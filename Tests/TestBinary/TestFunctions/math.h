@@ -1,0 +1,1 @@
+// A class full of various math equations, which make heavy use of while/for loop comparisons, and vector math.

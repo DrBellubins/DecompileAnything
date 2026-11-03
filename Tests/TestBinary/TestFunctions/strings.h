@@ -1,0 +1,1 @@
+// Various string related functions, heavy use of strncpy, strcat, strcmp, etc
