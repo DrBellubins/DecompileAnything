@@ -6,6 +6,15 @@ threshold = 97.0          # a unit only counts as done above this...
 cppflags = []             # ...and only if the opcode stream also matches (no opcode diffs)
 linkflags = []
 
+# The analysis side, read by the `decomp` CLI (Docs/Setup.md §3). eval.py ignores this
+# table; both tools read the same file on purpose. cache_dir is relative to this file, so
+# the analysis cache stays in the repo's gitignored cache/ - which must not be a
+# dot-prefixed path element (Ghidra's ProjectLocator rejects those).
+[ghidra]
+install_dir = ""             # empty = GHIDRA_INSTALL_DIR, then /opt/ghidra, then `ghidra` on PATH
+cache_dir = "../cache/ghproj"
+language = ""                # empty = let Ghidra auto-select (x86:LE:64:default here)
+
 # The variant name is the build directory name under Tests/build/.
 # gcc -O0 x86-64 is the entry point of the progression in the design plan:
 # -O0 free functions -> class methods -> virtual dispatch -> -O2, with -m32 as the

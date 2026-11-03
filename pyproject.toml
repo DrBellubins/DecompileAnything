@@ -1,0 +1,27 @@
+# The decomp package (Docs/Design-Plan.md). Install with:
+#   .venv/bin/pip install -e . --no-build-isolation
+# or run it without installing: .venv/bin/python -m decomp
+#
+# pyghidra is deliberately NOT a dependency: it must be pip-installed from the wheel
+# bundled inside the same Ghidra installation (Docs/Setup.md §2), not from PyPI.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decomp"
+version = "0.1.0"
+description = "Iteratively decompile functions out of a compiled binary into source that recompiles to the same bytes."
+requires-python = ">=3.11"
+dependencies = [
+	"typer",       # CLI
+	"lief",        # target/candidate object files: sections, relocations, .comment, Rich header
+	"capstone",    # disassembly, both sides
+]
+
+[project.scripts]
+decomp = "decomp.cli:main"
+
+[tool.setuptools]
+packages = ["decomp"]

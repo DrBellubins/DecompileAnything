@@ -59,11 +59,11 @@ export GHIDRA_INSTALL_DIR=/opt/ghidra
 Notes on that command:
 
 - **`--system-site-packages` is deliberate.** It reuses the distro-provided `capstone`, `pyelftools`, `pefile`, `click` (all already satisfy the plan's "lief **or** pyelftools+pefile" and "typer **or** click" alternatives), so only what is genuinely missing gets installed. For a fully self-contained venv instead, drop the flag and add `capstone pyelftools pefile` to the install line.
-- **Install `pyghidra` from the bundled wheel, never from PyPI.** PyPI currently serves `pyghidra` 3.2.0, which targets a newer Ghidra than 12.1.2 and will not match the installed `application.version`. Find the right file with:
+- **Install `pyghidra` from the bundled wheel, never from PyPI.** PyPI currently serves `pyghidra` 3.2.0, which targets a newer Ghidra than 12.1.2 and will not load against it. Find the right file with:
   ```bash
   ls "$GHIDRA_INSTALL_DIR/Ghidra/Features/PyGhidra/pypkg/dist"
   ```
-  Use the `pyghidra-<ver>-py3-none-any.whl` there (its version must match Ghidra's `application.version`). `jpype1` (1.5.2) is pulled in as a dependency; import name is `jpype`, package name `jpype1`.
+  Use the `pyghidra-<ver>-py3-none-any.whl` that lives there. **PyGhidra has its own version number**: the wheel bundled with Ghidra 12.1.2 is `pyghidra-3.1.0`, so "matching Ghidra" means *the same wheel*, not the same version string — `decomp check` compares the installed module against the wheel in that directory and says exactly which is wrong. `jpype1` (1.5.2) is pulled in as a dependency; import name is `jpype`, package name `jpype1`.
 - `typer` = CLI (plan's first choice); `lief` = `.o`/ELF/PE parsing (plan's first choice); `unicorn` = optional Phase 5 behavioural check.
 
 Resulting pins verified working on CPython 3.14 (`pip freeze` excerpt):
@@ -81,6 +81,16 @@ capstone==5.0.9  click==8.5.0  pyelftools==0.33  pefile==2024.8.26
 
 The venv also provides `pyghidra` / `pyghidraw` entry points in `.venv/bin`.
 
+### The package itself (Phase 1 and later)
+
+The `decomp` package lives in `decomp/` and is installed editable, so `.venv/bin/decomp` works from any directory (`Tests/` included); `python -m decomp` works without installing it.
+
+```bash
+.venv/bin/pip install -e . --no-build-isolation     # creates .venv/bin/decomp
+```
+
+`--no-build-isolation` avoids re-downloading setuptools, which the venv already has. `pyghidra` is deliberately **not** in `pyproject.toml`'s dependencies — it must come from the bundled wheel above.
+
 ---
 
 ## 3. Configuration
@@ -95,7 +105,7 @@ Resolution order for `decomp` (and what its Phase 1 startup check must report on
 2. `[ghidra] install_dir` in the target's `project.toml`;
 3. `/opt/ghidra`, then `which ghidra` resolved through its symlink — and error out naming each path tried.
 
-The startup check must verify, before any analysis: Ghidra dir contains `Ghidra/application.properties`, its `application.version` equals the installed `pyghidra` version, `java -version >= 21`, and the configured compiler responds to `--version`.
+The startup check must verify, before any analysis: Ghidra dir contains `Ghidra/application.properties`, its `application.version` is paired with the `pyghidra` wheel bundled in that install, `java -version >= 21`, and the configured compiler responds to `--version`. That is implemented in `decomp/check.py` and run by `.venv/bin/decomp check -C Tests/project.toml`; `decomp analyze` runs the same checks first (a missing compiler is only a warning there, since analysis needs none) and refuses to start the JVM on a failure.
 
 ### Per-target config: `project.toml`
 
@@ -120,6 +130,24 @@ Two hard constraints from Ghidra's `ProjectLocator`, both of which raise unhelpf
 ---
 
 ## 4. Verify the setup
+
+With the package installed, the tool verifies its own environment, and one analysis plus one
+lookup proves the whole path works:
+
+```bash
+.venv/bin/decomp check -C Tests/project.toml
+.venv/bin/decomp analyze Tests/build/gcc-o0/da_tests.stripped --variant gcc-o0
+.venv/bin/decomp show 0x2834 --bin Tests/build/gcc-o0/da_tests.stripped   # reads the cache, no JVM
+.venv/bin/python Tests/tools/check_analysis_cache.py                      # cache vs the answer key
+```
+
+Expected: every check `ok`; the analysis reports `153 bodies, 17 thunks, 23 external` for
+this build and writes `cache/ghproj/601677537ac2f6d3/analysis.db`; `show` prints the
+pseudo-code and the instruction stream of `FUN_00102834` (`pushq %rbp …`, matching
+`objdump -d`); the acceptance script prints `89/89 units found … size exact 89` for the
+-O0 variants. If any of that fails, the raw probe below is the ground truth to re-run.
+
+### Raw probe (no `decomp` involved)
 
 ```bash
 .venv/bin/python - <<'PY'
@@ -171,4 +199,15 @@ Most tutorials online are Ghidra 11-era and do not work here.
 - LIEF 1.0: `binary.relocations` spans the **whole file** (853 entries in `math.o`, incl. `.eh_frame`) — filter by `r.section.name`, exactly like the `objdump` section filter needed in `Tests/eval.py`.
 - capstone: `disasm(code, count=0, offset=0)` → `offset` must be a keyword argument.
 - Machine quirk: `/tmp` holds many scratch `.py` files that shadow stdlib modules (`dis.py` breaks `capstone`/`click`). Never run Python from `/tmp`.
+Things `decomp/ghidra.py` needed that are not in Ghidra-11-era tutorials (all hit while building Phase 1):
+
+- **Addresses/bodies.** `AddressSet` has no `getNumBytes()` and `AddressRange` no `getNumAddresses()`; use `getMinAddress()`/`getMaxAddress()` and iterate `function.getBody().getAddressRanges()` — bodies really are multi-range in real binaries (159 ranges across 153 functions in the benchmark). `Listing.getInstructions(body, True)` walks every range of an `AddressSetView`; still guard with `body.contains(addr)`.
+- **References.** `CodeUnit.getReferencesFrom()` also yields stack/register references (`StackReferenceDB`), which have no `getProgramSymbol()` and no `isCall()`. Keep `reference.isMemoryReference()` and decide call/data/jump from `reference.getReferenceType()` (`RefType`), not from the Reference. `Listing.getReferencesFrom(addr)` does not exist.
+- **Comments.** `CodeUnit.getComment()` requires a `CommentType`; block comments come from `listing.getComment(address, CommentType.PLATE)`.
+- **Parameters.** `Parameter.getDataType().getName()` — there is no `getDataTypeName()`.
+- **Functions.** `getMaxAddress()` not `getLastAddress()`; `getThunkedFunction(boolean)` needs the flag; `Symbol.getAnnotation()` does not exist; `FunctionStackFrame` has no `getTotalLocalSpaceSize()`.
+- **Address spaces.** `AddressSpace` has no `isDefaultSpace()`; the default space is `program.getAddressFactory().getDefaultAddressSpace()` and is named `ram`. Imported symbols appear in `getFunctions(True)` as entries inside Ghidra's `EXTERNAL` memory block and are **not** flagged `isExternal()` — classify them by block name, keep them (that is what a libc call resolves to), and do not decompile them. Memory blocks use `getStart()`/`getEnd()`.
+- **Language/executable facts.** `Language.isLittleEndian()` does not exist (endianness is part of the language id); `Program.getEntryPoint()` does not exist — take the entry point from the file headers (`decomp/toolchain.py` via LIEF).
+- **Bytes.** `Memory.getBytes(Address, int)` does not exist: allocate `jpype.JArray(JByte)(n)` and call `getBytes(address, buf, 0, n)`. Java bytes are signed, so mask with `& 0xFF`.
+- **Symbol iteration.** `SymbolTable.getSymbols(True)` returned nothing here; `getAllSymbols(True)` with `hasNext()/next()` works.
 - Never put a directory named `ghidra` on the import path. JPype exposes Ghidra's packages as a pseudo-module `ghidra`, so a real `ghidra/` directory reachable from `sys.path[0]` (e.g. running a scratch script from inside `cache/ghidra/`) wins the lookup and `import` dies with `RecursionError: maximum recursion depth exceeded`. This is why the analysis cache is `cache/ghproj/`, not `cache/ghidra/`.

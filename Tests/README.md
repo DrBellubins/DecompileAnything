@@ -23,6 +23,22 @@ Everything generated lives in `Tests/build/<variant>/` (gitignored): `da_tests`
 (with symbols), `da_tests.stripped`, `answer_key.json`, `task_list.json`,
 `goldens.jsonl`, `build.json`.
 
+## Feeding the decomp tool
+
+`Tests/project.toml` also carries a `[ghidra]` table (`cache_dir = "../cache/ghproj"`), which
+is what the `decomp` CLI reads; `eval.py` ignores it. To check the tool's own analysis cache
+against this benchmark's ground truth:
+
+```sh
+.venv/bin/python Tests/tools/check_analysis_cache.py
+```
+
+It resolves each unit's answer-key address into the cached analysis and reports whether the
+function, its size, its instructions and its pseudo-code are there. Current result: 89/89
+addresses and sizes exact for both `-O0` variants; at `-O2` all 89 addresses still match but
+51 sizes differ (Ghidra's own function boundaries), and STR-04/STR-11 are classified as
+thunks because their -O2 body is a tail call.
+
 ## The binary
 
 `main.cpp` only parses the mode and hands a `CSelfTest` to the three test classes:

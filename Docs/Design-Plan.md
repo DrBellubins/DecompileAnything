@@ -48,7 +48,11 @@ decomp/
 
 ## Phases
 
-**Phase 1: Skeleton and analysis cache**
+Status: **Phase 1 is implemented** - the commands that exist, the cache format, the measured
+results on `Tests/`, and the open gaps are documented in [README.md](README.md). The rest of
+this plan is unchanged and still authoritative for what comes next.
+
+**Phase 1: Skeleton and analysis cache** (done)
 1. Set up the package, config file, and startup checks (Ghidra path, JDK, compiler).
 2. `analyze`: open the binary via PyGhidra, run auto-analysis, export per function: name, address, size, bytes, instructions, resolved references, pseudo-code, and callers and callees.
 3. Store in the cache so later commands never start Ghidra.

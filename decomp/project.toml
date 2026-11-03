@@ -1,0 +1,23 @@
+# Default target configuration. It is used only when no project.toml is found next to the
+# target binary or in the directory tree above it, so a real target always describes itself
+# (Docs/Setup.md §3, same shape as Tests/project.toml).
+
+std = "c++17"
+threshold = 97.0          # ...and only counts as done when the opcode stream matches too
+cppflags = []
+linkflags = []
+
+[ghidra]
+# install_dir is optional: GHIDRA_INSTALL_DIR, then this value, then /opt/ghidra, then
+# `ghidra` on PATH resolved through its symlinks. Left unset to stay machine-neutral.
+install_dir = ""
+# Relative to this file, i.e. <repo>/cache/ghproj. Must be outside any path element that
+# starts with '.', and never name a directory 'ghidra' (JPype collision - Setup.md §5).
+cache_dir = "../cache/ghproj"
+language = ""             # empty = let Ghidra auto-select the language
+
+# The tool must know how the target was built: one [variants.<name>] per build flavour.
+[variants.gcc-o0]
+compiler = "g++"
+optimize = 0
+arch = "x86-64"

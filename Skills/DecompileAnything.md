@@ -12,13 +12,32 @@ scores; you write the source.
 cd Tests
 python3 eval.py build --variants gcc-o0,gcc-o2,gcc-o0-x86   # once per session
 python3 eval.py units                                       # what is in the binary
-python3 eval.py try --unit STRUCT-12 --src cand/structs.cpp --fn UnlinkNode
+
+../.venv/bin/decomp analyze build/gcc-o0/da_tests.stripped --variant gcc-o0   # once per binary
+../.venv/bin/decomp find strncmp                            # name, 0xaddr, or string content
+../.venv/bin/decomp show 0x2834 --bin build/gcc-o0/da_tests.stripped          # reads the cache
+../.venv/bin/decomp try --unit ... (Phase 2, not implemented yet)
+python3 eval.py try --unit STRUCT-12 --src cand/structs.cpp --fn UnlinkNode   # score meanwhile
 ```
 
-Per unit: `show` (asm + pseudo-code + referenced types/symbols) → write the function with
-its real signature and real field offsets → `try` → read the diff → change the thing the
-diff names. Stop when `match >= threshold` **and** `opcode: 0`. Never stop on the
+Per unit: `decomp show` (pseudo-code + the original instruction stream + resolved
+references + callers/callees) → write the function with its real signature and real field
+offsets → `eval.py try` until Phase 2 gives `decomp try` → read the diff → change the thing
+the diff names. Stop when `match >= threshold` **and** `opcode: 0`. Never stop on the
 percentage alone.
+
+# Driving `decomp`
+
+* Only `analyze` starts Ghidra (~10 s per binary, once). `show`/`find`/`status` read
+  `cache/ghproj/<sha256-16>/analysis.db` in ~0.1 s. Re-running `analyze` on the same bytes
+  says "already analysed"; `--force` rebuilds.
+* `decomp show` accepts the addresses `nm`/objdump print **and** Ghidra's: a PIE is loaded at
+  `0x100000`, and `meta.address_offset` records the gap, so `decomp show 0x2834` works.
+* Several targets can be cached; then pass `--bin <file>` or `--key <key>` (both printed by
+  `decomp status`).
+* Exit codes: 0 ok, 1 failed check/work, 2 usage or config, 3 nothing found or a later phase.
+* `decomp check` before debugging a failure - it names the Ghidra/JDK/Python/cache/compiler
+  problem and the fix.
 
 # Reading a score
 

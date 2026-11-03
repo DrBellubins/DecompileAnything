@@ -2,6 +2,10 @@
 
 # machine-specific: recreate with Docs/Setup.md
 .venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
 
-# Ghidra analysis cache (Docs/Setup.md §3)
+# Ghidra analysis cache (Docs/Setup.md §3): the Ghidra project + analysis.db per target
 cache/
