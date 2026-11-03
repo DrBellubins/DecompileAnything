@@ -1,0 +1,37 @@
+# Benchmark configuration. Tests/eval.py reads this; the decomp tool is meant to read
+# the same shape of file per target binary (see Docs/Design-Plan.md, project.toml).
+
+std = "c++17"
+threshold = 97.0          # a unit only counts as done above this...
+cppflags = []             # ...and only if the opcode stream also matches (no opcode diffs)
+linkflags = []
+
+# The variant name is the build directory name under Tests/build/.
+# gcc -O0 x86-64 is the entry point of the progression in the design plan:
+# -O0 free functions -> class methods -> virtual dispatch -> -O2, with -m32 as the
+# closer match to the 32-bit MSVC targets.
+[variants.gcc-o0]
+compiler = "g++"
+optimize = 0
+arch = "x86-64"
+
+[variants.gcc-o2]
+compiler = "g++"
+optimize = 2
+arch = "x86-64"
+
+[variants.gcc-o0-x86]
+compiler = "g++"
+optimize = 0
+arch = "x86"
+# -no-pie: on i386 a PIE link relaxes the pc-thunk/GOT sequence into %gs addressing,
+#   so the linked code would not match the object code of the same source.
+# static: the 32-bit dynamic loader/runtime is often missing, and goldens must run.
+cppflags = ["-no-pie", "-fno-pic"]
+linkflags = ["-no-pie", "-static"]
+
+# To try another toolchain locally, add a variant, e.g.:
+# [variants.clang-o0]
+# compiler = "clang++"
+# optimize = 0
+# arch = "x86-64"
