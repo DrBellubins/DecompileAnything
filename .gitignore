@@ -1,1 +1,7 @@
 .pi/
+
+# machine-specific: recreate with Docs/Setup.md
+.venv/
+
+# Ghidra analysis cache (Docs/Setup.md §3)
+cache/
