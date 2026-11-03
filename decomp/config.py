@@ -186,3 +186,17 @@ def variant(config: dict, name: str | None) -> tuple[str, dict]:
 
 def threshold(config: dict) -> float:
 	return float(config["raw"].get("threshold", 97.0))
+
+
+def include_dirs(config: dict, variant: dict | None = None) -> list[Path]:
+	"""Directories the candidate may include from - `[include_dirs]` in the target config, or
+	the same key inside a `[variants.*]` table. Relative paths are relative to the config
+	file, like `cache_dir` is. Phase 4's shared `types.h` header lives in one of these."""
+	values = list(config["raw"].get("include_dirs") or [])
+	if variant:
+		values += list(variant.get("include_dirs") or [])
+	out: list[Path] = []
+	for value in values:
+		path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+		out.append(path if path.is_absolute() else (config["root"] / path))
+	return out

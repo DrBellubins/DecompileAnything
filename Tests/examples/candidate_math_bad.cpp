@@ -1,12 +1,16 @@
 // A deliberately imperfect candidate, used to check that the scorer reports the right
 // kind of problem. Not part of the benchmark binary.
 //
-//   python3 eval.py try --unit MATH-02 --src examples/candidate_math_bad.cpp --fn ClampRange
-//   python3 eval.py try --unit MATH-38 --src examples/candidate_math_bad.cpp --fn ParityOf
-//   python3 eval.py try --unit STR-01  --src examples/candidate_math_bad.cpp --fn LengthOf
+//   .venv/bin/decomp try <address of MATH-02> examples/candidate_math_bad.cpp --fn ClampRangeProbe
+//   .venv/bin/decomp try <address of MATH-38> examples/candidate_math_bad.cpp --fn ParityOfProbe
+//   .venv/bin/decomp try <address of STR-01>  examples/candidate_math_bad.cpp --fn LengthOfProbe
+//
+// Tests/tools/check_phase2_try.py runs exactly these three and requires the report to name
+// the kind of problem each one is and to refuse them: 6 operand differences, 14 missing with
+// 1 operand, 2 missing with 1 opcode.
 
 // Wrong control flow: the inverted-range guard is gone and the bounds are compared with
-// the wrong operands. Expect operand + missing categories, not just a lower ratio.
+// the wrong operands. Reported as 6 operand differences, not just a lower ratio.
 int ClampRangeProbe(int value, int low, int high)
 {
 	if (value < low)
@@ -17,7 +21,7 @@ int ClampRangeProbe(int value, int low, int high)
 }
 
 // Wrong algorithm: parity by counting bits instead of folding. Same result, different
-// opcode stream - a behavioural test would pass, this one must not.
+// opcode stream - a behavioural test would pass, this one must not. Reported as 14 missing + 1 operand.
 int ParityOfProbe(unsigned int value)
 {
 	int count = 0;
@@ -30,7 +34,7 @@ int ParityOfProbe(unsigned int value)
 }
 
 // Right algorithm, deliberately different loop shape: counted loop instead of the
-// sentinel test. Expect extra/missing.
+// sentinel test. Reported as 2 missing + 1 opcode.
 int LengthOfProbe(const char *text)
 {
 	int length = 0;

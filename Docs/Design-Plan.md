@@ -48,22 +48,36 @@ decomp/
 
 ## Phases
 
-Status: **Phase 1 is implemented** - the commands that exist, the cache format, the measured
-results on `Tests/`, and the open gaps are documented in [README.md](README.md). The rest of
-this plan is unchanged and still authoritative for what comes next.
+Status: **Phase 1 and Phase 2 are implemented.** What the commands do, the cache format, the
+measured results on `Tests/`, and the open gaps are documented in [README.md](README.md). The
+rest of this plan is unchanged and still authoritative for what comes next.
 
-**Phase 1: Skeleton and analysis cache** (done)
+**Phase 1: Skeleton and analysis cache** - done, 2026-11-03
 1. Set up the package, config file, and startup checks (Ghidra path, JDK, compiler).
 2. `analyze`: open the binary via PyGhidra, run auto-analysis, export per function: name, address, size, bytes, instructions, resolved references, pseudo-code, and callers and callees.
 3. Store in the cache so later commands never start Ghidra.
 
-**Phase 2: Compile and diff (the core loop)**
-1. `compile.py`: invoke the compiler with the configured flags, producing a `.o`.
-2. `extract.py`: pull the target function's bytes and relocation entries from the `.o` (LIEF), mapping relocations to symbol names.
-3. `normalize.py`: on the original side, replace call targets and global addresses with symbol names from the cache. Both sides now compare symbolically.
-4. `diff.py`: align instruction streams, compute a match ratio, and categorize differences (opcode, operand, register-only, relocation, size).
-5. Output: match %, size delta, and the differing lines only, kept short for the LLM's context.
-6. Validate on one simple free function from your test program at `-O0`.
+**Phase 2: Compile and diff (the core loop)** - done, 2026-11-03
+1. `compile.py`: invoke the compiler with the configured flags, producing a `.o`. (Done: the
+   flags come from the variant the analysis was recorded with; the compiler's diagnostics are
+   returned verbatim and the object is kept for `objdump`.)
+2. `extract.py`: pull the target function's bytes and relocation entries from the `.o` (LIEF),
+   mapping relocations to symbol names. (Done, plus the two cases a `.o` has that a linked
+   image does not: a relocation naming a *section* with the offset as its addend, and a call
+   or address-of inside the same section, which needs no relocation at all.)
+3. `normalize.py`: on the original side, replace call targets and global addresses with symbol
+   names from the cache. Both sides now compare symbolically. (Done as one shared tokeniser:
+   positional symbol tokens per side, names/bytes/sizes kept and compared, function-relative
+   branch labels.)
+4. `diff.py`: align instruction streams, compute a match ratio, and categorize differences
+   (opcode, operand, register-only, relocation, size). (Done; `register` is reported and
+   `--register-abstract` exists, but the -O2 register-allocation work stays in Phase 5.)
+5. Output: match %, size delta, and the differing lines only, kept short for the LLM's
+   context. (Done, plus a table of what every symbol token means on each side.)
+6. Validate on one simple free function from your test program at `-O0`. (Done, and further:
+   `Tests/tools/check_phase2_try.py` scores all 89 units of the benchmark through the tool's
+   own path - 99.94% mean, 88/89 pass the gate at gcc -O0, above the independent harness's
+   own 99.53%/83. Known gaps are named in README.md.)
 
 **Phase 3: Discovery and compiler detection**
 1. `toolchain.py`: detect the compiler via `.comment` (ELF) or the Rich header (PE), and write a starting `project.toml`.

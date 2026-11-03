@@ -6,6 +6,9 @@ std = "c++17"
 threshold = 97.0          # ...and only counts as done when the opcode stream matches too
 cppflags = []
 linkflags = []
+# Directories a candidate may include from, added as -I by `decomp try` (relative to this
+# file). Phase 4's shared types.h header will live in one of these.
+include_dirs = []
 
 [ghidra]
 # install_dir is optional: GHIDRA_INSTALL_DIR, then this value, then /opt/ghidra, then

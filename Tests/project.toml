@@ -6,6 +6,11 @@ threshold = 97.0          # a unit only counts as done above this...
 cppflags = []             # ...and only if the opcode stream also matches (no opcode diffs)
 linkflags = []
 
+# Where a candidate may find the headers of the program being decompiled. `decomp try` adds
+# these as -I when it builds a candidate (Docs/Design-Plan.md, Phase 2). A relative path is
+# relative to this file.
+include_dirs = ["TestBinary", "TestBinary/TestFunctions"]
+
 # The analysis side, read by the `decomp` CLI (Docs/Setup.md §3). eval.py ignores this
 # table; both tools read the same file on purpose. cache_dir is relative to this file, so
 # the analysis cache stays in the repo's gitignored cache/ - which must not be a

@@ -19,7 +19,7 @@ from typing import Optional
 
 import typer
 
-from . import __version__, cache, check, config, ghidra, toolchain
+from . import __version__, cache, check, compile, config, diff, extract, ghidra, normalize, toolchain
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_FOUND = 0, 1, 2, 3
 
@@ -469,22 +469,207 @@ def find(
 
 
 # --------------------------------------------------------------------------------------
-# later phases
+# try: the loop (Phase 2)
+
+
+def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
+	fn: str | None = None, variant: str | None = None, includes: list[str] | None = None,
+	size: int = 0, register_abstract: bool = False, object_dir: Path | None = None) -> dict:
+	"""Compile a candidate and score it against one cached function.
+
+	Everything `decomp try` does, in one call, so the benchmark check in
+	`Tests/tools/check_phase2_try.py` exercises this same path.
+	"""
+	name, body = config.variant(cfg, variant or meta.get("variant"))
+	flags = toolchain.build_flags(body)
+	object_path = (object_dir or (config.cache_dir(cfg) / "candidates")) / compile.object_name(sources)
+	result = compile.build(sources, object_path, compiler=body.get("compiler", "g++"),
+		flags=flags, includes=[*config.include_dirs(cfg, body),
+			*[Path(item) for item in (includes or [])]])
+	outcome = {"variant": name, "flags": flags, "build": result, "object": object_path,
+		"warnings": [], "error": None, "error_code": EXIT_FAIL, "verdict": None,
+		"original": None, "candidate": None}
+	if result.failed:
+		outcome["error"] = "the candidate did not compile"
+		return outcome
+
+	language = meta.get("language_id") or ""
+	handle = normalize.capstone_for(language, detail=True)
+	if handle is None:
+		outcome["error"] = ("no decoder for %s - the diff supports x86 (x86:LE:32/64) for now"
+			% language)
+		return outcome
+
+	original = extract.original_function(conn, meta, row, size or None)
+	outcome["original"] = original
+	outcome["warnings"] += original.warnings
+	if row["kind"] == "thunk":
+		outcome["warnings"].append("the analysis classifies this function as a thunk: at -O2 its "
+			"body may be a jump into another function, so the cached range may be shorter than "
+			"the compiler's - pass --size <the symbol's size> to compare the whole range")
+	if not original.bytes:
+		outcome["error"] = "nothing to compare: the cache holds no bytes for this function"
+		return outcome
+
+	image = extract.TargetImage(Path(meta.get("target_path") or ""), int(meta.get("address_offset") or 0))
+	bind_original, _ = extract.original_bindings(conn, meta, row, image)
+
+	object_file = extract.CandidateObject(object_path)
+	if object_file.error:
+		outcome["error"] = object_file.error
+		outcome["error_code"] = EXIT_NOT_FOUND
+		return outcome
+	bits = 64 if (language.split(":") + ["", ""])[2] == "64" else 32
+	if object_file.bits and object_file.bits != bits:
+		outcome["error"] = ("the candidate object is %d-bit (%s) but the analysis of this target "
+			"is %s - compile it with the variant's arch (see [variants.%s] in %s)"
+			% (object_file.bits, object_file.path.name, language, name, cfg["path"]))
+		outcome["error_code"] = EXIT_USAGE
+		return outcome
+	try:
+		candidate = object_file.function(fn, original.size)
+	except extract.SymbolNotFound as exc:
+		outcome["error"] = str(exc)
+		outcome["error_code"] = EXIT_NOT_FOUND
+		return outcome
+	outcome["candidate"] = candidate
+
+	instructions_original = normalize.decode_function(handle, original.address, original.bytes,
+		original.boundaries)
+	instructions_candidate = normalize.decode_function(handle, candidate.address, candidate.bytes)
+	if not instructions_candidate:
+		outcome["error"] = ("no instructions could be decoded at %s in %s"
+			% (_hex(candidate.address), object_path.name))
+		outcome["error_code"] = EXIT_FAIL
+		return outcome
+
+	vocabulary = normalize.Vocabulary()
+	tokens_original = normalize.normalize_function(vocabulary, "original", instructions_original,
+		bind_original, original.address, original.size, register_abstract)
+	tokens_candidate = normalize.normalize_function(vocabulary, "candidate", instructions_candidate,
+		object_file.bindings(candidate)[0], candidate.address, candidate.size, register_abstract)
+	outcome["verdict"] = diff.compare(tokens_original, tokens_candidate, vocabulary,
+		threshold=config.threshold(cfg), original_bytes=original.bytes, candidate_bytes=candidate.bytes)
+	return outcome
 
 
 @app.command("try")
 def try_cmd(
-	function: str = typer.Argument(..., help="the function to score"),
-	source: Path = typer.Argument(..., help="candidate source file"),
+	function: str = typer.Argument(..., help="the function to score (name, substring, 0x address)"),
+	source: list[Path] = typer.Argument(..., help="candidate source file(s)"),
+	fn: Optional[str] = typer.Option(None, "--fn",
+		help="which symbol in the candidate to compare (default: the only function it defines)"),
 	binary: Optional[Path] = typer.Option(None, "--bin"),
 	key: Optional[str] = typer.Option(None, "--key"),
 	config_file: Optional[str] = typer.Option(None, "--config", "-C"),
-	variant: Optional[str] = typer.Option(None, "--variant", "-v"),
+	variant: Optional[str] = typer.Option(None, "--variant", "-v",
+		help="default: the variant the analysis was run with"),
+	include: list[str] = typer.Option([], "--include", help="-I for the candidate build"),
+	size: int = typer.Option(0, "--size", help="compare only N bytes of the original "
+		"(use the compiler's symbol size where the analysis' own range differs, e.g. at -O2)"),
+	register_abstract: bool = typer.Option(False, "--register-abstract",
+		help="treat a different register choice as a match (Phase 5; reported separately today)"),
+	max_diff: int = typer.Option(16, "--max-diff"),
+	max_symbols: int = typer.Option(12, "--max-symbols"),
+	as_json: bool = typer.Option(False, "--json"),
+	keep: bool = typer.Option(True, "--keep/--no-keep", help="keep the candidate object file"),
 ) -> None:
-	"""Compile a candidate and diff it against the original. Not implemented until Phase 2."""
-	echo("`decomp try` is Phase 2 (Docs/Design-Plan.md): compile -> extract -> normalise -> diff.")
-	echo("Implemented so far: check, analyze, status, show, find.")
-	raise typer.Exit(EXIT_NOT_FOUND)
+	"""Compile a candidate and diff it against the original: match %, size delta, and only
+	the differing instructions, categorised.
+
+	The candidate is built with the target's own variant flags, so it is compared at the same
+	-O and the same arch. The tool never edits source - it reports.
+	"""
+	cfg = load_config(config_file)
+	store = cache.Cache(config.cache_dir(cfg))
+	conn, values = open_analysis(store, binary, key)
+	try:
+		meta = cache.meta(conn)
+		# A candidate has to be built the way the analysed binary was built, so the config that
+		# produced this analysis is the right default when the caller did not name one.
+		recorded = str(meta.get("config_path") or "")
+		if not config_file and recorded and Path(recorded).is_file() and Path(recorded) != cfg["path"]:
+			cfg = load_config(recorded)
+			echo("config: %s (the one this analysis was run with)" % cfg["path"])
+		rows = cache.resolve_function(conn, function, _other_addresses(function,
+			int(meta.get("address_offset") or 0)))
+		if not rows:
+			raise Stop(EXIT_NOT_FOUND, "no function matches %r in the analysis of %s" % (function,
+				values.get("target_path")), "see what is there with: decomp find %s" % function)
+		if len(rows) > 1:
+			raise Stop(EXIT_USAGE, "%r matches %d functions:" % (function, len(rows)),
+				*["  %s  %s" % (_hex(row["entry"]), row["name"]) for row in rows])
+		row = rows[0]
+		missing = [str(item) for item in source if not Path(item).is_file()]
+		if missing:
+			raise Stop(EXIT_USAGE, "no such source file: %s" % ", ".join(missing))
+		try:
+			outcome = score_candidate(cfg, conn, meta, row, [Path(item) for item in source], fn=fn,
+				variant=variant, includes=list(include), size=size,
+				register_abstract=register_abstract, object_dir=store.root / "candidates")
+		except config.ConfigError as exc:
+			raise Stop(EXIT_USAGE, "%s" % exc)
+		except NotImplementedError as exc:
+			raise Stop(EXIT_USAGE, "%s" % exc)
+	finally:
+		conn.close()
+
+	build: "compile.Build" = outcome["build"]
+	if not keep and build.object_path.exists():
+		build.object_path.unlink()
+
+	verdict = outcome["verdict"]
+	if as_json:
+		payload = {
+			"target": values.get("target_path"), "function": row["name"],
+			"entry": _hex(row["entry"]), "size": row["size"], "kind": row["kind"],
+			"variant": outcome["variant"], "flags": outcome["flags"],
+			"object": str(build.object_path), "build_ok": build.ok,
+			"diagnostics": build.diagnostics, "warnings": outcome["warnings"],
+			"error": outcome["error"],
+			"original": None if outcome["original"] is None else {
+				"name": outcome["original"].display, "address": _hex(outcome["original"].address),
+				"size": outcome["original"].size, "section": outcome["original"].section},
+			"candidate": None if outcome["candidate"] is None else {
+				"name": outcome["candidate"].display, "section": outcome["candidate"].section,
+				"size": outcome["candidate"].size},
+			"result": None if verdict is None else {
+				"passed": verdict.passed, "threshold": verdict.threshold,
+				"match_percent": verdict.match_percent, "categories": verdict.categories,
+				"identical": verdict.identical, "bytes_equal": verdict.bytes_equal,
+				"original_instructions": verdict.original_instructions,
+				"candidate_instructions": verdict.candidate_instructions,
+				"original_bytes": verdict.original_bytes, "candidate_bytes": verdict.candidate_bytes,
+				"diff": verdict.diff, "symbols": verdict.symbols},
+		}
+		echo(json.dumps(payload, indent=1))
+		if verdict is not None and verdict.passed:
+			raise typer.Exit(EXIT_OK)
+		raise typer.Exit(EXIT_NOT_FOUND if verdict is None and outcome["error_code"] == EXIT_NOT_FOUND
+			else EXIT_FAIL)
+
+	echo("target %s  (key %s, variant %s: %s)" % (values.get("target_path"),
+		values.get("target_key"), outcome["variant"], " ".join(outcome["flags"])))
+	for line in compile.describe(build):
+		echo(line)
+	for warning in outcome["warnings"]:
+		echo("  note: %s" % warning)
+	if verdict is None:
+		echo("%s" % outcome["error"])
+		raise typer.Exit(outcome["error_code"])
+	echo()
+	for line in diff.report_lines(verdict, "%s @ %s" % (outcome["original"].display,
+		_hex(outcome["original"].address)), "%s (%s)" % (outcome["candidate"].display,
+		outcome["candidate"].section), max_diff=max_diff, max_symbols=max_symbols):
+		echo(line)
+	raise typer.Exit(EXIT_OK if verdict.passed else EXIT_FAIL)
+
+
+# --------------------------------------------------------------------------------------
+# later phases
+
+
+@app.command("types")
 
 
 @app.command("types")

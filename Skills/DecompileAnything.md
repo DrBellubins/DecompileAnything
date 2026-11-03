@@ -16,15 +16,20 @@ python3 eval.py units                                       # what is in the bin
 ../.venv/bin/decomp analyze build/gcc-o0/da_tests.stripped --variant gcc-o0   # once per binary
 ../.venv/bin/decomp find strncmp                            # name, 0xaddr, or string content
 ../.venv/bin/decomp show 0x2834 --bin build/gcc-o0/da_tests.stripped          # reads the cache
-../.venv/bin/decomp try --unit ... (Phase 2, not implemented yet)
-python3 eval.py try --unit STRUCT-12 --src cand/structs.cpp --fn UnlinkNode   # score meanwhile
+../.venv/bin/decomp try 0x2834 cand/math.cpp --fn AbsDiff                     # build, diff, score
 ```
 
 Per unit: `decomp show` (pseudo-code + the original instruction stream + resolved
 references + callers/callees) → write the function with its real signature and real field
-offsets → `eval.py try` until Phase 2 gives `decomp try` → read the diff → change the thing
-the diff names. Stop when `match >= threshold` **and** `opcode: 0`. Never stop on the
+offsets → `decomp try` → read the diff → change the thing the diff names. Stop when
+`match >= threshold` **and** `opcode: 0` **and** `relocation: 0`. Never stop on the
 percentage alone.
+
+`try` builds the candidate with the target's own variant flags (same compiler, `-O`, `-std`,
+`-m32`), so never compare -O0 asm to -O2 asm; it prints the object path, so `objdump -dr`
+on the candidate is one command away. `--fn` names the symbol in the candidate to compare
+(without it, the object must define exactly one function). `--include` adds `-I` for a header
+the candidate needs; `[include_dirs]` in the target's `project.toml` does it permanently.
 
 # Driving `decomp`
 
@@ -45,6 +50,8 @@ percentage alone.
 |---|---|---|
 | `opcode: n` | wrong operation: cmov vs branch, imul vs shifts, signed vs unsigned load | fix the operation; `movzbl` vs `movsbl` and `idiv` vs `shrd` are the usual ones |
 | `operand: n` | right operation, wrong offset/constant/type | field offsets, struct layout, the type of an array element, a truncated buffer bound |
+| `relocation: n` | same shape of code, reaching for something else: a different callee, a different table, different bytes in it | the report's `symbols` line names both sides - fix the callee or reproduce the data (tables and string literals are part of the answer) |
+| `register: n` | register allocation only | not yours to fix; use `--register-abstract` when comparing at -O2 (Phase 5) |
 | `missing`/`extra` | control flow or size differs | loop form (counted vs conditional), hoisted invariant, inlined vs called helper, early return vs branch |
 | `size_delta` large with high % | something is inlined or vectorised that should not be (or the reverse) | compare at the variant's own `-O`; never compare -O0 asm to -O2 asm |
 
@@ -63,6 +70,11 @@ problem.
   `0 failures`, and `eval.py crosscheck` must show no same-arch differences. The 89
   hand-checked expectations are the ground truth - if a `Want*` disagrees with the code,
   work out which one is wrong instead of editing the expectation to match the run.
+* `decomp try` compares **symbolically**: branches inside the function are function-relative
+  labels, and calls/data references become positional tokens (`SYM0`, `DAT0`) matched by order,
+  then checked by what they reach (a real name both sides know, the bytes there, the size). So
+  the score does not depend on the link address, and a table with the wrong bytes is still a
+  failure. `decomp try --json` gives the whole report if you need to parse it.
 * Float results are only comparable as **bit patterns** (`goldens.jsonl` stores both
   `f` and `bits`). x87 (-m32 default) and SSE (-m32 `-msse2`, x86-64) legitimately
   disagree: `SineApprox`, `SquareRootNewton` and `(float)mass * 0.001f` all differ in the

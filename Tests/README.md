@@ -34,7 +34,19 @@ against this benchmark's ground truth:
 ```
 
 It resolves each unit's answer-key address into the cached analysis and reports whether the
-function, its size, its instructions and its pseudo-code are there. Current result: 89/89
+function, its size, its instructions and its pseudo-code are there.
+
+To check the tool's own decompilation loop against this benchmark's ceiling:
+
+```sh
+.venv/bin/python Tests/tools/check_phase2_try.py
+```
+
+It feeds the untouched original source through `decomp try`'s code path for every unit and
+compares with what `eval.py self` reports (99.94% mean, 88/89 pass at gcc-o0 vs the
+harness's own 99.53%, 83/89), then re-scores the deliberately wrong candidates in
+`Tests/examples/candidate_math_bad.cpp` and requires the report to name the kind of problem
+they are. Current result: 89/89
 addresses and sizes exact for both `-O0` variants; at `-O2` all 89 addresses still match but
 51 sizes differ (Ghidra's own function boundaries), and STR-04/STR-11 are classified as
 thunks because their -O2 body is a tail call.
