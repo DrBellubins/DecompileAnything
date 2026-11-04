@@ -17,9 +17,9 @@ Two layers: **system tools** (installed once, machine-wide, on `PATH`) and a **p
 | **clang / clang++** | 23.1.4 | alternate compiler for flag inference (Phase 3) |
 | **binutils** | 2.47 (`objdump -dr`, `nm --print-size`, `c++filt`, `strip`, `readelf`) | extracting and normalising instruction streams |
 | `capstone`, `pyelftools`, `pefile`, `click` | provided by the distro's site-packages | disassembly, `.o`/PE reading — reused by the venv |
-| MSVC `cl` | *not installed* | only real PE/MSVC targets (would need Windows, or Wine + MSVC) |
+| MSVC `cl` | *not installed* (checked 2026-11-04: no `cl`, no `lld-link`, no Windows SDK/MSVC STL headers — `clang-cl` exists but cannot compile `#include <vector>`) | real PE/MSVC targets only; the install recipe and the two tiers (real `cl` under Wine, or `clang-cl` + downloaded MSVC/SDK) are in [MSVC-Plan.md](MSVC-Plan.md) §5 and phase MS-2 |
 | `objdiff-cli` | *not installed* | optional Phase 5 alternate diff backend |
-| `wine` | present | only to run Windows test targets |
+| `wine` | 9.21 Staging (`wine64` works; `/usr/bin/wine` is a 32-bit ELF whose interpreter `/lib/ld-linux.so.2` is not installed, so it fails to exec) | running `cl.exe`/`link.exe` for MSVC targets — use `wine64`, and `msitools`/`winbind` are still missing (MSVC-Plan.md §5) |
 
 ### Ghidra must be a system install reachable from `/usr/bin`
 

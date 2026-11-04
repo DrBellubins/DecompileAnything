@@ -7,6 +7,7 @@ it reports facts about the original binary and scores a candidate the model wrot
 * [Docs/Design-Plan.md](Docs/Design-Plan.md) - the plan, phases, and the design decisions.
 * [Docs/Setup.md](Docs/Setup.md) - the environment (Ghidra, JDK, venv) and why it is set up that way.
 * [Tests/README.md](Tests/README.md) - the benchmark that judges the loop, independent of this tool.
+* [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) - what it would take to support MSVC/PE targets from Linux, measured on a real one.
 
 ## Status
 
@@ -17,6 +18,7 @@ it reports facts about the original binary and scores a candidate the model wrot
 | 3 | `detect`: compiler/object/flags from the file; `find`: xrefs, vtables, related functions | **implemented** |
 | 4 | `types`: vtables, RTTI, the shared header | not implemented |
 | 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | not implemented |
+| MS-0..MS-5 | PE/MSVC targets from Linux (separate track) | not implemented - `analyze` works on a PE, `find`/`try`/`detect --range` do not |
 
 ## Use it
 
@@ -131,8 +133,11 @@ toolchain. Two honest limits, both printed by the tool:
 
 For PE, the Rich header and the linker version are read (the id -> product table is
 Microsoft-internal, so the build numbers are what is recorded); `.dynstr` and `DT_NEEDED`
-say which C++ ABI and standard library a *stripped* ELF uses. `cl` is not installed here, so
-the MSVC flag set and the PE path are written but not exercised on a real MSVC target.
+say which C++ ABI and standard library a *stripped* ELF uses. The PE path was read on a real
+MSVC binary (`Tests/Proprietary/notepad.exe`: `compiler = msvc`, linker 14.12, Rich build id
+25711, `/GL`+`/LTCG` from its debug directory) and it reads the note correctly, but `find`,
+`show`, `try` and `detect --range` then raise on it - the PE container is understood, the PE
+side of the work is not finished ([Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) §3).
 
 ## The group a request asks about (`decomp find`)
 
@@ -253,9 +258,12 @@ all three scripts print OK on this machine).
 * The `-O` inference samples the file's `.text` cut at every `ret` when there is no analysis
   to take real boundaries from; with a cached analysis and `--sample <name>` it uses the real
   ones. For a statically linked target the answer needs `--range` (see above).
-* A PE/MSVC target: the Rich header, the linker version and the `/std`-`/O` flag set are
-  written, and the Rich path was read on real MSVC binaries, but nothing here is built by
-  `cl` - that whole path is unexercised end to end.
+* A PE/MSVC target: `analyze` works on one (236 functions out of `Tests/Proprietary/notepad.exe`,
+  109 s) and the build note is read correctly, but `find` dies on the missing PE section map,
+  `try`/`show`/`detect --range` die in `extract.section_capabilities` (LIEF spells PE section
+  flags `characteristics`), and nothing reads `.pdata` - the function table an x64 PE carries,
+  which is where 186 exact unit boundaries are sitting unused.
+  [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
 * Ghidra's function boundaries at `-O2` differ from the compiler's, and a `-O2` body can be
   split across `.text` and `.text.unlikely`; only the first range is compared today.
   Extracting across ranges is Phase 5.
@@ -264,8 +272,10 @@ all three scripts print OK on this machine).
 * A candidate that calls a helper it does not define reaches it by name, while the analysis of
   a stripped target knows it by address only: that call reads as an operand difference, and
   the symbol table prints both names so the loop can still see what happened.
-* PE/MSVC targets are untested here: the ELF path works, the Rich-header note is written but
-  unexercised, and `cl` is not installed on this machine. The diff supports x86 only
-  (`x86:LE:32/64`); `try` says so rather than guessing.
+* No compiler here speaks MSVC: `cl.exe` is Windows-only, and the two Linux routes to it
+  (real `cl` under Wine via msvc-wine, or `clang-cl` with the MSVC/Windows SDK headers) are
+  both missing pieces on this machine - `msitools`/`winbind`, the SDK headers, and `lld-link`.
+  MinGW-w64 gcc produces PE/COFF but with GCC codegen, so it can test the container, never the
+  match. The diff supports x86 only (`x86:LE:32/64`); `try` says so rather than guessing.
 * `[ghidra] language` in `project.toml` is validated but not wired into the importer;
   Ghidra's auto-selection is used and the chosen language is recorded.

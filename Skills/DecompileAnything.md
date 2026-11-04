@@ -48,6 +48,12 @@ the candidate needs; `[include_dirs]` in the target's `project.toml` does it per
   to), and `--family <hops>` gives the connected group with the reason for each entry.
   In a stripped binary there are no names to search: start from a string or an address, then
   grow with `--family`.
+* A **PE/MSVC target**: `decomp analyze` works on one (236 functions out of
+  `Tests/Proprietary/notepad.exe`) and `detect`'s build note reads it (`msvc`, the Rich build
+  id, `/GL`+`/LTCG` from its debug directory), but `find`/`show`/`try`/`detect --range` raise
+  on it today - a named gap with the work phased in `Docs/MSVC-Plan.md`, not something to
+  debug mid-task. An x64 PE carries its own function table in `.pdata` (186 exact ranges on
+  that file); nothing reads it yet.
 * Only `analyze` starts Ghidra (~10 s per binary, once). `detect`/`show`/`find`/`status` read
   `cache/ghproj/<sha256-16>/analysis.db` or the file itself in ~0.1 s. Re-running `analyze` on
   the same bytes says "already analysed"; `--force` rebuilds.

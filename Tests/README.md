@@ -155,8 +155,11 @@ per-function difficulty is representative.
 ## Known gaps
 
 * **-m32 normalisation is weak** (87% ceiling): 32-bit addressing forms (`movl 0x804a2c4`,
-  `$displ,%eax` + `R_386_*`) are not all mapped to names. Fix before using x86 as the
-  MSVC-like target.
+  `$displ,%eax` + `R_386_*`) are not all mapped to names. x86 is *not* a stand-in for MSVC
+  either - "-m32 as the closer match to the 32-bit MSVC targets" in `project.toml` is about
+  addressing forms only. A real `msvc-*` variant of this benchmark (PE/COFF, `cl` or
+  `clang-cl`, an answer key from `.pdata`/the PDB instead of `nm --print-size`) is phase MS-2
+  of [../Docs/MSVC-Plan.md](../Docs/MSVC-Plan.md).
 * **Goldens are per-variant, not portable.** `crosscheck` treats a same-arch difference as
   a bug (there are none) and x87-vs-SSE float differences as expected: `-m32` computes
   `SineApprox` and `InitVehicleDescriptor`'s grip in float registers with different

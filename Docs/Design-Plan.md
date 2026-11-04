@@ -10,7 +10,7 @@ A Python CLI that lets an LLM decompile functions from a binary by iterating: wr
 |---|---|
 | Ghidra (recent release, with PyGhidra) | Analysis, function discovery, pseudo-code, xrefs, types |
 | JDK (version Ghidra requires, currently 21+) | Runs Ghidra |
-| Compiler (`gcc`/`clang`, optionally MSVC `cl`) | Builds candidate source into `.o` files |
+| Compiler (`gcc`/`clang`, optionally MSVC `cl`) | Builds candidate source into `.o` files. `cl` is Windows-only; the two ways to have it on Linux, and what each costs, are in [Docs/MSVC-Plan.md](MSVC-Plan.md) §5 |
 
 **Python libraries**
 | Library | Purpose |
@@ -102,6 +102,14 @@ What Phase 3 learned, for whoever extends it:
 * `endbr64`/`__stack_chk_fail`/frame-pointer shares are worth reporting as facts about the
   build (`-fcf-protection`, `-fstack-protector-strong` vs `-all`, `-fno-omit-frame-pointer`);
   they came free with the shape profile.
+
+**MS-0..MS-5: MSVC / PE targets, a separate track** - not implemented
+Measured against a real MSVC binary (`Tests/Proprietary/notepad.exe`) in
+[Docs/MSVC-Plan.md](MSVC-Plan.md), which is authoritative for that track: what a PE target already
+gives the tool (its build note, and `.pdata` - the compiler's own table of 186 function ranges),
+what breaks today (`find`, `show`, `try`, `detect --range`), how to get `cl` onto a Linux machine,
+and why the byte gate cannot be promised for a `/GL`+`/LTCG` target. MS-0 and MS-1 change nothing
+in the ELF path; MS-3 (COFF candidates) is the phase that makes `try` work on PE at all.
 
 **Phase 4: C++ structure recovery**
 1. Identify vtables, constructors, and destructors from Ghidra data and RTTI where present.
