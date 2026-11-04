@@ -1,8 +1,6 @@
 ![Decompile Anything](Images/DecompileAnythingBanner.png)
 
-`decomp` is a CLI that lets an LLM decompile a function out of a compiled binary and keep
-iterating until the candidate recompiles to the same bytes. The tool **never edits source**:
-it reports facts about the original binary and scores a candidate the model wrote.
+DecompileAnything is a set of tools that lets LLMs decompile into human-readible code that is byte-for-byte identical to the original.
 
 * [Docs/Design-Plan.md](Docs/Design-Plan.md) - the plan, phases, and the design decisions.
 * [Docs/Setup.md](Docs/Setup.md) - the environment (Ghidra, JDK, venv) and why it is set up that way.
