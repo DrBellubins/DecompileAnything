@@ -74,13 +74,26 @@ TRIM = ["--with-workload", "no", "--with-asan", "no", "--with-atl", "no",
 	"--with-dia", "no", "--with-msbuild", "no", "--with-devcmd", "no"]
 
 
-def msiextract_shim() -> Path:
-	"""A PATH entry providing `msiextract`, for vsdownload's SDK extraction step."""
+def msiextract_shim() -> "Path | None":
+	"""A PATH entry providing `msiextract` for vsdownload's SDK extraction step, or None.
+
+	None means the machine has msitools' own `msiextract`, which is the one to use: it reads
+	the MSI file table itself and expands the SDK's external cabinets (measured: the 284 MB
+	`Universal CRT Headers Libraries and Sources` payload in 0.85 s, into the same
+	`Program Files/Windows Kits/10/...` layout moveVCSDK expects). The shim below is for
+	machines without msitools; it runs `wine msiexec /a`, which stops on the Windows SDK's
+	WiX MSIs at `InstallAdminPackage` with 1627 (Docs/Setup.md §6.10).
+	"""
+	found = shutil.which("msiextract")
+	if found:
+		print("msiextract: using %s" % found)
+		return None
 	bin_dir = HERE / "bin"
 	bin_dir.mkdir(parents=True, exist_ok=True)
 	shim = bin_dir / "msiextract"
 	shim.write_text('#!/bin/sh\nexec "%s" "%s/msiextract.py" "$@"\n' % (sys.executable, HERE))
 	shim.chmod(0o755)
+	print("msiextract: not on PATH - using the wine shim, toolchains/msiextract.py")
 	return bin_dir
 
 
@@ -164,7 +177,9 @@ def main() -> int:
 		if not os.access(os.path.join(unpack, name), os.F_OK):
 			os.symlink(".", os.path.join(unpack, name), target_is_directory=True)
 
-	os.environ["PATH"] = "%s%s%s" % (msiextract_shim(), os.pathsep, os.environ.get("PATH", ""))
+	shim_dir = msiextract_shim()
+	if shim_dir is not None:
+		os.environ["PATH"] = "%s%s%s" % (shim_dir, os.pathsep, os.environ.get("PATH", ""))
 	os.environ.setdefault("WINEPREFIX", str(WINEPREFIX))
 	WINEPREFIX.mkdir(parents=True, exist_ok=True)
 	vsd.extractPackages(selected, cache, unpack)
