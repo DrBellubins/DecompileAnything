@@ -51,9 +51,15 @@ the candidate needs; `[include_dirs]` in the target's `project.toml` does it per
 * A **PE/MSVC target**: `decomp analyze`, `find`, `show` and `detect` work on one
   (`Tests/Proprietary/notepad.exe`: 236 functions; `detect` names the v141 toolset from the
   Rich build id, `/GL`+`/LTCG` from its debug directory, and the public PDB that holds that
-  file's answer key). `try` does not: no compiler here emits MSVC code, and nothing implements
-  COFF candidate semantics yet. Both are a named gap phased in `Docs/MSVC-Plan.md`, not
-  something to debug mid-task.
+  file's answer key). `try` does not yet: nothing implements COFF *candidate* semantics (MS-3).
+  Both are a named gap phased in `Docs/MSVC-Plan.md`, not something to debug mid-task.
+  Since MS-2 there is an MSVC toolchain here — `cl`/`link`/`lib`/`dumpbin` **14.12.25835.7**
+  (v141, the era `detect` names for that target) at `toolchains/msvc/bin/x64`, needing
+  `PATH=…:$PATH WINEPREFIX=$PWD/.wine`. It compiles (freestanding: its Windows SDK is an empty
+  placeholder this machine cannot extract) and its `.obj` files show one `.text$<name>` COMDAT per
+  function, which is where a COFF function's exact extent comes from. `decomp check` identifies
+  all of it by banner and refuses impostors (`/usr/bin/link` is GNU coreutils; `clang-cl` is
+  clang) — read its `msvc *` rows before believing any MSVC variant is usable.
   An x64 PE carries the compiler's own function table in `.pdata` (186 units on that file) and
   the tool reads it: `analyze` caches it and prints the reconciliation with the analysis (154
   agree, 32 the analysis reports shorter, 35 entries the file names no unit for), a unit's extent

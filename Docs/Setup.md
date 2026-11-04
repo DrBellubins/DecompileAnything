@@ -486,19 +486,68 @@ Steps, for `<arch>` in `x86 x64` (both must pass for a toolset to back a variant
 
 ### 6.9 Not done yet (tool-side; these are the follow-ups, not part of setup)
 
-* `.gitignore` must keep `toolchains/` and `.wine/` out of the repo (the toolchain is a
-  downloaded, non-redistributable asset — Microsoft's licence is accepted per download, never
-  bundled; `--accept-license` stays explicit).
-* A `scripts/setup-msvc.sh` (or `decomp setup-msvc`) wrapping §6.1 + §6.3/§6.4 + §6.8, with
-  `--vs/--msvc-version/--architectures` for the manifest route and `--from-existing <dir>` for the
-  import route (§6.5), and no implicit download without `--accept-license`.
-* `[msvc]` in `project.toml` next to `[ghidra]`: toolchain dir, expected `cl` version, target arch;
-  and `[variants.msvc-v141-x86]` with `compiler = "cl"` resolved through the wrapper — today
-  `cli.py` maps the `msvc` family to a bare `cl` on `PATH` (`Docs/MSVC-Plan.md` §1).
+* `.gitignore` keeps `toolchains/` and `.wine/` out of the repo (done); the two files that drive
+  the install, `toolchains/install_msvc.py` and `toolchains/msiextract.py`, are the exception and
+  are committed - the toolchain is a downloaded, non-redistributable asset, the drivers are not.
+* ~~A `scripts/setup-msvc.sh`~~ → `toolchains/install_msvc.py` (MS-2, 2026-11-04): it prunes the
+  package selection to the toolset + SDK, puts `msiextract` on PATH (see §6.10), filters the SDK
+  payload MSIs, runs `vsdownload`'s own extract/move and then `install.sh`. It has no
+  `--from-existing` import path yet (§6.5) and no VS2005-2013 route (§6.4/§6.5).
+* `decomp check` now reports the MSVC toolchain by banner: `cl`/`link`/`lib`/`dumpbin` versions
+  and the toolset family they agree on, the impostors refused (`/usr/bin/link` = GNU coreutils,
+  `clang-cl` = clang), whether the `cl` found is a Wine wrapper and whether Wine is there, and
+  the state of the matching Windows SDK (`decomp/check.py`, `msvc_tools()`/`msvc_sdk()`).
+  Still not done: a 32-bit-host answer (§6.7) and a `#include <vector>` probe - that one is
+  `Tests/tools/check_msvc_toolchain.py`'s link group, which needs the SDK.
+* `[msvc]` in `project.toml` next to `[ghidra]`: toolchain dir, expected `cl` version, target arch.
+  Today `cli.py` maps the `msvc` family to a bare `cl` on `PATH` (`Docs/MSVC-Plan.md` §1), which
+  works with the wrappers; a named prefix would let `decomp check` pin the era `detect` found.
 * All Windows path translation in one place (`decomp/toolchain.py`): run `cl` from the source
   directory with relative `/Fo`/`/I`, convert unavoidable absolute paths with `winepath -w`, and
   normalise diagnostics the way msvc-wine's wrappers do (strip `\r`, rewrite `z:\...`) —
   `compile.py` promises diagnostics verbatim, and that promise only holds if this is centralised.
+  One piece of this is done: `driver_form()` names the language for sources (`/Tp`/`/Tc`),
+  because `cl` reads a bare `/home/…/x.cpp` as an option and the wrappers rewrite `/t/x…`.
+
+### 6.10 The v141 install as it actually ran here (2026-11-04, no root)
+
+```sh
+.venv/bin/python toolchains/install_msvc.py            # --major 15 --msvc-version 15.5
+.venv/bin/python toolchains/install_msvc.py --no-sdk   # the same without the Windows SDK
+```
+
+Measured, in the order it happened:
+
+* `--msvc-version 15.5` selects `Microsoft.VisualStudio.Component.VC.Tools.14.12` in the 15.9.84
+  channel and then fails on its pinned SDK: `WinSDK version 10.0.16299 not found / Available
+  versions: 10.0.19041`. Pass `--sdk-version 10.0.19041` (the driver does).
+* The default selection is **363 packages / 2.1 GB**; the toolset + its CRT + the SDK is
+  **10 packages / 485 MB**. The IDE shell is a dependency of the toolset component in this
+  manifest, so it has to be excluded by id, one `--ignore` per package - the driver computes
+  that list from the selection instead of storing 351 ids.
+* The toolset arrives as **Vsix** (zip) packages, extracted natively by vsdownload; only the
+  Windows SDK uses MSIs. `VC/Tools/MSVC/14.12.25827/bin/Hostx64/x64/{cl,c1,c2,link,lib,dumpbin,
+  ml64}.exe` was complete from those five packages, including the C++ static CRT (`libcpmt`,
+  `libvcruntime`) - the `Microsoft.VisualCpp.CRT.*` (versionless, i.e. 14.16) packages are not
+  needed and would add a second, newer `VC/tools/msvc` that `install.sh` prefers.
+* The SDK's MSIs are the blocker: `wine64 msiexec /a pkg.msi /qn TARGETDIR=z:/abs` returns **91**
+  with `err:msi:ITERATE_Actions Execution halted, action L"InstallAdminPackage" returned 1627`
+  (measured on `Windows SDK EULA` and on `Universal CRT Headers Libraries and Sources`); a real
+  install, `msiexec /i`, exits 0 and installs nothing. `msiextract` (msitools) is the tool
+  vsdownload actually wants and it is not installable without root. The 165 cabs cannot stand in:
+  `7z l` shows their entries as `cat<hash>` - the file names live in each MSI's `File` table and
+  the paths in its `Directory` table.
+* `install.sh` refuses to build the wrappers without a `Windows Kits/10/include/10.*` directory,
+  so `--no-sdk` creates an empty placeholder and says so; `decomp check` then reports
+  `windows sdk FAIL ... libucrt.lib, kernel32.lib, oldnames.lib are not`.
+* Use it with `PATH=$PWD/toolchains/msvc/bin/x64:$PATH WINEPREFIX=$PWD/.wine`. `WINEPREFIX` must
+  be set for anything that shells out to `cl` (the wrappers otherwise use `~/.wine`). Clear a
+  stuck prefix with `pkill -x wineserver` - never `pkill -f wineserver`, which matches the shell
+  running that command.
+* A half-initialised Wine prefix makes `msiexec` fail fast with 91; stale `wineboot.exe --init`
+  processes from earlier sessions linger for days. Delete `.wine` and re-init instead of
+  debugging a prefix.
+
 * `decomp check` must report: the toolchain dir exists, the `cl` banner, whether a 32-bit host PE
   runs at all (§6.7), and that `#include <vector>` compiles — the last one is what catches a
   headers-without-compiler setup.

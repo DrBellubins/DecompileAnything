@@ -24,9 +24,11 @@ Two names to keep apart while reading this:
 * **PE support is not MSVC support.** `x86_64-w64-mingw32-g++` (installed here) emits PE/COFF
   with GCC codegen, and the MSVC *flags* in `toolchain.build_flags` would not apply to it. It
   is useful for exercising A and B and must never be labelled an MSVC variant.
-* **`/usr/bin/link` on this machine is binutils `link`**, not Microsoft's `link.exe`. Any probe
+* **`/usr/bin/link` on this machine is GNU coreutils' `link`** (9.12, the `link()` syscall
+  wrapper) - measured 2026-11-04; there is no binutils `link` here at all (`ld` is). Any probe
   that finds a compiler by name must not accept it (`cli.py:486` already maps the `msvc` family
-  to `cl`, which is the right thing to extend).
+  to `cl`, which is the right thing to extend; `decomp check` now identifies every MSVC tool by
+  its banner instead).
 
 ## 2. The probe target
 
@@ -309,15 +311,72 @@ Still open after MS-1, deliberately: `detect --range` still samples `.text` cut 
 (`toolchain.target_shape`), so it does not use the unit table yet; MS-4's shape profiles should
 sample real units.
 
-**MS-2: put a compiler on the machine.** msvc-wine full install (A) into a dedicated prefix,
-`--major 15` for a target-era match; optionally download-only + `lld` (B) for a fast, Wine-free
-path. Record the result in `decomp check` (it already maps the `msvc` family to `cl` at
-`cli.py:486`): probe `cl`, `link`, `dumpbin`, print their versions, and refuse to accept
-`/usr/bin/link`. Add `msvc-o0`/`msvc-o2` variants to `Tests/project.toml` and a PE build of the
-benchmark (`Tests/eval.py` needs `/Fe` linking and an answer key from `.pdata`/PDB instead of
-`nm --print-size`).
-*Check:* `Tests/tools/check_msvc_toolchain.py` (versions, and one probe compile + one probe
-link at each level), and the benchmark's own `selfcheck` passing on the PE build.
+**MS-2: put a compiler on the machine.** *Partly done 2026-11-04 - the toolset is installed and
+works, the Windows SDK is the part this machine cannot extract.* Everything tool-side is in and
+gated; the two checks that need a link are reported as skipped with the reason named, and the
+benchmark's PE path is proven on a PE built by MinGW instead.
+
+What is on the machine (all re-runnable with `toolchains/install_msvc.py`, §6.10 of Setup.md):
+
+```
+cl      -> Microsoft (R) C/C++ Optimizing Compiler Version 19.12.25835.7 for x64
+link    -> Microsoft (R) Incremental Linker Version 14.12.25835.7
+lib     -> Microsoft (R) Library Manager Version 14.12.25835.7
+dumpbin -> Microsoft (R) COFF/PE Dumper Version 14.12.25835.7
+```
+
+i.e. toolset **14.12**, the era `decomp detect` read off `notepad.exe` (§2) - reached with
+`--major 15 --msvc-version 15.5 --host-arch x64 --architecture x64`, which is what §5 predicted
+(`--msvc-version 15.5` → 14.12). `cl`'s own version is 19.12 and the toolset is 14.**12**: same
+minor, different major, from VS2015 on. `cl /?` prints no banner - `/Bv` does; the other four
+answer to `--version` as well as `/?`.
+
+* **The default install is not the toolchain.** That channel resolves `VC.Tools.14.12` to 363
+  packages / 2.1 GB because the VS2017 graph hangs the IDE shell under the toolset. Keeping the
+  pinned toolset, its own CRT headers and x64 import libraries, and the Windows SDK gives 10
+  packages / 485 MB (`install_msvc.py`'s `KEEP`). The versionless `Microsoft.VisualCpp.CRT.*`
+  packages must stay out: they put a second, newer `VC/tools/msvc/14.16` in the tree, and
+  `install.sh` picks the highest version that has bin+include+lib.
+* **`--msvc-version 15.5` cannot be installed as written**: it pins Windows SDK 10.0.16299, which
+  the 15.9 channel no longer serves ("WinSDK version 10.0.16299 not found / Available versions:
+  10.0.19041"). Pass `--sdk-version 10.0.19041`.
+* **The Windows SDK payloads cannot be extracted on this machine.** They are the one thing
+  missing. `vsdownload.py` extracts them with `msiextract` (msitools) - not installable here, no
+  root - and Wine 9.21's own `msiexec /a` stops at `InstallAdminPackage` with **1627** for every
+  one of these WiX-built MSIs (`/i` returns 0 and installs nothing). The cabs cannot substitute:
+  their entries are obfuscated (`cat<hash>`), so the file tree only exists in the MSI's
+  `File`/`Directory` tables. `toolchains/msiextract.py` implements the `msiextract -C DEST
+  package.msi` interface over `wine64 msiexec /a` - it is put on PATH by the driver and it does
+  extract VC-era MSIs, just not these - so the remaining step is msitools, or an MSI reader.
+  With `--no-sdk`, the driver leaves an empty `Windows Kits/10/{Include,Lib}` placeholder so
+  `install.sh` still builds the wrappers, and `decomp check` reports that placeholder as not
+  usable rather than as an SDK.
+* **What the toolset proves now** (`Tests/tools/check_msvc_toolchain.py`, exit 2 while the SDK is
+  a placeholder, 0 when it is real): identity of cl/link/lib/dumpbin by banner, all four in the
+  same toolset family, `/usr/bin/link` refused (§1 - measured: it is GNU **coreutils** `link`
+  9.12, not binutils `link`, which does not exist here), `clang-cl` named as clang, then a probe
+  compile at `/Od` and `/O2` built through `decomp.compile.build()` with the variant's own flags.
+  Both produce x86-64 COFF that `extract.CandidateObject` opens with no error, each function in
+  its own `.text$mn` - MS-3's premise, measured - and the two objects differ.
+* **`/Tp`/`/Tc` are needed for sources, not just for odd suffixes.** `driver_form()` now names the
+  language: `cl` reads a bare `/home/…/x.cpp` as an option, and the msvc-wine wrapper rewrites
+  `/t/x…` by stripping two characters, so an absolute path as a bare argument cannot work.
+* **MSVC/PE flags and variants**: `Tests/project.toml` gains `msvc-o0`/`msvc-o2` (`cl`, `/Od`
+  and `/O2`, `/MT` so the reference binary runs under Wine with no VC redist installed) and
+  `mingw-o0`, which is PE plumbing only and labelled as such (§1). `Tests/eval.py` gained the PE
+  half of the answer key - `.pdata` read with stdlib only, names from COFF symbols or from the
+  map file it asks `link` for (`/MAP:<binary>.map`, not from the config, since only the build
+  knows where the binary is), a Wine runner for the reference binary, and no `strip` for a PE,
+  which has no symbol table to strip. Measured on the MinGW PE build: `answer key: 89 units (89
+  markers in source)` and `selfcheck` → `89 cases, 0 failures`. One real finding there: **a
+  GCC-built PE splits `.pdata` across block groups of one function**, so almost no record starts
+  at a named symbol; eval.py says so and falls back to symbol spacing for the extents. The MSVC
+  case (§4, one record per function) is what the exact form is for - `notepad.exe` still yields
+  exactly 186 units through this code.
+
+Still open in MS-2, all of it behind the same missing SDK: the probe **link** and its run, and
+`eval.py build/selfcheck --variant msvc-o0`. And deliberately not here: reading COFF *candidate*
+symbols, which is MS-3 (the probe objects above are the evidence for it).
 
 **MS-3: the COFF candidate side - this is where `try` starts working on PE.**
 `extract.CandidateObject` (`extract.py:334`) needs a COFF branch: sections and relocations come

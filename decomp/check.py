@@ -221,7 +221,7 @@ MSVC_TOOLS = ("cl", "link", "lib", "dumpbin", "undname")
 def _banner_arguments(name: str) -> list[list[str]]:
 	if name == "cl":
 		return [["/Bv", "/c"], ["--version"], ["/?"]]
-	return [["/?"], ["--version"]]
+	return [["--version"], ["/?"]]
 
 # "Microsoft (R) Incremental Linker Version 14.12.25835", "Microsoft (R) C/C++ Optimizing
 # Compiler Version 19.12.25835 for x64", "Microsoft (R) COFF/PE Dumper Version ...".
@@ -235,9 +235,9 @@ _IMPOSTOR_BANNER = re.compile(r"\bGNU\b|binutils|coreutils", re.I)
 class Tool:
 	"""One MSVC-family tool as found on this machine, identified rather than assumed."""
 
-	def __init__(self, name: str) -> None:
+	def __init__(self, name: str, path: str | None = None) -> None:
 		self.name = name
-		self.path = shutil.which(name)
+		self.path = path or shutil.which(name)
 		self.text = ""
 		self.what = ""       # the tool's own description, from its banner
 		self.version = ""    # the version the banner prints, e.g. 19.12.25835

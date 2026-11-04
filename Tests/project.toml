@@ -80,4 +80,4 @@ linkflags = ["/SUBSYSTEM:CONSOLE"]
 compiler = "x86_64-w64-mingw32-g++"
 optimize = 0
 arch = "x86-64"
-linkflags = ["-Wl,-Map,da_tests.map"]
+linkflags = ["-static", "-static-libgcc", "-static-libstdc++"]

@@ -71,12 +71,13 @@ def tools() -> dict[str, check.Tool]:
 				"%s is the same toolset as cl (%s)" % (name, family))
 	expect(bool(family), "the toolset family of this toolchain: %s" % (family or "unknown"))
 	# The impostor the plan names. On this machine /usr/bin/link is GNU coreutils' `link`.
-	impostor = Path("/usr/bin/link")
-	if impostor.is_file():
-		pretender = check.Tool("link")
-		if str(pretender.path) == str(impostor):
-			expect(pretender.vendor != "msvc", "a `link` that is not Microsoft's is refused: %s"
-				% pretender.describe())
+	# The impostor the plan names: /usr/bin/link. Asked about by path, so that a real link.exe
+	# being on PATH first does not hide it.
+	for impostor in ("/usr/bin/link", "/bin/link"):
+		if Path(impostor).is_file():
+			pretender = check.Tool("link", impostor)
+			expect(pretender.vendor != "msvc", "%s is refused as MSVC: %s" % (impostor, pretender.describe()))
+			break
 	clang_cl = check.Tool("clang-cl")
 	if clang_cl.found:
 		expect(clang_cl.vendor != "msvc", "clang-cl is named as what it is: %s" % clang_cl.describe())
@@ -93,7 +94,7 @@ def probe_compile(variant: dict, work: Path) -> dict[int, Path]:
 		object_path = work / ("probe_O%d.obj" % level)
 		built = build_.build([source], object_path, compiler=body["compiler"],
 			flags=toolchain.build_flags(body), includes=[])
-		expect(built.ok, "cl /O%d compiles (%s)" % (level, " ".join(built.command[-3:])))
+		expect(built.ok, "cl %s compiles (%s)" % ("/O2" if level >= 2 else "/Od", " ".join(built.command[-3:])))
 		if not built.ok:
 			print("      " + "\n      ".join(built.diagnostics.splitlines()[:10]))
 			continue

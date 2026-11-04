@@ -96,6 +96,31 @@ contiguously across that gap, and `find`/`show` say which entries the table does
 then re-checks the ELF path, which has no unit table and must be unchanged. Exit 1 means a
 fact came out wrong; exit 2 means the target or its analysis is missing.
 
+## Building the benchmark itself as a PE (MS-2)
+
+`Tests/project.toml` has three PE-capable variants. `cl` needs the MSVC toolchain of
+Docs/Setup.md §6 on PATH (and `WINEPREFIX` set, since the wrappers shell out to Wine):
+
+```sh
+PATH=$PWD/toolchains/msvc/bin/x64:$PATH WINEPREFIX=$PWD/.wine \
+  .venv/bin/python Tests/eval.py build --variant msvc-o0
+.venv/bin/python Tests/tools/check_msvc_toolchain.py      # exit 2 = no toolchain / no Windows SDK
+```
+
+`msvc-o0`/`msvc-o2` are real MSVC variants (`cl /Od`, `/O2`, `/MT`). `mingw-o0` is **not** an
+MSVC variant and never a stand-in for one (Docs/MSVC-Plan.md §1) — it is here because it is the
+only PE this machine can build without a Windows SDK, so it is what exercises eval.py's PE half:
+the answer key comes from the file's `.pdata` function table (read with stdlib only) plus names
+from COFF symbols or from a linker map, `strip` is skipped (a PE from `link` has no symbol table
+to strip), and the reference binary is run through `wine64`.
+
+Measured on `mingw-o0`: `answer key: 89 units (89 markers in source)` and `selfcheck` →
+`89 cases, 0 failures`. Note the difference in what the two PEs say: an **MSVC**-built x64 PE has
+one `.pdata` record per function (`notepad.exe`: exactly 186), a **GCC**-built one splits a
+function across several records, so eval.py prints that it fell back to symbol spacing for the
+extents. `decomp check` prints the same facts about the installed toolchain (versions, the
+toolset family, the Windows SDK state).
+
 ## The binary
 
 `main.cpp` only parses the mode and hands a `CSelfTest` to the three test classes:

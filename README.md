@@ -20,7 +20,8 @@ it reports facts about the original binary and scores a candidate the model wrot
 | 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | not implemented |
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
-| MS-2..MS-5 | `cl` on the machine, COFF candidates for `try`, MSVC flags, MSVC C++ | not implemented |
+| MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **partly** - toolset v141 14.12 installed and compiling, the Windows SDK cannot be extracted here (`python Tests/tools/check_msvc_toolchain.py`, exit 2) |
+| MS-3..MS-5 | COFF candidates for `try`, MSVC flags, MSVC C++ | not implemented |
 
 ## Use it
 
@@ -282,9 +283,13 @@ all three scripts print OK on this machine).
   ~140 s), and since MS-0 so do the build note, `find`, `show` and `detect` (its report names
   the v141 toolset, `/GL`+`/LTCG`, and the public PDB that carries the answer key); since MS-1
   so does its own function table, `.pdata`, whose 186 unit boundaries the tool keeps, prefers for
-  a unit's extent, and reports its disagreement with the analysis with. Still missing: any
-  candidate side, since nothing here can run `cl` and no COFF semantics are implemented
-  (MS-2/MS-3). [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
+  a unit's extent, and reports its disagreement with the analysis with. Since MS-2 there *is* an
+  MSVC compiler here - `cl`/`link`/`lib`/`dumpbin` 14.12.25835.7 (v141, the era `detect` names
+  for that file), built through `decomp compile` at `/Od` and `/O2`, and its COFF objects open in
+  `extract.CandidateObject` with each function in its own `.text$mn`. Still missing: `try` on a
+  COFF candidate (MS-3 - the section-as-extent and no-addend relocation rules), and any *link*
+  with `cl`, because the Windows SDK of that prefix is an empty placeholder (below).
+  [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
 * Ghidra's function boundaries at `-O2` differ from the compiler's, and a `-O2` body can be
   split across `.text` and `.text.unlikely`; only the first range is compared today.
   Extracting across ranges is Phase 5. (An x64 PE no longer has that problem: the unit table
@@ -296,9 +301,13 @@ all three scripts print OK on this machine).
 * A candidate that calls a helper it does not define reaches it by name, while the analysis of
   a stripped target knows it by address only: that call reads as an operand difference, and
   the symbol table prints both names so the loop can still see what happened.
-* No compiler here speaks MSVC: `cl.exe` is Windows-only, and the two Linux routes to it
-  (real `cl` under Wine via msvc-wine, or `clang-cl` with the MSVC/Windows SDK headers) are
-  both missing pieces on this machine - `msitools`/`winbind`, the SDK headers, and `lld-link`.
+* The MSVC toolchain here is complete except for its **Windows SDK**: the SDK ships as payload
+  MSIs, and this machine has no way to extract them - `msitools`/`msiextract` needs root, and
+  Wine 9.21's `msiexec /a` stops at `InstallAdminPackage` with 1627 on those MSIs (the cabs alone
+  are no use: their entries are named `cat<hash>`, the tree lives in the MSI tables). So `cl`
+  compiles freestanding code and nothing more; `toolchains/install_msvc.py` + Docs/Setup.md §6.10
+  reproduce the install, and `decomp check` says which part is missing. `clang-cl` is installed
+  but is clang's codegen, never an MSVC variant; `lld-link` is absent.
   MinGW-w64 gcc produces PE/COFF but with GCC codegen, so it can test the container, never the
   match. The setup steps for every toolset era, VS2005 - VS2026, 32-bit and 64-bit, are
   [Docs/Setup.md](Docs/Setup.md) §6 - including the two facts that decide reachability here: the

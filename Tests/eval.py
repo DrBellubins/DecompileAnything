@@ -308,7 +308,14 @@ def msvc_map_names(binary, image_base, sections):
 	return names
 
 def pe_symbols(binary):
-	"""The same entry shape `symbols()` returns for an ELF, built from `.pdata` + names."""
+	"""The same entry shape `symbols()` returns for an ELF, built from `.pdata` + names.
+
+	An MSVC-built x64 PE has one `.pdata` record per function, which is the exact answer key
+	(MSVC-Plan §4). GCC splits a function into one record per block group, so on a MinGW-built
+	PE most records name no symbol. When that happens the units are taken from the symbols
+	instead, with an extent that runs to the next one - stated out loud, because it is a worse
+	answer and any score built on it inherits that.
+	"""
 	image_base, sections = pe_sections(binary)
 	units = pe_units(binary)
 	if not units:
@@ -320,8 +327,35 @@ def pe_symbols(binary):
 		name = names.get(unit["address"], "")
 		entries.append({"address": unit["address"], "size": unit["size"], "mangled": name,
 			"name": simple_name(name) if name else "unnamed@0x%x" % unit["address"], "type": "t"})
+	named = sum(1 for entry in entries if entry["mangled"])
+	if named * 3 < len(entries):
+		print("  note: only %d of %d .pdata records of %s carry a name - this PE was not built "
+			"by MSVC (GCC splits one function across several unwind records), so the units below "
+			"come from the symbol table with extents up to the next symbol" % (named, len(entries), binary))
+		entries = symbol_units(names)
+	# A PE built by GCC still uses Itanium names; MSVC decorations are handled by simple_name.
+	itanium = [entry["mangled"] for entry in entries if entry["mangled"].startswith("_Z")]
+	if itanium:
+		table = dict(zip(sorted(set(itanium)), demangle(sorted(set(itanium)))))
+		for entry in entries:
+			if entry["mangled"]:
+				entry["name"] = simple_name(table.get(entry["mangled"], entry["mangled"]))
 	entries.sort(key=lambda entry: entry["address"])
 	return entries
+
+
+def symbol_units(names):
+	"""Named addresses -> units, each running to the next name. A merged `.rdata` pool or a
+	tail-padded function makes this wrong at the edges; it is still the boundary the file
+	names, and better than no boundary at all."""
+	addresses = sorted(names)
+	entries = []
+	for index, address in enumerate(addresses):
+		end = addresses[index + 1] if index + 1 < len(addresses) else address
+		name = names[address]
+		entries.append({"address": address, "size": max(0, end - address), "mangled": name,
+			"name": name, "type": "t"})
+	return [entry for entry in entries if entry["size"]]
 
 
 def simple_name(demangled):
