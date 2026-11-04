@@ -49,3 +49,35 @@ linkflags = ["-no-pie", "-static"]
 # compiler = "clang++"
 # optimize = 0
 # arch = "x86-64"
+
+# MSVC (Docs/MSVC-Plan.md MS-2). Needs the toolchain of Docs/Setup.md §6 on PATH:
+#   PATH=$PWD/toolchains/msvc/bin/x64:$PATH
+# `cl` spells its flags differently (decomp.toolchain.build_flags turns optimize=0 into /Od
+# and optimize=2 into /O2, and driver_form() turns those into cl's own argument form), and a
+# PE has no ELF symbol sizes - eval.py reads its function boundaries out of `.pdata`, the
+# compiler's own function table, and its names out of the map file it asks link for.
+# /MT, not /MD: the reference binary must run under Wine, and a /MD build needs a VC runtime
+# redist installed that this machine does not have.
+[variants.msvc-o0]
+compiler = "cl"
+optimize = 0
+arch = "x86-64"
+cppflags = ["/MT"]
+linkflags = ["/SUBSYSTEM:CONSOLE"]
+
+[variants.msvc-o2]
+compiler = "cl"
+optimize = 2
+arch = "x86-64"
+cppflags = ["/MT"]
+linkflags = ["/SUBSYSTEM:CONSOLE"]
+
+# A PE built by GCC. Not an MSVC variant and never an MSVC stand-in (Docs/MSVC-Plan.md §1):
+# the flags above would not apply to it and the codegen is GCC's. It is here because it is
+# the only PE this machine can build without a Windows SDK, so it is what exercises eval.py's
+# PE answer key (.pdata + map file) and the Wine runner.
+[variants.mingw-o0]
+compiler = "x86_64-w64-mingw32-g++"
+optimize = 0
+arch = "x86-64"
+linkflags = ["-Wl,-Map,da_tests.map"]

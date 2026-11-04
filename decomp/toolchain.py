@@ -72,7 +72,14 @@ def driver_form(compiler: str, flags: list[str], sources: list[Path], object_pat
 	for include in [*(includes or []), *(Path(source).parent for source in sources)]:
 		command += [("/I" if msvc_driver else "-I"), str(Path(include))]
 	command += ["/c"] if msvc_driver else ["-c"]
-	command += [str(source) for source in sources]
+	if msvc_driver:
+		# `cl` reads a bare `/home/…/x.cpp` as an option, and the msvc-wine wrappers rewrite
+		# `/x/…` into `z:/…` by stripping the switch, so the language has to be named: /Tc for
+		# C, /Tp for C++ (which is also what lets a candidate with an odd suffix build).
+		for source in sources:
+			command.append(("/Tc" if Path(source).suffix == ".c" else "/Tp") + str(source))
+	else:
+		command += [str(source) for source in sources]
 	command += ["/Fo%s" % object_path] if msvc_driver else ["-o", str(object_path)]
 	return command
 

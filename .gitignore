@@ -7,6 +7,8 @@ __pycache__/
 build/
 dist/
 
+%SystemDrive%/
+
 Tests/Proprietary/
 
 # Ghidra analysis cache (Docs/Setup.md §3): the Ghidra project + analysis.db per target

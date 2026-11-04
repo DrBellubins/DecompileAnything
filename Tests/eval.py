@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shlex
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -96,11 +97,62 @@ def variant_flags(config, name):
 	extra = list(variant.get("cppflags", config.get("cppflags", [])))
 	arch = ["-m32"] if variant.get("arch") == "x86" else []
 	link = list(variant.get("linkflags", config.get("linkflags", [])))
+	if is_msvc(compiler):
+		# cl takes none of -std/-O/-Wall (Docs/MSVC-Plan.md §1); /nologo keeps the build log
+		# readable. Same rule as decomp.toolchain.build_flags - the benchmark and the tool have
+		# to build a candidate the same way.
+		level = "/O2" if int(variant.get("optimize", 0)) >= 2 else "/Od"
+		std = "/std:c++%s" % str(config["std"]).replace("c++", "").replace("gnu++", "") or "17"
+		return compiler, [level, std, "/EHsc", "/W3", "/nologo", "/FS"] + extra, link
 	return compiler, ["-std=%s" % config["std"], "-O%d" % variant.get("optimize", 0), "-Wall", "-Wextra"] + arch + extra, link
+
+
+def is_msvc(compiler):
+	"""An MSVC driver - a different argument form in everything that matters."""
+	return str(compiler or "").lower() in ("cl", "cl.exe", "clang-cl", "msvc", "icx", "icx-cl")
+
+
+def is_pe(path):
+	"""PE/COFF rather than ELF - by its magic, because the answer key differs per format."""
+	try:
+		with open(path, "rb") as handle:
+			return handle.read(2) == b"MZ"
+	except OSError:
+		return False
+
+
+def wine_runner():
+	"""A PE is built for Windows; Wine runs it. `wine64` first: a 32-bit wine launcher is not
+	usable on this machine (Docs/Setup.md §1)."""
+	import shutil
+
+	return shutil.which("wine64") or shutil.which("wine")
+
+
+def runner(path):
+	return [wine_runner(), str(path)] if is_pe(path) else [str(path)]
 
 
 # --------------------------------------------------------------------------------------
 # symbol tables
+
+
+def msvc_simple_name(decorated):
+	"""`?AbsDiff@CMathTests@@SAHHH@Z` -> `CMathTests::AbsDiff`.
+
+	`c++filt` cannot read an MSVC decoration (Docs/MSVC-Plan.md §8), and the decorated name is
+	the comparison key anyway - this is only the display/matching form of the Itanium names the
+	answer key already uses. Anything it does not understand comes back unchanged.
+	"""
+	if not decorated.startswith("?"):
+		return decorated
+	body = decorated[1:].split("@@")[0]
+	parts = body.split("@")
+	name = parts[0]
+	owner = [p for p in parts[1:] if p and not p.startswith("?")]
+	if "?" in name or not name:
+		return decorated
+	return "::".join(reversed(owner) + [name]) if owner else name
 
 
 def demangle(names):
@@ -111,7 +163,16 @@ def demangle(names):
 
 
 def symbols(binary):
-	"""Every symbol with a size: [{address,size,mangled,name,type}] in address order."""
+	"""Every symbol with a size: [{address,size,mangled,name,type}] in address order.
+
+	ELF: `nm --print-size` gives names and sizes. A PE gives neither in general - a linked
+	MSVC image has no COFF symbol table at all, and COFF symbols have no size field - so the
+	extents come from the file's own function table (`.pdata`, MSVC-Plan §4) and the names
+	from whatever the build left behind: COFF symbols (a MinGW PE) or the map file `link /MAP`
+	writes. A unit the names do not cover is still a unit; it is just unnamed.
+	"""
+	if is_pe(binary):
+		return pe_symbols(binary)
 	out = sh(["nm", "--defined-only", "--print-size", str(binary)])
 	entries = []
 	for line in out.splitlines():
@@ -132,9 +193,142 @@ def symbols(binary):
 	return entries
 
 
+# --------------------------------------------------------------------------------------
+# the PE side of the answer key (Docs/MSVC-Plan.md §4)
+
+
+def pe_sections(path):
+	"""(image base, {section name: {va, vsize, rawptr, rawsize}}), stdlib only.
+
+	Section `va` is imagebase + RVA, i.e. in the domain objdump, Ghidra and the cache use -
+	the one conversion that has to be made exactly once (MSVC-Plan §8).
+	"""
+	with open(path, "rb") as handle:
+		data = handle.read()
+	offset = struct.unpack_from("<I", data, 0x3C)[0]
+	if data[offset:offset + 4] != b"PE\0\0":
+		raise RuntimeError("%s is not a PE" % path)
+	coff = offset + 4
+	_, count, _, _, _, size_optional, _ = struct.unpack_from("<HHIIIHH", data, coff)
+	optional = coff + 20
+	magic = struct.unpack_from("<H", data, optional)[0]
+	image_base = (struct.unpack_from("<Q", data, optional + 24)[0] if magic == 0x20B
+		else struct.unpack_from("<I", data, optional + 28)[0])
+	sections = {}
+	for index in range(count):
+		head = optional + size_optional + index * 40
+		name = data[head:head + 8].split(b"\0")[0].decode("latin-1")
+		vsize, rva, rawsize, rawptr = struct.unpack_from("<IIII", data, head + 8)
+		sections[name] = {"va": image_base + rva, "vsize": vsize, "rawptr": rawptr, "rawsize": rawsize}
+	return image_base, sections
+
+
+def pe_units(path):
+	"""`.pdata`, the x64 unwind directory: (begin, end) of every function the compiler emitted.
+
+	Iterated by the bytes the file actually holds, not by the section's virtual size - the
+	padding after the records is not in the file (MSVC-Plan §8).
+	"""
+	image_base, sections = pe_sections(path)
+	table = sections.get(".pdata")
+	if not table:
+		return []
+	with open(path, "rb") as handle:
+		handle.seek(table["rawptr"])
+		data = handle.read(table["rawsize"])
+	units = []
+	for index in range(len(data) // 12):
+		begin, end, _unwind = struct.unpack_from("<III", data, index * 12)
+		if end <= begin:
+			continue
+		units.append({"address": image_base + begin, "size": end - begin})
+	return units
+
+
+def pe_names(binary, units, image_base, sections):
+	"""Names for those extents: COFF symbols if the file kept them, else the map file.
+
+	A linked MSVC image has no COFF symbol table (`nm` says "no symbols"), which is why the
+	MSVC build links with `/MAP`. A MinGW PE does keep symbols, and `nm` reads them - that is
+	the form this machine can produce without a Windows SDK.
+	"""
+	try:
+		out = sh(["nm", "--defined-only", str(binary)])
+	except RuntimeError:
+		out = ""
+	names = {}
+	for line in out.splitlines():
+		parts = line.split(None, 2)
+		if len(parts) != 3 or parts[1] not in "tTwWdDrRbB":
+			continue
+		try:
+			names[int(parts[0], 16)] = parts[2]
+		except ValueError:
+			continue
+	if names and not any(address in names for address in (u["address"] for u in units)):
+		# nm quotes an address relative to the image base on some builds; the units are biased.
+		shifted = {address + image_base: name for address, name in names.items()}
+		if any(address in shifted for address in (u["address"] for u in units)):
+			names = shifted
+	if not names:
+		names.update(msvc_map_names(binary, image_base, sections))
+	return names
+
+
+def msvc_map_names(binary, image_base, sections):
+	"""`link /MAP`: the "Publics by Value" table, whose rows are `section:offset`."""
+	path = Path(str(binary) + ".map")
+	if not path.is_file():
+		path = path.with_suffix("")  # <stem>.map, not <stem>.exe.map
+	if not path.is_file():
+		return {}
+	text = path.read_text(errors="replace")
+	if "Publics by Value" not in text:
+		return {}
+	# The map's `0001:` indexes name image sections; the RVAs are read from the file itself,
+	# which is the same fact stated once.
+	names = {}
+	body = text.split("Publics by Value", 1)[1]
+	for line in body.splitlines():
+		match = re.match(r"^\s*([0-9a-f]{4}):([0-9a-f]{8})\s+(.*)$", line)
+		if not match:
+			continue
+		index, offset = int(match.group(1), 16), int(match.group(2), 16)
+		fields = match.group(3).split()
+		# The row is `<ordinal> <hits> <thunk> <#bytes> <type> <section> <symbol> <object>`;
+		# anchoring on the section field is what survives the columns changing between linker
+		# versions, and the symbol is the field that follows it.
+		position = next((i for i, field in enumerate(fields) if field.startswith((".text", ".data", ".rdata", "INIT"))), None)
+		if position is None or position + 1 >= len(fields):
+			continue
+		section = fields[position]
+		if section not in sections:
+			continue
+		names[sections[section]["va"] + offset] = fields[position + 1]
+	return names
+
+def pe_symbols(binary):
+	"""The same entry shape `symbols()` returns for an ELF, built from `.pdata` + names."""
+	image_base, sections = pe_sections(binary)
+	units = pe_units(binary)
+	if not units:
+		raise RuntimeError("%s has no .pdata - the answer key of an x64 PE is its function table"
+			% binary)
+	names = pe_names(binary, units, image_base, sections)
+	entries = []
+	for unit in units:
+		name = names.get(unit["address"], "")
+		entries.append({"address": unit["address"], "size": unit["size"], "mangled": name,
+			"name": simple_name(name) if name else "unnamed@0x%x" % unit["address"], "type": "t"})
+	entries.sort(key=lambda entry: entry["address"])
+	return entries
+
+
 def simple_name(demangled):
 	"""`CMathTests::AbsDiff(int, int)` -> `CMathTests::AbsDiff`."""
 	text = demangled
+	if text.startswith("?"):
+		return msvc_simple_name(text)
 	text = re.sub(r"\s+(const|noexcept|volatile)\b.*$", "", text)
 	paren = text.find("(")
 	if paren > 0:
@@ -512,7 +706,25 @@ def score_tokens(original, candidate):
 
 
 def compile_source(compiler, flags, source, output):
+	if is_msvc(compiler):
+		# A bare `/home/…/x.cpp` reads as an option to cl, so the language is named (the same
+		# rule decomp.toolchain.driver_form follows).
+		sh([compiler] + flags + ["/c",
+			("/Tc" if str(source).endswith(".c") else "/Tp") + str(source), "/Fo%s" % output])
+		return
 	sh([compiler] + flags + ["-c", str(source), "-o", str(output)])
+
+
+def link_binary(compiler, flags, objects, linkflags, binary):
+	"""Link the benchmark. `cl` names the output with /Fe and passes the rest to the linker
+	after /link; a gcc driver uses -o (Docs/MSVC-Plan.md §7, MS-2)."""
+	if is_msvc(compiler):
+		# /MAP is not in the config on purpose: the answer key needs the map next to the
+		# binary it describes, and only this function knows where that is.
+		sh([compiler] + ["/Fe:%s" % binary] + [str(o) for o in objects] +
+			["/link", "/MAP:%s.map" % binary] + linkflags)
+		return
+	sh([compiler] + flags + [str(o) for o in objects] + linkflags + ["-o", str(binary)])
 
 
 def cmd_build(config, variants, capture=True):
@@ -528,21 +740,36 @@ def cmd_build(config, variants, capture=True):
 				SOURCE_DIR / source, object_path)
 			objects.append(object_path)
 		binary = out_dir / "da_tests"
-		sh([compiler] + flags + [str(o) for o in objects] + linkflags + ["-o", str(binary)])
+		link_binary(compiler, flags, objects, linkflags, binary)
+		if not binary.exists() and Path(str(binary) + ".exe").exists():
+			# A Windows toolchain adds the .exe suffix to an extension-less output name (MinGW's
+			# ld does; `cl /Fe:` does not). This harness names the reference binary one way.
+			Path(str(binary) + ".exe").rename(binary)
 		stripped = out_dir / "da_tests.stripped"
-		sh(["strip", "--strip-all", str(binary), "-o", str(stripped)])
+		if is_pe(binary):
+			# A PE from `link` has no symbol table to strip and `strip` would only rewrite the
+			# file, so the two names hold the same bytes by construction. The check below still
+			# runs, because the answer key addresses have to stay valid either way.
+			stripped.write_bytes(binary.read_bytes())
+		else:
+			sh(["strip", "--strip-all", str(binary), "-o", str(stripped)])
 		# strip must not move anything: the answer key addresses have to stay valid
 		original_text = sh(["objdump", "-s", "--section=.text", str(binary)], binary=False)
 		stripped_text = sh(["objdump", "-s", "--section=.text", str(stripped)], binary=False)
 		if original_text.split("\n", 2)[2:] != stripped_text.split("\n", 2)[2:]:
 			raise RuntimeError("%s: .text differs after strip, addresses are not reusable" % variant)
+		try:
+			compiler_version = sh([compiler, "--version"] if not is_msvc(compiler) else [compiler, "/Bv", "/c"])
+		except RuntimeError as exc:  # cl /Bv exits non-zero: it has no source file, and that is fine
+			compiler_version = str(exc)
 		build_info = {
 			"variant": variant,
-			"compiler": sh([compiler, "--version"]).splitlines()[0],
+			"compiler": (compiler_version.strip().splitlines() or [""])[0],
 			"flags": flags,
 			"binary": str(binary),
 			"stripped": str(stripped),
-			"comment_section": sh(["readelf", "-p", ".comment", str(binary)], binary=False).strip(),
+			"comment_section": (sh(["readelf", "-p", ".comment", str(binary)], binary=False).strip()
+				if not is_pe(binary) else ""),
 		}
 		(out_dir / "build.json").write_text(json.dumps(build_info, indent=1) + "\n")
 		build_answer_key(variant, config)
@@ -557,7 +784,7 @@ def cmd_build(config, variants, capture=True):
 def cmd_goldens(variant, config):
 	out_dir = BUILD_DIR / variant
 	binary = out_dir / "da_tests"
-	text = sh([str(binary), "--golden"])
+	text = sh(runner(binary) + ["--golden"])
 	(out_dir / "goldens.jsonl").write_text(text)
 	cases = len([line for line in text.splitlines() if line.strip()])
 	print("goldens: %d cases -> %s" % (cases, out_dir / "goldens.jsonl"))
@@ -565,7 +792,7 @@ def cmd_goldens(variant, config):
 
 def cmd_selfcheck(variant, config):
 	binary = BUILD_DIR / variant / "da_tests"
-	out = sh([str(binary)])
+	out = sh(runner(binary))
 	print(out.strip())
 	return 0 if " 0 failures" in out else 1
 

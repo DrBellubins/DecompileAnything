@@ -1,4 +1,4 @@
-# DecompileAnything
+![Decompile Anything](Images/DecompileAnythingBanner.png)
 
 `decomp` is a CLI that lets an LLM decompile a function out of a compiled binary and keep
 iterating until the candidate recompiles to the same bytes. The tool **never edits source**:
