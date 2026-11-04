@@ -48,7 +48,7 @@ decomp/
 
 ## Phases
 
-Status: **Phase 1 and Phase 2 are implemented.** What the commands do, the cache format, the
+Status: **Phase 1, Phase 2 and Phase 3 are implemented.** What the commands do, the cache format, the
 measured results on `Tests/`, and the open gaps are documented in [README.md](README.md). The
 rest of this plan is unchanged and still authoritative for what comes next.
 
@@ -79,10 +79,29 @@ rest of this plan is unchanged and still authoritative for what comes next.
    own path - 99.94% mean, 88/89 pass the gate at gcc -O0, above the independent harness's
    own 99.53%/83. Known gaps are named in README.md.)
 
-**Phase 3: Discovery and compiler detection**
-1. `toolchain.py`: detect the compiler via `.comment` (ELF) or the Rich header (PE), and write a starting `project.toml`.
-2. `find`: name and string search, plus xref queries ("functions touching this global/vtable") to support requests like "decompile the coin system."
-3. Flag inference helper: compile a few reference snippets at different optimization levels and compare prologue and epilogue patterns.
+**Phase 3: Discovery and compiler detection** - done, 2026-11-03
+1. `toolchain.py`: detect the compiler via `.comment` (ELF) or the Rich header (PE), and write a starting `project.toml`. (Done as `decomp detect <bin> [--write path]`: `.comment`/Rich header/CodeView, the object type - PIE vs `-no-pie`, dynamic vs `-static` - the machine class, and the C++ ABI and lowest `-std` proved by `.dynstr`/`DT_NEEDED`. The written config separates facts from guesses in comments and its `[variants.*]` reproduces the flags the target was really built with, measured on all three benchmark variants.)
+2. `find`: name and string search, plus xref queries ("functions touching this global/vtable") to support requests like "decompile the coin system". (Done: symbol/global/vtable search, xrefs with the instruction at each site, the pointer slots of a data object - a vtable's methods - and which vtables a function appears in, plus `--family <hops>`, which grows the match along the call graph and ranks the result by call edges and shared objects. New module `discover.py`; the pointers come from the link's relocations, because in a PIE the file bytes of `.data.rel.ro` are zeros.)
+3. Flag inference helper: compile a few reference snippets at different optimization levels and compare prologue and epilogue patterns. (Done: `PROBE_SOURCE` is compiled at `-O0..-O3` with the installed toolchain and the target's own code is described the same way, then ranked. -O0 is separated strongly from everything else (0.94 vs 3.32, and 0.26 vs 3.08 for the -m32 build); -O1/-O2/-O3 are reported as "optimised code", not a level, because that is what the evidence carries. A statically linked image must be sampled with `--range`: its glibc outvotes the program, and the tool says so rather than answering confidently.)
+
+What Phase 3 learned, for whoever extends it:
+
+* LIEF returns section flags as an **int** for ELF/PE (`str(section.flags)` is `"6"`), which the
+  Phase 2 code was string-matching: every ELF section was silently read as neither allocated
+  nor writable, so `TargetImage.read()` never returned anything and `diff`'s byte comparison of
+  referenced objects had never actually run. Fixed (`extract.section_capabilities`), and the
+  byte rule is now sound: bytes count only where both sides know what object they are reading
+  (a size on both, or a name on both), because two 16-byte windows out of two independently
+  laid-out `.rodata` pools are not the same object. `check_phase2_try.py` is unchanged at
+  88/89 with that rule.
+* Dynamic relocations have `has_section == False`; `R_*_RELATIVE` ones carry a *nameless*
+  pseudo-symbol whose value is the addend. Both are traps that silently drop every pointer in
+  the image if written the obvious way.
+* Ghidra's own labels (source DEFAULT/ANALYSIS) sit *inside* objects, so an object's extent is
+  bounded by the next symbol the **file** names (source IMPORTED), not by the next label.
+* `endbr64`/`__stack_chk_fail`/frame-pointer shares are worth reporting as facts about the
+  build (`-fcf-protection`, `-fstack-protector-strong` vs `-all`, `-fno-omit-frame-pointer`);
+  they came free with the shape profile.
 
 **Phase 4: C++ structure recovery**
 1. Identify vtables, constructors, and destructors from Ghidra data and RTTI where present.

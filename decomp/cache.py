@@ -367,3 +367,120 @@ def section_of(conn: sqlite3.Connection, address: int) -> str | None:
 	row = conn.execute("SELECT name FROM sections WHERE start <= ? AND end >= ? ORDER BY start DESC LIMIT 1",
 		(address, address)).fetchone()
 	return row["name"] if row else None
+
+
+# --------------------------------------------------------------------------------------
+# discovery (Phase 3): what the analysis knows about data, and what touches what
+
+
+def symbol_rows(conn: sqlite3.Connection, pattern: str = "", addresses: list[int] | None = None,
+	limit: int = 40) -> list[sqlite3.Row]:
+	"""Symbols of the image: globals, vtables, labels, PLT stubs, imports.
+
+	This is the half of the analysis a name-and-function search misses: the question "which
+	functions touch this global/vtable" starts by finding the object, which is never a
+	function.
+	"""
+	clauses, values = [], []
+	if pattern:
+		clauses.append("name LIKE ?")
+		values.append("%" + pattern + "%")
+	if addresses:
+		clauses.append("address IN (%s)" % ",".join("?" * len(addresses)))
+		values.extend(addresses)
+	if not clauses:
+		return []
+	values.append(limit)
+	return conn.execute("SELECT address, name, type, source, namespace, section FROM symbols"
+		" WHERE %s ORDER BY length(name), address LIMIT ?" % " OR ".join(clauses), values).fetchall()
+
+
+def xrefs_to(conn: sqlite3.Connection, addresses: list[int], limit: int = 60) -> list[sqlite3.Row]:
+	"""Every recorded reference reaching one of these addresses, with the function it is in."""
+	if not addresses:
+		return []
+	marks = ",".join("?" * len(addresses))
+	return conn.execute(
+		"SELECT r.address, r.to_address, r.to_name, r.to_kind, r.ref_type, r.is_call,"
+		" f.id AS fn, f.name, f.entry, f.size, f.kind, i.text"
+		" FROM refs r JOIN functions f ON f.id = r.fn"
+		" LEFT JOIN instructions i ON i.fn = r.fn AND i.address = r.address"
+		" WHERE r.to_address IN (%s) ORDER BY f.entry, r.address LIMIT ?" % marks,
+		addresses + [limit]).fetchall()
+
+
+def referrer_counts(conn: sqlite3.Connection, addresses: list[int]) -> dict[int, int]:
+	"""How many reference sites each address has, per function ({fn id: sites})."""
+	if not addresses:
+		return {}
+	marks = ",".join("?" * len(addresses))
+	return {row["fn"]: row["sites"] for row in conn.execute(
+		"SELECT fn, count(*) AS sites FROM refs WHERE to_address IN (%s) GROUP BY fn" % marks,
+		addresses)}
+
+
+def nearest_symbol(conn: sqlite3.Connection, address: int) -> tuple[str, int] | None:
+	"""The symbol containing an address, as (name, its address) - what an offset is inside of.
+
+	A vtable header, a `.rodata` table and a string all get named this way: the interesting
+	part of a pointer slot is which object its address falls inside. A name that came from the
+	file's own symbol table beats a label Ghidra invented at the same address.
+	"""
+	row = conn.execute("SELECT address, name FROM symbols WHERE address <= ?"
+		" ORDER BY (source IN ('IMPORTED','EXTERNAL')) DESC, address DESC LIMIT 1",
+		(address,)).fetchone()
+	return (row["name"], row["address"]) if row else None
+
+
+def next_own_symbol(conn: sqlite3.Connection, address: int) -> int | None:
+	"""The next symbol the *file* names above an address - where an object ends.
+
+	Labels Ghidra created (source DEFAULT/ANALYSIS) sit inside objects, so they cannot bound
+	one; in a stripped binary there is nothing to bound by and the caller's other rule applies.
+	"""
+	row = conn.execute("SELECT min(address) AS next FROM symbols WHERE address > ?"
+		" AND source IN ('IMPORTED','EXTERNAL')", (address,)).fetchone()
+	return row["next"] if row and row["next"] else None
+
+
+def function_at(conn: sqlite3.Connection, address: int) -> sqlite3.Row | None:
+	return conn.execute("SELECT id, name, namespace, entry, size, kind, section FROM functions"
+		" WHERE entry = ?", (address,)).fetchone()
+
+
+def targets_of(conn: sqlite3.Connection, fn_id: int) -> list[dict]:
+	"""What one function reaches: (address, name, kind). The input to 'what else touches the
+	same things' queries."""
+	return [{"address": row["to_address"], "name": row["to_name"], "kind": row["to_kind"],
+			"is_call": bool(row["is_call"])}
+		for row in conn.execute("SELECT DISTINCT to_address, to_name, to_kind, is_call FROM refs"
+			" WHERE fn = ? AND to_address IS NOT NULL", (fn_id,)).fetchall()]
+
+
+def inside_function(conn: sqlite3.Connection, address: int) -> bool:
+	"""Is an address inside a function body? Then it is a code label, not an object."""
+	return conn.execute("SELECT 1 FROM functions WHERE entry <= ? AND entry + size > ? LIMIT 1",
+		(address, address)).fetchone() is not None
+
+
+def function_bodies(conn: sqlite3.Connection, sample: str = "",
+	band: tuple[int, int] = (4, 90)) -> list[list[str]]:
+	"""Instruction text of every function body in the cache, for shape profiling.
+
+	`sample` narrows it to functions whose name matches, which is how the shape of one part
+	of a binary is measured without measuring a statically linked library at the same time.
+	The band is the same one `decomp.toolchain` applies to its own probe objects.
+	"""
+	sql = ("SELECT i.fn AS fn, f.entry AS entry, i.address AS address, i.text AS text"
+		" FROM instructions i JOIN functions f ON f.id = i.fn WHERE f.kind = 'function'")
+	values: list = []
+	if sample:
+		sql += " AND f.name LIKE ?"
+		values.append("%" + sample + "%")
+	groups: dict[int, list[str]] = {}
+	order: dict[int, int] = {}
+	for row in conn.execute(sql + " ORDER BY f.entry, i.address", values):
+		groups.setdefault(row["fn"], []).append(row["text"] or "")
+		order[row["fn"]] = row["entry"]
+	return [text for text in groups.values() if band[0] <= len(text) <= band[1]]
+

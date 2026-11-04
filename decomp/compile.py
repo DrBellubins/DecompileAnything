@@ -47,20 +47,19 @@ def object_name(sources: list[Path], stem: str = "candidate") -> str:
 def build(sources: list[Path], object_path: Path, *, compiler: str, flags: list[str],
 	includes: list[Path] | None = None, timeout: int = 120) -> Build:
 	"""Compile one or more candidate sources to one object file. Never raises."""
+	from . import toolchain
+
 	sources = [Path(source).expanduser() for source in sources]
 	object_path = Path(object_path)
-	command = [compiler, *flags]
 	missing = [str(source) for source in sources if not source.is_file()]
 	if missing:
-		return Build(ok=False, command=command, object_path=object_path,
+		return Build(ok=False, command=[compiler, *flags], object_path=object_path,
 			diagnostics="no such source file: %s" % ", ".join(missing))
+	command = toolchain.driver_form(compiler, flags, sources, object_path, includes)
 	for source in sources:
-		if source.suffix not in _SOURCE_SUFFIXES:
-			command += ["-x", "c++"]
+		if source.suffix not in _SOURCE_SUFFIXES and not toolchain.msvc(compiler):
+			command[-3:-3] = ["-x", "c++"]  # before -c: tell the driver it is C++
 			break
-	for include in [*(includes or []), *(source.parent for source in sources)]:
-		command += ["-I", str(Path(include))]
-	command += ["-c"] + [str(source) for source in sources] + ["-o", str(object_path)]
 
 	object_path.parent.mkdir(parents=True, exist_ok=True)
 	started = time.time()

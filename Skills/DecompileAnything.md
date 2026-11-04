@@ -13,8 +13,10 @@ cd Tests
 python3 eval.py build --variants gcc-o0,gcc-o2,gcc-o0-x86   # once per session
 python3 eval.py units                                       # what is in the binary
 
+../.venv/bin/decomp detect build/gcc-o0/da_tests.stripped   # compiler/-O, and project.toml (--write)
 ../.venv/bin/decomp analyze build/gcc-o0/da_tests.stripped --variant gcc-o0   # once per binary
-../.venv/bin/decomp find strncmp                            # name, 0xaddr, or string content
+../.venv/bin/decomp find strncmp                            # name, 0xaddr, string, global, vtable
+../.venv/bin/decomp find coin --family 2                    # the group of functions a request means
 ../.venv/bin/decomp show 0x2834 --bin build/gcc-o0/da_tests.stripped          # reads the cache
 ../.venv/bin/decomp try 0x2834 cand/math.cpp --fn AbsDiff                     # build, diff, score
 ```
@@ -33,9 +35,22 @@ the candidate needs; `[include_dirs]` in the target's `project.toml` does it per
 
 # Driving `decomp`
 
-* Only `analyze` starts Ghidra (~10 s per binary, once). `show`/`find`/`status` read
-  `cache/ghproj/<sha256-16>/analysis.db` in ~0.1 s. Re-running `analyze` on the same bytes
-  says "already analysed"; `--force` rebuilds.
+* Start a new target with `decomp detect <bin> --write project.toml`: it reads the compiler and
+  version from `.comment` (Rich header on PE), PIE vs `-no-pie`, static vs dynamic, the C++ ABI
+  and the lowest `-std` the imports prove, and infers `-O` by comparing the *shape* of the
+  target's code against what this machine's compilers produce at each `-O`. Trust the facts;
+  read the `-O` line's `confidence`/margin. For a **statically linked** target, narrow the
+  sample: `--range 0xLO-0xHI` over the program's own code (an answer over the whole image is
+  mostly glibc's flags, and the tool says so).
+* `decomp find` answers three kinds of question: what a name/address/string/**global/vtable**
+  is, what reaches it (`--xref`, with the instruction at each site) and what it points at
+  (`--table` gives a vtable's method list; `--members` gives the class the function belongs
+  to), and `--family <hops>` gives the connected group with the reason for each entry.
+  In a stripped binary there are no names to search: start from a string or an address, then
+  grow with `--family`.
+* Only `analyze` starts Ghidra (~10 s per binary, once). `detect`/`show`/`find`/`status` read
+  `cache/ghproj/<sha256-16>/analysis.db` or the file itself in ~0.1 s. Re-running `analyze` on
+  the same bytes says "already analysed"; `--force` rebuilds.
 * `decomp show` accepts the addresses `nm`/objdump print **and** Ghidra's: a PIE is loaded at
   `0x100000`, and `meta.address_offset` records the gap, so `decomp show 0x2834` works.
 * Several targets can be cached; then pass `--bin <file>` or `--key <key>` (both printed by
@@ -50,7 +65,7 @@ the candidate needs; `[include_dirs]` in the target's `project.toml` does it per
 |---|---|---|
 | `opcode: n` | wrong operation: cmov vs branch, imul vs shifts, signed vs unsigned load | fix the operation; `movzbl` vs `movsbl` and `idiv` vs `shrd` are the usual ones |
 | `operand: n` | right operation, wrong offset/constant/type | field offsets, struct layout, the type of an array element, a truncated buffer bound |
-| `relocation: n` | same shape of code, reaching for something else: a different callee, a different table, different bytes in it | the report's `symbols` line names both sides - fix the callee or reproduce the data (tables and string literals are part of the answer) |
+| `relocation: n` | same shape of code, reaching for something else: a different callee, a different table, different bytes in it | the report's `symbols` line names both sides - fix the callee or reproduce the data (tables and string literals are part of the answer). Bytes are only compared when both sides know what object they are: an anonymous `.rodata` pool is laid out per build |
 | `register: n` | register allocation only | not yours to fix; use `--register-abstract` when comparing at -O2 (Phase 5) |
 | `missing`/`extra` | control flow or size differs | loop form (counted vs conditional), hoisted invariant, inlined vs called helper, early return vs branch |
 | `size_delta` large with high % | something is inlined or vectorised that should not be (or the reverse) | compare at the variant's own `-O`; never compare -O0 asm to -O2 asm |

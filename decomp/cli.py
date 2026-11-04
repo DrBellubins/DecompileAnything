@@ -19,7 +19,8 @@ from typing import Optional
 
 import typer
 
-from . import __version__, cache, check, compile, config, diff, extract, ghidra, normalize, toolchain
+from . import (__version__, cache, check, compile, config, discover, diff, extract, ghidra,
+	normalize, toolchain)
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_FOUND = 0, 1, 2, 3
 
@@ -426,6 +427,195 @@ def _print_asm(conn, fn_id: int, max_lines: int) -> None:
 
 
 # --------------------------------------------------------------------------------------
+# detect: the compiler, the object, and the -O it was built with (Phase 3)
+
+
+def _parse_range(text: str) -> tuple[int, int] | None:
+	"""`0x804c866-0x8053606` or `0x804c866+0x6da0`, in file addresses."""
+	value = (text or "").strip()
+	if not value:
+		return None
+	for separator in ("-", "+", ":"):
+		body = value[2:] if value.lower().startswith("0x") else value
+		if separator not in body:
+			continue
+		left, _, right = value.partition(separator)
+		try:
+			start, other = int(left.strip(), 16), int(right.strip(), 16)
+		except ValueError:
+			raise Stop(EXIT_USAGE, "--range wants 0xLO-0xHI or 0xSTART+0xLEN, got %r" % text)
+		return (start, start + other) if separator == "+" else (start, other)
+	raise Stop(EXIT_USAGE, "--range wants 0xLO-0xHI or 0xSTART+0xLEN, got %r" % text)
+
+
+def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=None,
+	levels: tuple[int, ...] = (0, 1, 2, 3), probe: bool = True) -> dict:
+	"""Everything `decomp detect` reports, in one call (the benchmark check uses it too).
+
+	No Ghidra: the facts come from the file's own headers, and the optimisation level comes
+	from comparing the shape of the target's code against what the compilers installed here
+	produce at each `-O`.
+	"""
+	out = {"target": str(target), "note": {}, "profile": {}, "signatures": [], "guess": None,
+		"ranked": [], "problems": [], "sample": {}}
+	note = toolchain.build_note(target)
+	out["note"] = note
+	if note.get("error"):
+		out["problems"].append(note["error"])
+		return out
+	rng = _parse_range(range_text)
+	if sample and conn is not None:
+		bodies = cache.function_bodies(conn, sample=sample, band=toolchain.BAND)
+		profile = toolchain.shape_profile(bodies)
+		out["sample"] = {"source": "the cached analysis, functions whose name contains %r" % sample}
+	else:
+		profile, _note, problems = toolchain.target_shape(target, rng=rng, note=note)
+		out["problems"].extend(problems)
+		out["sample"] = {"source": "%s, bodies of %d-%d instructions%s" % (
+			"the executable sections of the file (cut at every ret)", *toolchain.BAND,
+			" in --range" if rng else "")}
+		out["sample"]["range"] = [hex(rng[0]), hex(rng[1])] if rng else None
+	out["profile"] = profile
+	if not probe:
+		return out
+	if not profile.get("bodies"):
+		return out
+	import shutil
+
+	family = note.get("compiler")
+	candidates = {"gcc": ["g++"], "clang": ["clang++"], "msvc": ["cl"]}.get(family, [])
+	if not candidates:
+		candidates = [compiler for compiler in ("g++", "clang++") if shutil.which(compiler)]
+		out["problems"].append("the compiler is not named in the file: ranking the toolchains "
+			"that are installed here by shape instead")
+	bits = note.get("bits") or 64
+	for compiler in candidates:
+		if not shutil.which(compiler):
+			out["problems"].append("%s is not installed here - no probe for it, so no -O inference"
+				% compiler)
+			continue
+		signatures, problems = toolchain.probe_signatures(compiler, bits, levels=levels)
+		out["signatures"] += signatures
+		out["problems"].extend(problems)
+	if out["signatures"]:
+		out["ranked"] = toolchain.infer_optimize(profile, out["signatures"])
+		out["guess"] = out["ranked"][0] if out["ranked"] else None
+	if out["guess"]:
+		out["guess"]["sampled"] = profile.get("bodies", 0)
+	out["sample_warning"] = toolchain.sample_warning(profile, note,
+		narrowed=bool(range_text or sample))
+	return out
+
+
+@app.command()
+def detect(
+	binary: Path = typer.Argument(..., help="the target binary to describe"),
+	config_file: Optional[str] = typer.Option(None, "--config", "-C"),
+	write: Optional[Path] = typer.Option(None, "--write",
+		help="write a starting project.toml here (use with --force to replace one)"),
+	force: bool = typer.Option(False, "--force", help="replace an existing file"),
+	sample_range: str = typer.Option("", "--range",
+		help="sample only this range of file addresses: 0xLO-0xHI or 0xSTART+0xLEN"),
+	sample: str = typer.Option("", "--sample",
+		help="sample only functions whose name matches, from the cached analysis"),
+	levels: str = typer.Option("0,1,2,3", "--levels", help="which -O levels to probe"),
+	probe: bool = typer.Option(True, "--probe/--no-probe", help="infer the optimisation level"),
+	as_json: bool = typer.Option(False, "--json"),
+) -> None:
+	"""Detect the compiler and the flags from the file itself, and write a starting config.
+
+	Reads the `.comment` section (ELF), the Rich header and CodeView record (PE), the object
+	type and the dynamic section. The optimisation level is not a fact a stripped binary
+	carries, so it is a ranked guess: reference snippets are compiled with the installed
+	toolchain at each `-O`, and the shape of the target's code is matched against them.
+	"""
+	target = Path(binary).expanduser()
+	if not target.is_file():
+		raise Stop(EXIT_USAGE, "no such file: %s" % target)
+	target = target.resolve()
+	wanted = tuple(int(item) for item in levels.split(",") if item.strip() != "")
+	cfg = load_config(config_file, target)
+	conn = None
+	try:
+		store = cache.Cache(config.cache_dir(cfg))
+		status = store.status(cache.target_key(target)["key"])
+		if status.get("complete"):
+			conn = cache.open_readonly(Path(status["db"]))
+	except config.ConfigError:
+		conn = None
+	try:
+		outcome = detect_target(target, range_text=sample_range, sample=sample, conn=conn,
+			levels=wanted, probe=probe)
+	finally:
+		if conn is not None:
+			conn.close()
+
+	note, profile, ranked = outcome["note"], outcome["profile"], outcome["ranked"]
+	guess = outcome["guess"]
+	if as_json:
+		payload = {key: value for key, value in outcome.items() if key != "signatures"}
+		payload["probes"] = [{"optimize": item["optimize"], "compiler": item.get("compiler"),
+			"profile": item["profile"]} for item in outcome["signatures"]]
+		echo(json.dumps(payload, indent=1, default=str))
+		if write is not None:
+			_path = _write_config(target, Path(write), note, guess, force)
+		raise typer.Exit(EXIT_OK if not note.get("error") else EXIT_FAIL)
+
+	echo("target %s" % target)
+	for line in toolchain.note_lines(note):
+		echo(line)
+	if note.get("error"):
+		raise typer.Exit(EXIT_FAIL)
+
+	echo()
+	echo("code shape (%s):" % outcome["sample"].get("source", "the target"))
+	if profile:
+		for line in toolchain.profile_lines(profile):
+				echo(line)
+	else:
+		for problem in outcome["problems"]:
+			echo("  %s" % problem)
+	warning = outcome.get("sample_warning") or ""
+	if warning:
+		echo("  caution: %s" % warning)
+
+	if probe and ranked:
+		echo()
+		echo("measured with the toolchains installed here (a candidate is built with these):")
+		for item in ranked[:8]:
+			echo("  %-10s -O%d  distance %.3f  next %.3f" % (item.get("compiler"), item["optimize"],
+				item["distance"], item.get("runner_up", item["distance"])))
+		echo()
+		echo("optimize = %s  (%s)" % (guess["optimize"], guess.get("confidence")))
+		echo("  why: %s" % guess.get("why"))
+		if warning:
+			echo("  caution: the sample warning above applies to this answer")
+	elif probe and not outcome["problems"]:
+		echo("no -O inference: nothing was sampled")
+	for problem in outcome["problems"]:
+		echo("  note: %s" % problem)
+
+	if write is not None:
+		path = _write_config(target, Path(write), note, guess, force)
+		echo()
+		echo("wrote %s" % path)
+		echo("next: decomp analyze %s --variant %s -C %s" % (binary,
+			toolchain.variant_name(note, guess["optimize"] if guess else None), path))
+	raise typer.Exit(EXIT_OK)
+
+
+def _write_config(target: Path, path: Path, note: dict, guess: dict | None, force: bool) -> Path:
+	if path.is_dir():
+		path = path / config.CONFIG_NAME
+	if path.is_file() and not force:
+		raise Stop(EXIT_USAGE, "%s already exists - pass --force to replace it (or edit it: "
+		"`decomp detect` writes a starting point, not an answer)" % path)
+	path.parent.mkdir(parents=True, exist_ok=True)
+	path.write_text(toolchain.starter_config(target, note, guess))
+	return path
+
+
+# --------------------------------------------------------------------------------------
 # find
 
 
@@ -436,36 +626,119 @@ def find(
 	key: Optional[str] = typer.Option(None, "--key"),
 	config_file: Optional[str] = typer.Option(None, "--config", "-C"),
 	limit: int = typer.Option(40, "--limit"),
+	xrefs: bool = typer.Option(True, "--xref/--no-xref",
+		help="what references what was found, with the instruction at each site"),
+	table: bool = typer.Option(True, "--table/--no-table",
+		help="for a data object found: the pointers it holds (a vtable's methods, a table)"),
+	members: bool = typer.Option(True, "--members/--no-members",
+		help="for a function found: the other functions that share its vtable"),
+	family: int = typer.Option(0, "--family",
+		help="also list the functions related to what matched, grown N call edges out "
+		"(the answer to \"decompile the coin system\")"),
 	as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-	"""Search a cached analysis by name, address, or the strings a function reads.
-
-	(xref/vtable queries and flag inference come with Phase 3.)
+	"""Search a cached analysis: by name, address, string, global or vtable - and what in
+	the binary is related to what was found.
 	"""
 	cfg = load_config(config_file)
 	store = cache.Cache(config.cache_dir(cfg))
 	conn, values = open_analysis(store, binary, key)
+	bits = 64 if ":64:" in (cache.meta(conn).get("language_id") or "") else 32
 	try:
-		offset = int(cache.meta(conn).get("address_offset") or 0)
-		hits = cache.find(conn, query, limit, _other_addresses(query, offset))
+		meta = cache.meta(conn)
+		offset = int(meta.get("address_offset") or 0)
+		hits = discover.search(conn, meta, query, limit, _other_addresses(query, offset))
+		addresses = discover.addresses_named(conn, hits)
+		report = {"target": values.get("target_path"), "target_key": values.get("target_key"),
+			"address_offset": offset, "query": query, **hits, "addresses": addresses}
+		if xrefs and addresses:
+			report["xref_groups"] = discover.xrefs(conn, addresses, limit)
+		image = None
+		if (table or members) and addresses:
+			image = extract.TargetImage(Path(meta.get("target_path") or ""), offset)
+			if image.error:
+				report["image_note"] = image.error
+		if table and image is not None:
+			report["tables"] = []
+			for row in hits["symbols"][:8]:
+				found = discover.table(conn, image, int(row["address"]), bits=bits, limit=limit)
+				if found["count"]:
+					report["tables"].append(dict(found, name=row["name"]))
+		if members and image is not None:
+			report["vtable_members"] = []
+			for row in hits["functions"][:8]:
+				rows = discover.members_of(conn, image, int(row["id"]), int(row["entry"]), bits=bits)
+				if rows:
+					report["vtable_members"].append({"function": row["name"], "entry": row["entry"],
+						"members": rows[:limit]})
+		if family:
+			report["family"] = discover.family(conn, [int(row["id"]) for row in hits["functions"]],
+				hops=family, limit=limit)
 	finally:
 		conn.close()
+
+	found_any = any(hits[key] for key in ("functions", "strings", "symbols", "touching"))
 	if as_json:
-		echo(json.dumps({"target": values.get("target_path"), **hits}, indent=1))
-		raise typer.Exit(EXIT_OK if any(hits.values()) else EXIT_NOT_FOUND)
-	echo("; %s (key %s)" % (values.get("target_path"), values.get("target_key")))
+		echo(json.dumps(report, indent=1, default=str))
+		raise typer.Exit(EXIT_OK if found_any else EXIT_NOT_FOUND)
+
+	echo("; %s (key %s)%s" % (values.get("target_path"), values.get("target_key"),
+		"  addresses: Ghidra = file + 0x%x" % offset if offset else ""))
 	echo("functions (%d):" % len(hits["functions"]))
 	for row in hits["functions"]:
 		echo("  %s  %-6s %6s  %s" % (_hex(row["entry"]), row["kind"], row["size"], row["name"]))
+	if hits["symbols"]:
+		echo("symbols and data (%d):" % len(hits["symbols"]))
+		for row in hits["symbols"]:
+			echo("  %s  %-9s %s%s" % (_hex(row["address"]), row["type"], row["name"],
+				"  [%s]" % row["section"] if row["section"] else ""))
 	echo("strings (%d):" % len(hits["strings"]))
 	for row in hits["strings"]:
 		echo("  %s  [%s]  %r" % (_hex(row["address"]), row["section"], row["value"]))
-	echo("functions referencing it (%d):" % len(hits["touching"]))
-	for row in hits["touching"]:
-		echo("  %s  %s  -> %s" % (_hex(row["entry"]), row["name"], row["to_name"]))
-	if not any(hits.values()):
+	if hits["touching"]:
+		echo("functions referencing it (%d):" % len(hits["touching"]))
+		for row in hits["touching"]:
+			echo("  %s  %s  -> %s" % (_hex(row["entry"]), row["name"], row["to_name"]))
+	for group in report.get("xref_groups", []):
+		echo()
+		echo("references from %s (%s bytes, %d sites):" % (group["name"], group["size"],
+			len(group["sites"])))
+		for site in group["sites"][:limit]:
+			echo("    %s  %-28s -> %s %s" % (_hex(site["address"]), (site["text"] or "?")[:28],
+				site["ref_type"], site["to_name"]))
+	for entry in report.get("tables", []):
+		echo()
+		echo("what %s at %s points at (%d slots, %d bytes read):" % (entry["name"],
+			_hex(entry["address"]), entry["count"], entry["bytes"]))
+		for slot in entry["slots"]:
+			target = slot["target"]
+			extra = " (%s bytes)" % target["size"] if target["kind"] == "function" else ""
+			echo("    %s +0x%-2x -> %-8s %s%s" % (_hex(slot["slot"]), slot["offset"],
+				target["kind"], target["name"], extra))
+	for entry in report.get("vtable_members", []):
+		echo()
+		echo("in the same vtable as %s (%s):" % (entry["function"], _hex(entry["entry"])))
+		for row in entry["members"][:limit]:
+			echo("    %s  %6s  %s  (slot %s of %s)" % (_hex(row["entry"]), row["size"], row["name"],
+				_hex(row["slot"]), row["vtable"]))
+	group = report.get("family")
+	if group:
+		echo()
+		echo("related to what matched (%d functions, %d hops):" % (len(group["members"]), family))
+		for row in group["members"]:
+			echo("  %s  %-6s %6s  %-40s  %s" % (_hex(row["entry"]), row["kind"], row["size"],
+				row["name"], "; ".join(row["why"])))
+		if group["shared"]:
+			echo("  objects this group shares:")
+			for row in group["shared"][:limit]:
+				echo("    %s  %-9s %s" % (_hex(row["address"]) if row["address"] else "-",
+					row["kind"], row["name"]))
+				echo("      referenced by %d of the matched functions" % row["seeds"])
+	if not found_any:
 		echo("nothing matched %r" % query)
-	raise typer.Exit(EXIT_OK if any(hits.values()) else EXIT_NOT_FOUND)
+		echo("  (a name search only finds names that survive: in a stripped binary, try a string, "
+		"an address from `decomp status`/objdump, or `--family` from something that did match)")
+	raise typer.Exit(EXIT_OK if found_any else EXIT_NOT_FOUND)
 
 
 # --------------------------------------------------------------------------------------
@@ -667,9 +940,6 @@ def try_cmd(
 
 # --------------------------------------------------------------------------------------
 # later phases
-
-
-@app.command("types")
 
 
 @app.command("types")

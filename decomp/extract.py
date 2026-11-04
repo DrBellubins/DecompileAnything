@@ -25,6 +25,30 @@ from .normalize import Ref, clean_symbol, demangle, is_synthetic
 # same bytes: read-only initialised sections. A pointer in .data/.got is link-relative.
 _COMPARABLE = (".rodata", ".text", ".data.rel.ro")
 
+def section_capabilities(fmt: str, section) -> tuple[bool, bool, bool]:
+	"""(allocated, writable, executable) of a section, however this format spells its flags.
+
+	LIEF hands back an int for ELF and PE (`str(section.flags)` is literally "6") and an enum
+	elsewhere, so the flag test is done per format here rather than by string matching - which
+	matters: string matching silently read every ELF section as neither allocated nor writable.
+	"""
+	raw = section.flags
+	if not isinstance(raw, int):
+		text = str(raw).upper()
+		return ("ALLOC" in text or "MEM" in text), "WRITE" in text, ("EXEC" in text or "CODE" in text)
+	format_name = str(fmt).upper()
+	if "ELF" in format_name:
+		return bool(raw & 0x2), bool(raw & 0x1), bool(raw & 0x4)
+	if "PE" in format_name:
+		return (section.size > 0, bool(raw & 0x80000000),
+			bool(raw & 0x20000020))  # MEM_EXECUTE | CNT_CODE
+	return True, False, False
+
+
+# Where an object's data lives: pointer tables (vtables, GOT-like tables) and ordinary data.
+_POINTER_SECTIONS = (".data.rel.ro", ".rodata", ".data", ".got", ".got.plt", ".init_array",
+	"__DATA")
+
 # How many bytes of a referenced object are compared when its size is not recorded.
 _PROBE = 16
 _WINDOW = 64
@@ -57,6 +81,13 @@ class TargetImage:
 		self.offset = int(address_offset)
 		self.sections: list[tuple[str, int, int, int, bool, bool]] = []
 		self.error = ""
+		# slot address (in the analysis' domain) -> what the link writes there. In a PIE the
+		# file bytes of .data/.data.rel.ro are zeros and the value lives in the relocation's
+		# addend, so a pointer table can only be read from the relocations.
+		self.pointers: dict[int, int] = {}
+		# ... and the slots whose value is an imported symbol (a pure-virtual slot, a method
+		# of another translation unit): no address to read, only a name.
+		self.named_pointers: dict[int, str] = {}
 		try:
 			import lief
 		except ImportError as exc:  # pragma: no cover - `decomp check` reports this
@@ -73,21 +104,78 @@ class TargetImage:
 		for section in binary.sections:
 			if not section.size:
 				continue
-			flags = str(section.flags)
+			allocated, writable, _executable = section_capabilities(binary.format, section)
 			self.sections.append((str(section.name), int(section.virtual_address), int(section.size),
-				int(section.offset), "ALLOC" in flags or "WRITE" in flags, "WRITE" in flags))
+				int(section.offset), allocated, writable))
+		try:
+			self._read_pointers(binary)
+		except Exception:  # noqa: BLE001 - pointer tables are a discovery nicety, not a requirement
+			self.pointers = {}
 
-	def _locate(self, address: int):
+	def _read_pointers(self, binary) -> None:
+		"""The pointer slots a linked image writes at load time (R_*_RELATIVE and friends).
+
+		A dynamic relocation has no section (`has_section` is False there), so the slots are
+		found by address, and a candidate target is kept only if it lands inside the image -
+		which is what separates a pointer slot from a GOT offset or an import.
+		"""
+		mapped = [(virtual, virtual + size) for _name, virtual, size, _offset, allocated, _writable
+			in self.sections if allocated and size]
+		for source in ("dynamic_relocations", "object_relocations"):
+			try:
+				items = list(getattr(binary, source, []))
+			except Exception:  # noqa: BLE001
+				continue
+			for item in items:
+				try:
+					slot = int(item.address) + self.offset
+					target = int(item.addend)
+					if item.has_symbol and item.symbol is not None:
+						try:
+							value = int(item.symbol.value)
+						except Exception:  # noqa: BLE001 - an import has no value to read
+							value = 0
+						if not value:
+							# a symbol with no address: an import (a pure-virtual slot, a
+							# helper of another translation unit). Note that LIEF attaches a
+							# nameless pseudo-symbol to R_*_RELATIVE relocations, whose value
+							# *is* the addend, so only a named one counts as an import.
+							name = str(item.symbol.name or "")
+							if name:
+								self.named_pointers[slot] = name
+								continue
+						else:
+							target = value + target
+					if target <= 0 or not any(low <= target < high for low, high in mapped):
+						continue
+					self.pointers[slot] = target + self.offset
+				except Exception:  # noqa: BLE001
+					continue
+
+	def _locate(self, address: int, any_section: bool = False):
 		file_address = address - self.offset
 		for name, virtual, size, file_offset, allocated, writable in self.sections:
-			if allocated and not writable and virtual <= file_address < virtual + size \
-					and name.startswith(_COMPARABLE):
-				return name, file_offset + (file_address - virtual), size - (file_address - virtual)
+			if not allocated or not virtual <= file_address < virtual + size:
+				continue
+			if not any_section:
+				if writable or not name.startswith(_COMPARABLE):
+					continue
+			elif not name.startswith(_POINTER_SECTIONS):
+				continue
+			return name, file_offset + (file_address - virtual), size - (file_address - virtual)
 		return None
 
 	def read(self, address: int, length: int) -> bytes | None:
 		"""The initialised, read-only bytes at an analysed address, or None."""
-		where = self._locate(address)
+		return self._read(address, length, any_section=False)
+
+	def read_data(self, address: int, length: int) -> bytes | None:
+		"""Bytes of an initialised data section, writable ones included (in a PIE the values
+		there are still zeros - see `pointers`)."""
+		return self._read(address, length, any_section=True)
+
+	def _read(self, address: int, length: int, any_section: bool) -> bytes | None:
+		where = self._locate(address, any_section)
 		if where is None or self.error:
 			return None
 		_, offset, available = where
@@ -97,6 +185,12 @@ class TargetImage:
 				return handle.read(min(int(length), max(0, available)))
 		except OSError:  # pragma: no cover
 			return None
+
+	def data_sections(self) -> list[tuple[str, int, int]]:
+		"""(name, address, size) of the initialised data sections, in the analysis' domain."""
+		return [(name, virtual + self.offset, size) for name, virtual, size, _offset, allocated,
+			_writable in self.sections
+			if allocated and size and name.startswith(_POINTER_SECTIONS)]
 
 
 def _string_lengths(conn: sqlite3.Connection, addresses: list[int]) -> dict[int, tuple[int, str]]:
@@ -271,9 +365,8 @@ class CandidateObject:
 			for section in binary.sections:
 				if not section.size:
 					continue
-				flags = str(section.flags)
 				name = str(section.name)
-				if "WRITE" in flags:
+				if section_capabilities(binary.format, section)[1]:
 					self._writable.add(name)
 				self._sections[name] = bytes(section.content)
 			self._read_symbols(binary)

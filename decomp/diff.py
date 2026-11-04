@@ -60,17 +60,24 @@ def refs_compatible(a: Ref, b: Ref) -> tuple[bool, str]:
 	"""Conservative: a difference is only claimed when both sides have evidence.
 
 	A name only counts against a candidate when both sides know a real name (an import, or a
-	symbol of an unstripped target); bytes only count when both sides could read them; a size
-	only counts when both sides know one. Anything unknown stays an accepted match, and the
-	symbol table says so, rather than being guessed at.
+	symbol of an unstripped target); bytes only count when both sides know what object they
+	are reading (a size on both, or a name on both); a size only counts when both sides know
+	one. Anything unknown stays an accepted match, and the symbol table says so, rather than
+	being guessed at.
 	"""
 	if a.cls != b.cls:
 		return False, "%s on the original, %s in the candidate" % (a.kind, b.kind)
 	if a.named and b.named and canonical_name(a.name) != canonical_name(b.name):
 		return False, "reaches %s, the candidate reaches %s" % (a.name, b.name)
-	if a.content and b.content:
-		shared = min(len(a.content), len(b.content))
-		if a.content[:shared] != b.content[:shared]:
+	# Bytes only count when both sides are reading *the same kind of thing*: an object whose
+	# extent both sides know (a size on both), or one both sides name. A `.rodata` pool that
+	# neither side can bound is laid out per build - the same constants at different offsets -
+	# so two 16-byte windows out of it are not the same object twice, and a difference there
+	# would be the linker's layout, not the candidate's.
+	bounded = bool(a.size and b.size)
+	if a.content and b.content and (bounded or (a.named and b.named)):
+		shared = min(len(a.content), len(b.content), int(min(a.size, b.size)) if bounded else 1 << 30)
+		if shared and a.content[:shared] != b.content[:shared]:
 			return False, "the bytes there differ (%s vs %s)" % (
 				a.content[:shared].hex(), b.content[:shared].hex())
 	# a size is only the same kind of quantity when both sides know the object by name, or

@@ -51,6 +51,23 @@ addresses and sizes exact for both `-O0` variants; at `-O2` all 89 addresses sti
 51 sizes differ (Ghidra's own function boundaries), and STR-04/STR-11 are classified as
 thunks because their -O2 body is a tail call.
 
+To check the tool's own discovery and toolchain detection (Phase 3):
+
+```sh
+.venv/bin/decomp analyze build/gcc-o0/da_tests --variant gcc-o0   # the unstripped build
+.venv/bin/python Tests/tools/check_phase3_discovery.py
+```
+
+Detection is judged against `build.json` (the compiler, class, PIE/static, and the exact flags
+the generated `project.toml` must reproduce) and against the `-O` the variant really used -
+exactly for `-O0`, "not -O0" for `-O2`, since the shape of a prologue cannot tell -O1 from -O3.
+The `-O` sample is narrowed to the answer key's own address span, because the -m32 build is
+statically linked and most of its image is glibc. Discovery is judged against the answer key's
+unit addresses and the source's own names: a string search must reach the same code in the
+stripped and unstripped builds, `--family` must bring back every unit of a family, and a
+vtable's slots must resolve to that class's methods. (That is why the *unstripped* build is
+analysed too: name and vtable queries need names to find.)
+
 ## The binary
 
 `main.cpp` only parses the mode and hands a `CSelfTest` to the three test classes:
