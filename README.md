@@ -18,7 +18,9 @@ it reports facts about the original binary and scores a candidate the model wrot
 | 3 | `detect`: compiler/object/flags from the file; `find`: xrefs, vtables, related functions | **implemented** |
 | 4 | `types`: vtables, RTTI, the shared header | not implemented |
 | 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | not implemented |
-| MS-0..MS-5 | PE/MSVC targets from Linux (separate track) | not implemented - `analyze` works on a PE, `find`/`try`/`detect --range` do not |
+| MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
+| MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
+| MS-2..MS-5 | `cl` on the machine, COFF candidates for `try`, MSVC flags, MSVC C++ | not implemented |
 
 ## Use it
 
@@ -67,13 +69,18 @@ element starting with `.`):
 
 ```
 <key>/analysis.db    functions, instructions, resolved references, call graph, pseudo-code,
-                     symbols, strings, sections, and the meta table (analysis facts)
+                     symbols, strings, sections, the function table the file carries itself
+                     (a PE's `.pdata`, units in the analysis' addresses), and the meta table
+                     (analysis facts)
 <key>/target.gpr     the Ghidra project itself, so re-analysis is never needed
 ```
 
 `<key>` is a content hash of the target, so the cache follows the bytes, not the filename.
 Every write is one transaction whose last statement records `complete`; a half-written cache
 is never mistaken for a usable one, and a cache written by another `CACHE_VERSION` is rebuilt.
+Tables added later (the function table is one) are read tolerously instead of forcing a
+rebuild: an analysis written before they existed keeps working and simply has none, and a tool
+that needs one says which command re-analyses it.
 Candidate objects go to `cache/ghproj/candidates/`.
 
 ## Address domains
@@ -131,13 +138,26 @@ toolchain. Two honest limits, both printed by the tool:
   which samples the cached analysis instead). Narrowed, the -m32 build reads as -O0 with a
   margin of 2.8; un-narrowed it answers -O1 and says the sample spans builds.
 
-For PE, the Rich header and the linker version are read (the id -> product table is
-Microsoft-internal, so the build numbers are what is recorded); `.dynstr` and `DT_NEEDED`
-say which C++ ABI and standard library a *stripped* ELF uses. The PE path was read on a real
-MSVC binary (`Tests/Proprietary/notepad.exe`: `compiler = msvc`, linker 14.12, Rich build id
-25711, `/GL`+`/LTCG` from its debug directory) and it reads the note correctly, but `find`,
-`show`, `try` and `detect --range` then raise on it - the PE container is understood, the PE
-side of the work is not finished ([Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) §3).
+For PE, the Rich header, the linker version and the debug directory are read: a real MSVC
+binary (`Tests/Proprietary/notepad.exe`) reports `compiler = msvc`, link.exe 14.12 = the v141
+(VS2017) toolset, every tool at Rich build id 25711, `/GL`+`/LTCG` from its POGO record, and
+the PDB's GUID with the address Microsoft serves that PDB from. `find`, `show`, `detect` and
+`detect --range` work on it (`python Tests/tools/check_pe_target.py`), and the report says
+plainly that a `/GL` image cannot be reproduced byte-for-byte by a single-file compile.
+
+An x64 PE also carries the compiler's own function table, and since MS-1 the tool uses it.
+`decomp analyze` reads `.pdata` into the cache next to the analysis' ranges and prints the
+reconciliation instead of silently picking a side - on `notepad.exe`, 186 units / 99 778 bytes,
+154 agreeing with the analysis, 32 the analysis reports shorter, 0 longer, and 35 analysis
+entries the file names no unit for. A unit's extent is what `try` compares (`--size` still
+overrides it), `show` prints the unit or the gap an invented function sits in, and `find` marks
+what the table does not know. What is still missing on a PE is a candidate side at all -
+[Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) §5-§7.
+
+`.dynstr` and `DT_NEEDED` say which C++ ABI and standard library a *stripped* ELF uses; on a
+PE the imports say which CRT it links (`msvcrt.dll` = the downlevel C runtime), which is a
+runtime, not a language - an MSVC binary's language comes from its decorated names, and that is
+MSVC-Plan MS-4.
 
 ## The group a request asks about (`decomp find`)
 
@@ -259,14 +279,18 @@ all three scripts print OK on this machine).
   to take real boundaries from; with a cached analysis and `--sample <name>` it uses the real
   ones. For a statically linked target the answer needs `--range` (see above).
 * A PE/MSVC target: `analyze` works on one (236 functions out of `Tests/Proprietary/notepad.exe`,
-  109 s) and the build note is read correctly, but `find` dies on the missing PE section map,
-  `try`/`show`/`detect --range` die in `extract.section_capabilities` (LIEF spells PE section
-  flags `characteristics`), and nothing reads `.pdata` - the function table an x64 PE carries,
-  which is where 186 exact unit boundaries are sitting unused.
-  [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
+  ~140 s), and since MS-0 so do the build note, `find`, `show` and `detect` (its report names
+  the v141 toolset, `/GL`+`/LTCG`, and the public PDB that carries the answer key); since MS-1
+  so does its own function table, `.pdata`, whose 186 unit boundaries the tool keeps, prefers for
+  a unit's extent, and reports its disagreement with the analysis with. Still missing: any
+  candidate side, since nothing here can run `cl` and no COFF semantics are implemented
+  (MS-2/MS-3). [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
 * Ghidra's function boundaries at `-O2` differ from the compiler's, and a `-O2` body can be
   split across `.text` and `.text.unlikely`; only the first range is compared today.
-  Extracting across ranges is Phase 5.
+  Extracting across ranges is Phase 5. (An x64 PE no longer has that problem: the unit table
+  gives one contiguous range and the bytes are read across it - see MS-1.)
+* `detect --range` still samples a PE's `.text` cut at every `ret` rather than over the unit
+  table it now has. MS-4's shape profiles should sample the units.
 * A vtable or other object defined in another translation unit is named by the `.o` and
   reached through a pointer slot in the linked image (STRUCT-24 above). Phase 4.
 * A candidate that calls a helper it does not define reaches it by name, while the analysis of

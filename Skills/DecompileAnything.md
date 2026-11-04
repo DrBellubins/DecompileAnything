@@ -48,12 +48,19 @@ the candidate needs; `[include_dirs]` in the target's `project.toml` does it per
   to), and `--family <hops>` gives the connected group with the reason for each entry.
   In a stripped binary there are no names to search: start from a string or an address, then
   grow with `--family`.
-* A **PE/MSVC target**: `decomp analyze` works on one (236 functions out of
-  `Tests/Proprietary/notepad.exe`) and `detect`'s build note reads it (`msvc`, the Rich build
-  id, `/GL`+`/LTCG` from its debug directory), but `find`/`show`/`try`/`detect --range` raise
-  on it today - a named gap with the work phased in `Docs/MSVC-Plan.md`, not something to
-  debug mid-task. An x64 PE carries its own function table in `.pdata` (186 exact ranges on
-  that file); nothing reads it yet.
+* A **PE/MSVC target**: `decomp analyze`, `find`, `show` and `detect` work on one
+  (`Tests/Proprietary/notepad.exe`: 236 functions; `detect` names the v141 toolset from the
+  Rich build id, `/GL`+`/LTCG` from its debug directory, and the public PDB that holds that
+  file's answer key). `try` does not: no compiler here emits MSVC code, and nothing implements
+  COFF candidate semantics yet. Both are a named gap phased in `Docs/MSVC-Plan.md`, not
+  something to debug mid-task.
+  An x64 PE carries the compiler's own function table in `.pdata` (186 units on that file) and
+  the tool reads it: `analyze` caches it and prints the reconciliation with the analysis (154
+  agree, 32 the analysis reports shorter, 35 entries the file names no unit for), a unit's extent
+  is what a diff compares (`--size` still overrides it), `show` prints the unit or names the gap
+  an analysis-only function sits in, and `find` marks those entries `<- not in .pdata`. Trust
+  the unit boundary over the analysis' size; trust the analysis for instruction boundaries.
+  A cached analysis made before this has no unit table - `analyze --force` gives it one.
 * Only `analyze` starts Ghidra (~10 s per binary, once). `detect`/`show`/`find`/`status` read
   `cache/ghproj/<sha256-16>/analysis.db` or the file itself in ~0.1 s. Re-running `analyze` on
   the same bytes says "already analysed"; `--force` rebuilds.

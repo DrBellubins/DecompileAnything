@@ -268,7 +268,14 @@ def decode_function(handle: Cs, base: int, data: bytes,
 
 
 def _fill_gaps(handle: Cs, data: bytes, base: int, known: list[Instruction]) -> list[Instruction]:
-	"""Decode any bytes the given boundaries did not cover (a `--size` re-cut at -O2)."""
+	"""Decode any bytes the given boundaries did not cover.
+
+	Two ways to get them: a `--size` re-cut at -O2, or a unit of the file's own function table
+	(Docs/MSVC-Plan.md MS-1), whose extent includes bytes the analysis left out of its ranges -
+	alignment padding, a jump table, a tail block. Whatever they decode to, they are compared: an
+	invention here shows up as `extra` in the diff rather than going unmeasured. Capstone's own
+	instruction objects are converted to this module's, since that is what the caller walks.
+	"""
 	covered = [(item.address, item.length) for item in known]
 	extra: list[Instruction] = []
 	address = base
@@ -281,9 +288,13 @@ def _fill_gaps(handle: Cs, data: bytes, base: int, known: list[Instruction]) -> 
 				break
 		else:
 			stop = min([start for start, _ in covered if start > address] + [end])
-			for instruction in handle.disasm(data[address - base:stop - base], address):
-				extra.append(instruction)
-				address = instruction.address + instruction.length
+			for item in handle.disasm(data[address - base:stop - base], address):
+				decoded = _decode_one(handle, data[item.address - base:stop - base], item.address)
+				if decoded is None:
+					address = item.address + max(item.size, 1)
+					continue
+				extra.append(decoded)
+				address = item.address + max(item.size, 1)
 			address = max(address, gap_start + 1)
 	known.extend(extra)
 	known.sort(key=lambda item: item.address)

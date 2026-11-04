@@ -87,7 +87,8 @@ def build_note(target: Path) -> dict:
 	note = {"path": str(target), "name": Path(target).name, "format": None, "arch": None,
 		"bits": 0, "entrypoint": None, "file_type": None, "pie": None, "static": None,
 		"needed": [], "interp": None, "sections": {}, "segments": [], "gnu_features": [],
-		"comment": [], "rich": [], "linker_version": None, "dynstr": "",
+		"comment": [], "rich": [], "linker_version": None, "dynstr": "", "image_base": None,
+		"pdb": None, "pogo": None, "ltcg": False, "toolset": None,
 		"compiler": None, "compiler_id": None, "compiler_version": None, "linker": None,
 		"abi": None, "language": None, "std_hints": [], "build_notes": [],
 		"compiler_hint": None, "error": None}
@@ -199,26 +200,127 @@ def _read_elf(binary, note: dict) -> None:
 
 def _read_pe(binary, note: dict) -> None:
 	header = binary.header
+	optional = binary.optional_header
 	note["arch"] = _short(header.machine)
 	note["bits"] = 64 if "64" in note["arch"] else 32
-	note["entrypoint"] = int(binary.optional_header.addressof_entrypoint)
+	# A PE's own headers speak RVAs; the analysis, objdump and `decomp --range` speak
+	# imagebase + RVA. The note is recorded in the second domain, the one the cache is keyed
+	# by, so `cli._address_offset()` can answer "0, because the format says so" instead of
+	# answering "unknown" (Docs/MSVC-Plan.md §8: forget that bias once and every address in
+	# the tool is "no such function").
+	image_base = int(getattr(binary, "imagebase", 0) or getattr(optional, "imagebase", 0) or 0)
+	note["image_base"] = image_base
+	note["entrypoint"] = image_base + int(optional.addressof_entrypoint)
 	note["file_type"] = "DLL" if int(header.characteristics) & 0x2000 else "EXE"  # IMAGE_FILE_DLL
-	note["pie"] = bool(int(binary.optional_header.dll_characteristics) & 0x0040)  # DYNAMIC_BASE
+	note["pie"] = bool(int(optional.dll_characteristics) & 0x0040)  # DYNAMIC_BASE (ASLR)
+	note["sections"] = {str(section.name): image_base + int(section.virtual_address)
+		for section in binary.sections if section.size}
+	for library in binary.imports:
+		# The import directory is the PE's DT_NEEDED: what it asks the loader for. PE stores
+		# these names upper-cased, so they are kept as the file writes them and compared
+		# case-insensitively where a name is evidence.
+		note["needed"].append(str(library.name))
 	note["static"] = not note["needed"]
-	note["linker_version"] = "%d.%d" % (binary.optional_header.major_linker_version,
-		binary.optional_header.minor_linker_version)
+	note["linker_version"] = "%d.%d" % (optional.major_linker_version, optional.minor_linker_version)
+	note["toolset"] = msvc_toolset(note["linker_version"])
 	rich = getattr(binary, "rich_header", None)
 	if rich is not None:
 		# The Rich header's id -> product table is Microsoft-internal and undocumented, so the
 		# build number is what is recorded: it identifies the toolset build that produced it.
 		for entry in rich.entries:
+			count = getattr(entry, "count", None)
+			if count is None:  # LIEF < 1.0 spelled it `number`
+				count = getattr(entry, "number", 0)
 			note["rich"].append({"id": int(getattr(entry, "id", 0) or 0),
-				"build": int(getattr(entry, "build_id", 0) or 0),
-				"count": int(getattr(entry, "number", 0) or 0)})
-	for info in getattr(binary, "debug_info", []) or []:
-		if _short(info.type) == "CODEVIEW":
-			note["comment"].append("codeview:%s" % getattr(info, "info", ""))
+				"build": int(getattr(entry, "build_id", 0) or 0), "count": int(count or 0)})
+	_read_pe_debug(binary, note)
 	note["link_flags"] = []
+
+
+def _debug_records(binary) -> list:
+	"""The debug directory of a PE: CodeView, POGO, REPRO, ... LIEF 1.0 calls this `debug`;
+	`debug_info` is what older LIEF called it, and in 1.0 it is something else entirely (the
+	abstract DebugInfo, and None in a LIEF built without it). Asking both by name, in the
+	order that works, is the only portable way to read the CodeView record."""
+	for attribute in ("debug", "debug_info"):
+		try:
+			items = list(getattr(binary, attribute) or [])
+		except Exception:  # noqa: BLE001 - a format that has neither is not a PE worth arguing about
+			continue
+		if items:
+			return items
+	return []
+
+
+def _read_pe_debug(binary, note: dict) -> None:
+	"""The three debug records that say how an MSVC image was built.
+
+	CodeView is the PDB's identity - and the address Microsoft serves the PDB of a shipped
+	Windows binary from, which for a stripped proprietary target is an answer key
+	(§4 of Docs/MSVC-Plan.md). POGO says whether the image went through link-time
+	codegen, and that is what decides whether the byte gate can be promised at all (§6).
+	"""
+	for record in _debug_records(binary):
+		kind = _short(record.type)
+		if kind == "CODEVIEW":
+			name = str(getattr(record, "filename", "") or "")
+			guid = str(getattr(record, "guid", "") or "")
+			age = int(getattr(record, "age", 0) or 0)
+			entry = {"name": name, "guid": guid, "age": age,
+				"signature": _short(getattr(record, "cv_signature", "") or "")}
+			if name and guid:
+				entry["symbols_url"] = "https://msdl.microsoft.com/download/symbols/%s/%s%d/%s" % (
+					name, guid.replace("-", "").upper(), age, name)
+			note["pdb"] = entry
+			note["comment"].append("codeview:%s guid=%s age=%d" % (name or "?", guid or "?", age))
+		elif kind == "POGO":
+			signature = _short(getattr(record, "signature", "") or "")
+			note["pogo"] = signature
+			if signature == "LCTG":
+				note["ltcg"] = True
+				note["comment"].append("pogo:LCTG (/GL + /LTCG: the linker generated this code)")
+			else:
+				note["comment"].append("pogo:%s" % signature)
+		elif kind == "REPRO":
+			note["comment"].append("reproducible-build record (/REPRO)")
+
+
+# link.exe's version says which toolset family produced the file - which is the decision the
+# tool has to make before it compiles anything: a candidate only has a chance of matching when
+# the compiler is of the same era (Docs/MSVC-Plan.md §6). The major and minor say the family;
+# the exact Visual Studio update comes from the Rich build id, and Docs/MSVC-Plan.md MS-4 owns
+# that table. Listed newest first, so the first match is the narrowest one.
+_MSVC_TOOLSETS = (
+	((14, 30), "v143 (Visual Studio 2022)"),
+	((14, 20), "v142 (Visual Studio 2019)"),
+	((14, 10), "v141 (Visual Studio 2017)"),
+	((14, 0), "v140 (Visual Studio 2015)"),
+	((13, 10), "v130 (Visual Studio 2003)"),
+	((12, 0), "v120 (Visual Studio 2013)"),
+	((11, 0), "v110 (Visual Studio 2012)"),
+	((10, 0), "v100 (Visual Studio 2010)"),
+)
+
+
+def msvc_toolset(linker_version) -> dict | None:
+	"""The toolset family a PE's linker version names, or None when there is no such version."""
+	if not linker_version:
+		return None
+	parts = str(linker_version).split(".")
+	try:
+		major, minor = int(parts[0]), int(parts[1])
+	except (IndexError, ValueError):
+		return None
+	for (want_major, want_minor), family in _MSVC_TOOLSETS:
+		if major == want_major and minor >= want_minor:
+			return {"family": family, "linker_version": str(linker_version)}
+	return {"family": "MSVC link.exe %s (no toolset table entry)" % linker_version,
+		"linker_version": str(linker_version)}
+
+
+def rich_builds(note: dict) -> list[int]:
+	"""The toolset build ids the Rich header names (0 is the padding entry)."""
+	return sorted({int(item["build"]) for item in note.get("rich", []) if item.get("build")})
 
 
 def _read_macho(binary, note: dict) -> None:
@@ -278,22 +380,32 @@ _CPP_ABI = re.compile(r"__cxxabiv1|__cxa_|_ZTV|_ZTI|_ZTS|__gxx_personality")
 def language_evidence(note: dict) -> None:
 	"""ABI, language and the lowest `-std` the imports force, from names the file carries."""
 	carrier = " ".join(note["needed"]) + " " + note["dynstr"] + " " + " ".join(note["comment"])
-	abi = None
+	abi, cpp_abi = None, False
 	for name in note["needed"]:
-		if "stdc++" in name:
-			abi = "libstdc++ (Itanium C++ ABI)"
-		elif name.startswith(("libc++", "c++.")):
-			abi = "libc++ (Itanium C++ ABI)"
-		elif name.startswith(("msvc", "vcruntime", "ucrt")):
-			abi = "MSVC CRT"
+		# A PE names its imports upper-cased (MSVCRT.dll), an ELF lower-cased, so the name is
+		# compared case-insensitively and reported as the file writes it.
+		library = name.lower()
+		if "stdc++" in library:
+			abi, cpp_abi = "libstdc++ (Itanium C++ ABI)", True
+		elif library.startswith(("libc++", "c++.")):
+			abi, cpp_abi = "libc++ (Itanium C++ ABI)", True
+		elif library.startswith("msvcrt"):
+			# The *downlevel* CRT: what `msvcrt.lib` links - not the UCRT, not the redistributable
+			# vcruntime/MSVC++ DLLs. It is a C runtime, so it says nothing about the language.
+			abi = "MSVC CRT (%s: the downlevel C runtime, not UCRT or the vcruntime DLLs)" % name
+		elif library.startswith(("msvc", "vcruntime", "ucrt", "vccorlib")):
+			abi, cpp_abi = "MSVC CRT (%s)" % name, library.startswith(("msvcp", "vccorlib"))
 	if abi is None and note["rich"]:
 		abi = "MSVC CRT (the Rich header is written by the Microsoft linker)"
 	if abi is None:
 		match = _CPP_ABI.search(note["dynstr"])
 		if match:
-			abi = "C++ ABI runtime (the symbol %s)" % match.group(0)
+			abi, cpp_abi = "C++ ABI runtime (the symbol %s)" % match.group(0), True
 	note["abi"] = abi
-	note["language"] = "c++" if abi else None
+	# Which runtime a program imports is not the same question as what language it is written
+	# in: msvcrt.dll is what a plain C program imports too. On an MSVC image the language and
+	# the standard come from decorated names, which is Docs/MSVC-Plan.md MS-4.
+	note["language"] = "c++" if cpp_abi else None
 	for std, pattern in _STD_MARKERS:
 		match = re.search(pattern, carrier)
 		if match:
@@ -308,6 +420,12 @@ def note_lines(note: dict, width: int = 12) -> list[str]:
 	def line(key, value):
 		return None if value in (None, [], {}, "") else "  %-*s %s" % (width, key, value)
 	built = " ".join(part for part in (note.get("compiler"), note.get("compiler_version")) if part)
+	toolset, pdb = note.get("toolset"), note.get("pdb") or {}
+	toolset_line = builds = None
+	if toolset:
+		builds = rich_builds(note)
+		toolset_line = toolset["family"] + (" - Rich header tool build %s"
+			% "/".join(str(item) for item in builds) if builds else "")
 	return [item for item in (
 		line("file", "%s %s %s-bit" % (note.get("format"), note.get("arch"), note.get("bits"))),
 		line("object", "%s%s" % (note.get("file_type"), " (PIE)" if note.get("pie") else "")),
@@ -316,6 +434,16 @@ def note_lines(note: dict, width: int = 12) -> list[str]:
 		line("built by", built),
 		line("linker", note.get("linker") or ("MSVC link.exe %s" % note["linker_version"]
 			if note.get("linker_version") else None)),
+		# The toolset era is the first thing a candidate build has to agree with: a 2022 `cl`
+		# does not produce a 2017 image (Docs/MSVC-Plan.md §6).
+		line("toolset", toolset_line),
+		line("whole-program", "link-time code generation (/GL + /LTCG): the code in this image "
+			"was regenerated by the linker, so no single-file compile of the same source "
+			"reproduces its bytes - the byte gate cannot be promised here"
+			if note.get("ltcg") else None),
+		line("pdb", ("%s  guid %s age %s" % (pdb.get("name"), pdb.get("guid"), pdb.get("age"))
+			+ ("\n%s%s" % (" " * (width + 2), pdb["symbols_url"]) if pdb.get("symbols_url") else ""))
+			if pdb.get("guid") else None),
 		line("build notes", "; ".join(note.get("build_notes", [])) or None),
 		line("abi", note.get("abi")),
 		line("std at least", "; ".join("%s (%s)" % (hint["std"], hint["evidence"])
@@ -358,6 +486,14 @@ def starter_config(target: Path, note: dict, guess: dict | None = None) -> str:
 	]
 	if note.get("abi"):
 		lines.append("# Its imports say: %s." % note["abi"])
+	if note.get("ltcg"):
+		# Docs/MSVC-Plan.md §6: the byte gate only applies to a target a variant can reproduce.
+		lines.append("# This image went through link-time code generation (/GL + /LTCG): no"
+			" single-file")
+		lines.append("# compile of the same source reproduces its bytes, so a variant here can be"
+			" scored on")
+		lines.append("# shape and references, not byte-identity. Its toolset:%s"
+			% (" %s" % note["toolset"]["family"] if note.get("toolset") else " (see `decomp detect`)"))
 	if levels:
 		lines.append("# The imports need at least -std=%s (%s)." % (levels[-1],
 			", ".join(hint["evidence"] for hint in note["std_hints"][:3])))
@@ -627,14 +763,18 @@ def target_shape(target: Path, rng: tuple[int, int] | None = None, band: tuple[i
 		return {}, note, ["could not re-read %s: %s" % (Path(target).name, exc)]
 	bodies: list[list[str]] = []
 	seen_sections: list[str] = []
+	# A PE section header gives an RVA and the sample's addresses have to be in the domain the
+	# caller is quoting (`--range` comes from objdump, which adds the image base). ELF and
+	# Mach-O section headers already carry load addresses.
+	base = extract.file_address_base(binary)
 	for section in binary.sections:
 		name = str(section.name)
 		if not section.size or not (name.startswith(".text") or name in ("__text", ".text.unlikely")):
 			continue
-		if not extract.section_capabilities(binary.format, section)[2]:
+		if not extract.section_capabilities(getattr(binary, "format", None), section)[2]:
 			continue
 		seen_sections.append(name)
-		start = int(section.virtual_address)
+		start = base + int(section.virtual_address)
 		data = bytes(section.content)
 		stream = [(int(item.address), normalize.format_instruction(item.mnemonic, item.op_str))
 			for item in handle.disasm(data, start)]

@@ -5,7 +5,9 @@ binaries built by Microsoft's compiler, on a Linux machine, with no Windows inst
 number below was measured on this machine on **2026-11-04** against
 `Tests/Proprietary/notepad.exe`. **No code in `decomp/` was changed to obtain them** - the probe
 ran with a `project.toml` and an analysis cache outside the repo (`/tmp/danotepad`), and `decomp/`
-is still untouched by this work.
+is still untouched by this work. (MS-0 has changed `decomp/` since; every number below is still
+what `Tests/tools/check_pe_target.py` measures, which is now the machine-readable form of this
+section.)
 
 ---
 
@@ -45,6 +47,9 @@ imported DLLs, 256 base-relocation entries.
 `TimeDateStamp` is a reproducible-build constant (it decodes to 2053), so the toolset, not the
 timestamp, is what dates this file.
 
+The probe target is gitignored (`Tests/Proprietary/`), so re-measure it after fetching it; the
+check script exits 2 - not 1 - when the file or its analysis is absent.
+
 Re-measure it with:
 
 ```sh
@@ -72,7 +77,8 @@ Working today:
   survive into the cache (`OpenProcessToken`, `TextOutW`, ...), and **all 186 `.pdata`
   function starts are function entries in the cache**.
 
-Broken, in the order it bites:
+Broken, in the order it bites. (This is the state before MS-0; §7 records what closed each of
+them.)
 
 1. `extract.section_capabilities` (`extract.py:28,35`) reads `section.flags`. LIEF's PE section
    attribute is **`characteristics`** (`pointerto_raw_data`, `sizeof_raw_data`,
@@ -82,7 +88,8 @@ Broken, in the order it bites:
    PE executable mask there (`0x20000020`) also ANDs `MEM_EXECUTE` with `CNT_CODE`; they are
    alternatives, not a pair.
 2. `_read_pe` never fills `note["sections"]`, so `cli._address_offset()` (`cli.py:959`) returns
-   `None` and `decomp find` dies at `cli.py:649` (`int(None)`). For a PE this offset is 0 in
+   `None` and `decomp find` dies at `cli.py:649` - on `int("None")`, because `cache.write`
+   stores `str(value)` and the missing offset reaches the reader as text. For a PE this offset is 0 in
    practice - Ghidra loads the image at its own `imagebase` - but "compute it as 0 because the
    format says so" has to be an answer the code can give.
 3. `_read_pe` never fills `note["needed"]` from the PE imports, so `note["static"]` is
@@ -193,24 +200,108 @@ Numbered `MS-*` so they do not renumber Design-Plan's Phases 1-5. Each phase is 
 useful and each has a check script in `Tests/tools/`, in the style of
 `check_analysis_cache.py`.
 
-**MS-0: make the PE path run.** (~50 lines, no new dependency, fixes four real crashes.)
-`section_capabilities`: PE `characteristics`, correct masks, and a COFF branch (COFF has no
-`binary.format`; its header has `machine`/`kind`, no `identity_class`).
-`_read_pe`: fill `note["sections"]` (RVA + `imagebase`) and `note["needed"]` from
-`binary.imports`; read `binary.debug` (CodeView GUID/age/PDB name, `POGO`/LCTG, `REPRO`) and
-`entry.count`. Then `decomp detect`, `show` and `find` work on a PE, and `detect` can say
-`/GL` and name the toolset.
-*Check:* `Tests/tools/check_pe_target.py` - on `Tests/Proprietary/notepad.exe`: `compiler =
-msvc`, `linker_version = 14.12`, `static = False`, 28 imports, the PDB GUID, `LCTG` reported,
-and `find`/`show` return results without raising.
+**MS-0: make the PE path run.** *Done 2026-11-04.* `Tests/tools/check_pe_target.py` is the
+gate and it passes on `Tests/Proprietary/notepad.exe`: `compiler = msvc`, `linker_version =
+14.12`, toolset `v141 (Visual Studio 2017)` cross-read against Rich build id `25711`,
+`static = False` with the 28 imports listed, the PDB's GUID/age plus the
+`msdl.microsoft.com` URL it can be fetched from, `pogo = LCTG` / `ltcg = True`, Rich counts
+non-zero, `.text` in the section map at `0x140001000`, the entry point inside it, and
+`find`/`show` run as the CLI runs them (exit 0, 36 of 45 references bound to operands).
+`detect --write` on a PE writes a config that names `cl`, `o0`, and the /GL warning, and
+`--range 0x140012000-0x140018000` samples 65 bodies inside `.text` while a range outside the
+image is reported as empty. All four items of §3 are closed; the ELF path is unchanged
+(Phase 1/2/3 checks report the same numbers as before). The analysis cache for this target now
+lives in the repo's own cache (`cache/ghproj/899346f9f283a4fd`), so `decomp find`/`show` on
+it need no `--config`; it was made before MS-0, which is why `cache.address_offset` below is
+not a hypothetical (the MS-1 re-analysis rewrote it, so the tolerant reader is now asserted
+directly rather than relied on from an old file).
 
-**MS-1: `.pdata` as the source of function boundaries.** Read `.pdata` in `extract.TargetImage`
-(biased by `imagebase`), keep it in the cache alongside the Ghidra ranges, and prefer it for
-`entry`/`size`; report the disagreement instead of silently taking one side.
-*Check:* the same script asserts 186 units with exact sizes and no invented function in an
-alignment gap; today's numbers (154 exact, 32 short, 35 invented) are the baseline it must
-improve on. This is also worth doing for ELF-free reasons: it is the fix for the multi-range
-bodies Phase 5 needs anyway.
+Four things §3 did not list, found while fixing it:
+
+* **The image-base bias is needed on the byte path too, not only in the note.** LIEF's PE
+  section `virtual_address` is an RVA, so `extract.TargetImage` could find no section for any
+  analysed address. `extract.file_address_base()` is now the single place that answers "what
+  do I add to this file's section addresses to get the addresses everything here is keyed
+  by": the image base for a PE, 0 for ELF/Mach-O. `cli._address_offset()` then computes
+  `(0, ".text")` for a PE - the answer "the format says so", with the basis recorded.
+* **A cached `meta` value is stored as `str(value)`**, so an analysis made before this fix
+  holds the text `"None"` and `int(meta["address_offset"])` raised in `find`/`show`/`try`
+  whatever the code now records. `cache.address_offset(meta)` reads it as 0.
+* **`.rdata` is a PE's `.rodata`.** `extract._COMPARABLE` and `_POINTER_SECTIONS` are prefix
+  lists, and without it the bytes of every string and table the analysis named read back as
+  `None`. Verified against `0x1400205f0`, which holds `TextOutW`.
+* **A CRT import is not a language.** `msvcrt.dll` is what a plain C program imports, so
+  `language_evidence` now reports `abi = MSVC CRT (msvcrt.dll: the downlevel C runtime...)`
+  and leaves `language` unset instead of claiming C++ (that needs decorated names: MS-4). It
+  also has to match import names case-insensitively - a PE writes them upper-cased.
+
+The COFF half of MS-0 is exactly what §7 asked for and no more: `extract._machine_name` and
+`extract._bits_of` read a COFF header (`machine`, and no `identity_class` at all - `kind` says
+EXEC/OBJ), so `CandidateObject` opens a `.obj` instead of failing on the header, and
+`section_capabilities` answers from `characteristics` with no `binary.format` to consult. The
+check builds a `clang-cl` object when one is installed and asserts machine/bits/no-error; the
+symbol and relocation semantics (no sizes, no addends, one COMDAT per function) are MS-3.
+
+**MS-1: `.pdata` as the source of function boundaries.** *Done 2026-11-04.*
+`extract.TargetImage._read_function_table` reads `.pdata` (its RVAs through
+`extract.file_address_base()`, exactly as planned), `analyze` writes it into a new cache table
+`units(source, entry, end, size, unwind, section)` in the analysis' addresses, and everything
+that reads a body can consult it. `Tests/tools/check_pe_target.py` is the gate; the numbers it
+asserts are the ones §3 item 5 measured by hand, which the tool now produces itself:
+
+```
+  unit table   .pdata: 186 units, 99778 bytes - the file's own boundaries (.text 99778)
+               154 agree with the analysis, 32 the analysis reports shorter, 0 longer,
+               0 of its units are not a function entry in the analysis
+               35 analysis function entries are not in .pdata - the analysis made those up
+```
+
+* **Preferred, not merely kept.** `extract.original_function` compares the unit's extent whenever
+  the caller did not pass `--size`, and gets the unit's bytes by reading the *file* contiguously
+  over it. That is also the multi-range fix Phase 5 asked for: 12 of this file's bodies have a
+  gap inside them, and `0x140005af4` (2 ranges, a 67-byte gap, 2222 bytes analysed) is now
+  compared over the compiler's contiguous 2289. Every disagreement is reported as a warning, and
+  an explicit `--size` still wins, because a caller who names a range asked for one.
+* **Reported on both sides.** `show` prints `; .pdata 0x…-0x… (3567 bytes): the file's own
+  function table, the analysis' body is 3566 - `decomp try` compares the unit and says so`, or,
+  for an entry the table does not name, `names no unit at 0x140001120: this function is the
+  analysis' own - its units end at 0x140001118 and start again at 0x140001160, a 72-byte gap`.
+  `find` marks what it lists (`<- not in .pdata`, `<- .pdata says N`), `status` names the table,
+  and `show --json` carries the record.
+* **The ELF path did not move.** The schema gained a table, but reading it is tolerant
+  (`cache.has_table`, and every unit helper returns nothing when there is none), so the analyses
+  already on disk keep working and keep their answers; `check_pe_target.py`'s last group
+  re-measures that on `gcc-o0/da_tests.stripped`. A PE analysis has to be re-run
+  (`analyze --force`) to gain its table - which is how the numbers above were obtained here.
+
+Four things §7 did not predict:
+
+* A PE section's `size` is its **virtual** size and LIEF's `content` is only the initialised
+  bytes: walking `size` invents zero-length units out of the padding. The 186 real records live
+  in 2232 bytes of a 2560-byte `.pdata`.
+* `functions.bytes` in the cache is the **concatenation** of the analysis' ranges, so a gap
+  inside a body is *missing* from the blob rather than zero-filled. Extending the blob to a
+  unit's extent appends the wrong bytes; the unit has to be re-read from the file.
+* The 35 analysis-only entries are not scattered: they sit in the **alignment gaps between
+  units**, so printing the gap they are in is the honest annotation, and it is why `find`
+  should not list them like real units.
+* `unit_at`, keyed on the entry, is not the whole question: an analysis function can start
+  *inside* a unit. `cache.unit_covering` answers that separately and `show` says "the analysis
+  split one unit the compiler bounded as one" - a case this file happens not to contain.
+* Comparing a unit means **decoding** its padding, and that path had never run:
+  `normalize._fill_gaps` appended capstone's own instruction objects, whose length is `.size`
+  and not `.length`, so the first byte it tried to fill raised `AttributeError`. It now decodes
+  gaps into this module's `Instruction` (an undecodable byte advances one byte), and the check
+  asserts instructions come out *inside* a gap - 13 of them in the 67-byte gap at
+  `0x140005af4`, 520 for the unit overall.
+* A side effect worth knowing: `decomp try`'s **original side** now works on a PE end to end -
+  `try 0x140001d58` against any candidate decodes 766 instructions over the unit's 3567 bytes,
+  binds 151 symbols, and reports the unit disagreement as a note. What is missing is only the
+  candidate side (MS-3), which is exactly the split MS-0/MS-1 were built on.
+
+Still open after MS-1, deliberately: `detect --range` still samples `.text` cut at every `ret`
+(`toolchain.target_shape`), so it does not use the unit table yet; MS-4's shape profiles should
+sample real units.
 
 **MS-2: put a compiler on the machine.** msvc-wine full install (A) into a dedicated prefix,
 `--major 15` for a target-era match; optionally download-only + `lld` (B) for a fast, Wine-free
@@ -260,10 +351,25 @@ independent of each other. Nothing here changes the ELF path.
 
 * LIEF 1.0 PE/COFF spellings: `section.characteristics`, `pointerto_raw_data`,
   `sizeof_raw_data`, `numberof_relocations`, `binary.debug`, `entry.count`,
-  `header.machine`. COFF has no `binary.format`; `lief.parse` auto-detects `.obj` files and
-  returns a `COFF.Binary`.
-* `.pdata`, PDB addresses and PE relocations speak **RVAs**; Ghidra speaks
-  `imagebase + RVA`. Forget the bias once and everything is "no such function".
+  `header.machine`, `binary.imagebase` (not `image_base`). COFF has no `binary.format` and no
+  `identity_class` in its header - it says `machine` and `kind`; `lief.parse` auto-detects
+  `.obj` files and returns a `COFF.Binary`.
+* In this LIEF build (PyPI 1.0.0-d05b3499b) `binary.debug_info` is **`None`** - it is the
+  abstract DebugInfo, and the extended parser is not compiled in (it prints "Debug info not
+  available for this build"). The PE debug directory is `binary.debug`, which does work and
+  yields `CodeViewPDB` / `Pogo` / `Repro` objects. Ask for both names, in that order
+  (`toolchain._debug_records`).
+* `.pdata`, PDB addresses and PE relocations speak **RVAs**; Ghidra, objdump and this tool's
+  cache speak `imagebase + RVA`. Forget the bias once and everything is "no such function" -
+  and note that it is needed in three places: the build note, the section map used to read
+  bytes, and the `-O` shape sample's `--range` filter. (A unit table's rows are written in the
+  **analysis'** addresses, i.e. after the bias, so the cache and the analysis meet without one
+  more conversion: `TargetImage.units` is in the file's addresses and `analysis_units()` is the
+  biased copy.)
+* A PE section's `size` is its virtual size, its `content` only the bytes the file initialises -
+  iterating a table by `size` walks padding that is not in the file (MS-1). And a cached
+  function's `bytes` is the concatenation of its ranges, so a gap inside a body is absent from
+  it, not zero-filled.
 * COFF: no symbol sizes, no `is_function`, relocations per section with no addend, and one
   COMDAT section per function - which is the good news, and what MS-3 should use.
 * MSVC names are decorated and `c++filt` cannot read them. Keep the decorated name as the

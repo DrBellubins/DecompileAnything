@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,31 +24,99 @@ from .normalize import Ref, clean_symbol, demangle, is_synthetic
 
 # Reading the bytes at a reference is only meaningful where the file and the object hold the
 # same bytes: read-only initialised sections. A pointer in .data/.got is link-relative.
-_COMPARABLE = (".rodata", ".text", ".data.rel.ro")
+_COMPARABLE = (".rodata", ".rdata", ".text", ".data.rel.ro")
 
-def section_capabilities(fmt: str, section) -> tuple[bool, bool, bool]:
+# ELF section flags (SHF_*).
+_SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
+# PE and COFF share one flag word (IMAGE_SCN_*).
+_SCN_CNT_UNINITIALIZED, _SCN_CNT_CODE = 0x00000080, 0x00000020
+_SCN_MEM_DISCARDABLE, _SCN_MEM_WRITE, _SCN_MEM_EXECUTE = 0x00008000, 0x80000000, 0x20000000
+
+
+def _section_flags(section) -> tuple[object, str]:
+	"""A section's flag word, and how this format spells it: ELF says `flags`, PE and COFF
+	both say `characteristics`. Reading the wrong one is an AttributeError out of a working
+	tool, which is what happened to every command that touches a PE."""
+	for attribute, spelling in (("flags", "elf"), ("characteristics", "pe")):
+		try:
+			value = getattr(section, attribute)
+		except AttributeError:
+			continue
+		if value is not None:
+			return value, spelling
+	return None, ""
+
+
+def _machine_name(header) -> str:
+	"""The machine a header names, however this format spells it (ELF says `machine_type`,
+	PE and COFF say `machine`)."""
+	for attribute in ("machine_type", "machine"):
+		try:
+			value = getattr(header, attribute)
+		except AttributeError:
+			continue
+		if value is not None:
+			return str(value).rsplit(".", 1)[-1]
+	return ""
+
+
+def _bits_of(header, machine: str) -> int:
+	"""32 or 64. ELF and PE say it in `identity_class`; a COFF object header has no such field
+	(it says `kind` = EXEC/OBJ instead), so there the machine has to say it."""
+	try:
+		text = str(header.identity_class)
+	except AttributeError:
+		text = ""
+	if "64" in text:
+		return 64
+	if "32" in text:
+		return 32
+	name = machine.upper()
+	if name in ("AMD64", "ARM64", "ARM64EC", "IA64"):
+		return 64
+	if name in ("I386", "ARM", "ARMNT", "THUMB"):
+		return 32
+	return 0
+
+
+def section_capabilities(fmt, section) -> tuple[bool, bool, bool]:
 	"""(allocated, writable, executable) of a section, however this format spells its flags.
 
-	LIEF hands back an int for ELF and PE (`str(section.flags)` is literally "6") and an enum
-	elsewhere, so the flag test is done per format here rather than by string matching - which
-	matters: string matching silently read every ELF section as neither allocated nor writable.
+	LIEF hands back an int for ELF, PE and COFF (`str(section.flags)` is literally "6") and an
+	enum elsewhere, so the flag test is done per format here rather than by string matching -
+	which matters: string matching silently read every ELF section as neither allocated nor
+	writable. `fmt` may be None: a COFF object has no `binary.format`.
 	"""
-	raw = section.flags
+	raw, spelling = _section_flags(section)
 	if not isinstance(raw, int):
 		text = str(raw).upper()
 		return ("ALLOC" in text or "MEM" in text), "WRITE" in text, ("EXEC" in text or "CODE" in text)
-	format_name = str(fmt).upper()
-	if "ELF" in format_name:
-		return bool(raw & 0x2), bool(raw & 0x1), bool(raw & 0x4)
-	if "PE" in format_name:
-		return (section.size > 0, bool(raw & 0x80000000),
-			bool(raw & 0x20000020))  # MEM_EXECUTE | CNT_CODE
+	format_name = str(fmt or "").upper()
+	if spelling == "elf" or "ELF" in format_name:
+		return bool(raw & _SHF_ALLOC), bool(raw & _SHF_WRITE), bool(raw & _SHF_EXECINSTR)
+	if spelling == "pe" or "PE" in format_name or "COFF" in format_name:
+		# A PE/COFF section has no ALLOC bit: the loader maps whatever it is given bytes for.
+		# What is not mapped is a discardable section and an initialised-but-empty one
+		# (IMAGE_SCN_CNT_UNINITIALIZED, a `.bss`), which has no file bytes to read. And
+		# IMAGE_SCN_MEM_EXECUTE and IMAGE_SCN_CNT_CODE both say "code" - the first is what the
+		# loader enforces, the second what the compiler wrote - so they are alternatives here,
+		# never a pair to AND together.
+		return (not raw & (_SCN_MEM_DISCARDABLE | _SCN_CNT_UNINITIALIZED),
+			bool(raw & _SCN_MEM_WRITE),
+			bool(raw & _SCN_MEM_EXECUTE) or bool(raw & _SCN_CNT_CODE))
 	return True, False, False
 
 
 # Where an object's data lives: pointer tables (vtables, GOT-like tables) and ordinary data.
-_POINTER_SECTIONS = (".data.rel.ro", ".rodata", ".data", ".got", ".got.plt", ".init_array",
-	"__DATA")
+_POINTER_SECTIONS = (".data.rel.ro", ".rodata", ".rdata", ".data", ".got", ".got.plt",
+	".init_array", "__DATA")
+
+# The function table a file carries itself. An x64 PE's `.pdata` is the unwind table the loader
+# reads: (begin, end, unwind) for every function, with no symbols, after stripping - the
+# compiler's own answer to "where does this unit end", and the only one a shipped proprietary
+# binary gives (Docs/MSVC-Plan.md §4). ELF answers the same question with symbol sizes, which
+# Design-Plan Phase 5 reads; Mach-O carries neither.
+_PDATA_RECORD = struct.Struct("<III")
 
 # How many bytes of a referenced object are compared when its size is not recorded.
 _PROBE = 16
@@ -73,6 +142,26 @@ class Function:
 # the original side: the analysis cache, plus the target file for values
 
 
+def file_address_base(binary) -> int:
+	"""What has to be added to this file's section addresses to get the addresses everything
+	here is keyed by: the analysis' addresses, and the ones objdump prints.
+
+	A PE section header gives an RVA and its loader adds the image base; Ghidra loads the image
+	at that same image base, so the answer for a PE is `imagebase` and the address offset the
+	analysis records is 0. ELF and Mach-O section headers already carry load addresses, so it is
+	0 there. (Docs/MSVC-Plan.md §8: this is the bias that, forgotten once, makes every address
+	in the tool "no such function".)
+	"""
+	import lief
+
+	try:
+		if isinstance(binary, lief.PE.Binary):
+			return int(getattr(binary, "imagebase", 0) or 0)
+	except (AttributeError, TypeError):  # pragma: no cover - a LIEF without PE support
+		pass
+	return 0
+
+
 class TargetImage:
 	"""Byte access into the analysed file, by the address the *analysis* uses."""
 
@@ -81,6 +170,11 @@ class TargetImage:
 		self.offset = int(address_offset)
 		self.sections: list[tuple[str, int, int, int, bool, bool]] = []
 		self.error = ""
+		# The file's own function table, in the *file's* addresses (the same domain
+		# `self.sections` is in): `analysis_units()` biases it into the analysis' ones.
+		self.units: list[dict] = []
+		self.unit_source = ""
+		self.unit_note = ""
 		# slot address (in the analysis' domain) -> what the link writes there. In a PIE the
 		# file bytes of .data/.data.rel.ro are zeros and the value lives in the relocation's
 		# addend, so a pointer table can only be read from the relocations.
@@ -104,13 +198,70 @@ class TargetImage:
 		for section in binary.sections:
 			if not section.size:
 				continue
-			allocated, writable, _executable = section_capabilities(binary.format, section)
-			self.sections.append((str(section.name), int(section.virtual_address), int(section.size),
+			allocated, writable, _executable = section_capabilities(
+				getattr(binary, "format", None), section)
+			self.sections.append((str(section.name),
+				int(section.virtual_address) + file_address_base(binary), int(section.size),
 				int(section.offset), allocated, writable))
 		try:
 			self._read_pointers(binary)
 		except Exception:  # noqa: BLE001 - pointer tables are a discovery nicety, not a requirement
 			self.pointers = {}
+		try:
+			self._read_function_table(binary)
+		except Exception as exc:  # noqa: BLE001 - a unit table is an extra source of truth, not a
+			self.units = []  # requirement, and a LIEF that cannot read .pdata must not break `try`
+			self.unit_note = "reading the function table failed: %s" % exc
+
+	def _read_function_table(self, binary) -> None:
+		"""`.pdata`, the (begin, end, unwind) table an x64 PE carries, in the file's addresses.
+
+		The RVAs in it are relative to the image base, so every value goes through
+		`file_address_base()` - the bias MS-0 put in one place for exactly this reason
+		(Docs/MSVC-Plan.md §8). Only the bytes the file initialises are walked: a PE section's
+		`size` is its virtual size, which pads past the table, and reading that padding as records
+		would invent zero-length units.
+		"""
+		import lief
+
+		if not isinstance(binary, lief.PE.Binary):
+			return
+		section = next((item for item in binary.sections if str(item.name) == ".pdata"), None)
+		if section is None or not section.size:
+			self.unit_note = "no .pdata section: this PE carries no function table"
+			return
+		data = bytes(section.content)
+		bias = file_address_base(binary)
+		units, skipped = [], 0
+		for position in range(0, len(data) - len(data) % _PDATA_RECORD.size, _PDATA_RECORD.size):
+			begin, end, unwind = _PDATA_RECORD.unpack_from(data, position)
+			if end <= begin:
+				skipped += 1
+				continue
+			units.append({"source": ".pdata", "entry": int(begin) + bias, "end": int(end) + bias,
+				"size": int(end) - int(begin), "unwind": int(unwind) + bias,
+				"section": self._section_name(int(begin) + bias)})
+		self.units = units
+		self.unit_source = ".pdata"
+		if not units:
+			self.unit_note = ".pdata holds no readable function record"
+		elif skipped:
+			self.unit_note = "%d .pdata record(s) skipped: end <= begin" % skipped
+
+	def _section_name(self, file_address: int) -> str:
+		for name, virtual, size, _offset, allocated, _writable in self.sections:
+			if allocated and virtual <= file_address < virtual + size:
+				return name
+		return ""
+
+	def analysis_units(self) -> list[dict]:
+		"""The file's function table in the addresses the *analysis* uses (add the offset).
+
+		For a PE the offset is 0 - Ghidra loads the image at its own image base - but writing the
+		units into the cache without biasing them is how a unit ends up "no such function".
+		"""
+		return [{**unit, "entry": unit["entry"] + self.offset, "end": unit["end"] + self.offset,
+			"unwind": unit["unwind"] + self.offset} for unit in self.units]
 
 	def _read_pointers(self, binary) -> None:
 		"""The pointer slots a linked image writes at load time (R_*_RELATIVE and friends).
@@ -221,10 +372,36 @@ def original_function(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 	body = bytes(row["bytes"] or b"")
 	if body and start != entry:  # pragma: no cover - entry is the first range min
 		start = entry
+	image = None
+
+	# The file's own function table (MS-1) is the compiler's extent of the unit, gaps and all, so
+	# it is what `try` should score. Its bytes are read back out of the file contiguously, which
+	# is also the fix for a body the analysis split into ranges: the unit is one range. A caller
+	# who passed `--size` asked for a range, so that answer wins over this one, and any
+	# disagreement is reported rather than taken silently.
+	unit = cache.unit_at(conn, entry)
+	if unit is not None and not size:
+		extent = int(unit["end"]) - entry
+		if extent != full:
+			warnings.append("the analysis' body of this function is %d bytes but %s says the unit is "
+				"%d (%s..%s): the %d bytes between are inside the unit, so they are compared too - "
+				"%s is the compiler's own boundary, not a disassembler's recovery"
+				% (full, unit["source"], extent, hex(entry), hex(int(unit["end"])),
+					abs(extent - full), unit["source"]))
+			image = image or TargetImage(Path(meta.get("target_path") or ""),
+				cache.address_offset(meta))
+			whole = image.read(entry, extent)
+			if whole is not None and len(whole) == extent:
+				body, wanted, start = whole, extent, entry
+			else:
+				warnings.append("those bytes could not be read from %s%s, so only the analysis' range "
+					"is compared" % (meta.get("target_path"),
+						(": " + image.error) if image.error else ""))
 	if len(body) < wanted:
 		# the cache stores the body, but a `--size` re-cut can ask past it: read the rest
 		# straight from the file the analysis was made of
-		image = TargetImage(Path(meta.get("target_path") or ""), int(meta.get("address_offset") or 0))
+		image = image or TargetImage(Path(meta.get("target_path") or ""),
+			cache.address_offset(meta))
 		more = image.read(entry + len(body), wanted - len(body))
 		if more:
 			body += more
@@ -258,7 +435,7 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		for item in conn.execute("SELECT id, entry, name, size, kind, bytes FROM functions"
 			" WHERE entry IN (%s)" % ",".join("?" * len(targets)), targets)} if targets else {}
 	if image is None:
-		image = TargetImage(Path(meta.get("target_path") or ""), int(meta.get("address_offset") or 0))
+		image = TargetImage(Path(meta.get("target_path") or ""), cache.address_offset(meta))
 	ranked = {"address": 0, "label": 1, "function": 2, "external": 3}
 	seen: dict[str, Ref] = {}
 	used: list[Ref] = []
@@ -360,13 +537,13 @@ class CandidateObject:
 			return
 		try:
 			header = binary.header
-			self.machine = str(header.machine_type).rsplit(".", 1)[-1]
-			self.bits = 64 if "64" in str(header.identity_class) else 32
+			self.machine = _machine_name(header)
+			self.bits = _bits_of(header, self.machine)
 			for section in binary.sections:
 				if not section.size:
 					continue
 				name = str(section.name)
-				if section_capabilities(binary.format, section)[1]:
+				if section_capabilities(getattr(binary, "format", None), section)[1]:
 					self._writable.add(name)
 				self._sections[name] = bytes(section.content)
 			self._read_symbols(binary)

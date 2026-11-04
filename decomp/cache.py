@@ -65,6 +65,17 @@ CREATE TABLE calls (
 	callee INTEGER REFERENCES functions(id) ON DELETE CASCADE,
 	site INTEGER);
 
+-- The function table the *file* carries, in the analysis' addresses: for an x64 PE this is
+-- `.pdata`, the unwind table, which names every unit's begin/end with no symbols and after
+-- stripping (Docs/MSVC-Plan.md §4). It is kept beside the Ghidra ranges rather than replacing
+-- them so the two can be compared; where they differ the table wins for a unit's extent
+-- (`extract.original_function`) and the disagreement is reported.
+CREATE TABLE units (
+	source TEXT,                    -- '.pdata' today; an ELF symbol table would be another
+	entry INTEGER, end INTEGER, size INTEGER,
+	unwind INTEGER,                 -- the unwind record, where the format gives one
+	section TEXT);
+
 CREATE INDEX i_functions_entry ON functions(entry);
 CREATE INDEX i_functions_name ON functions(name);
 CREATE INDEX i_instructions_fn ON instructions(fn);
@@ -73,6 +84,7 @@ CREATE INDEX i_refs_to ON refs(to_address);
 CREATE INDEX i_calls_caller ON calls(caller);
 CREATE INDEX i_calls_callee ON calls(callee);
 CREATE INDEX i_symbols_address ON symbols(address);
+CREATE INDEX i_units_entry ON units(entry);
 CREATE INDEX i_strings_address ON strings(address);
 """
 
@@ -226,6 +238,10 @@ def write(conn: sqlite3.Connection, analysis: dict) -> None:
 			for call in function.get("calls", []):
 				conn.execute("INSERT INTO calls VALUES (?,?,?)", (
 					ids[call["caller"]], ids[call["callee"]], call.get("site")))
+		for unit in analysis.get("units", []):
+			conn.execute("INSERT INTO units VALUES (?,?,?,?,?,?)", (
+				unit["source"], unit["entry"], unit["end"], unit["size"],
+				unit.get("unwind") or 0, unit.get("section", "")))
 		for key, value in analysis.get("meta", {}).items():
 			conn.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, str(value)))
 		# last, so a cache is either complete or absent
@@ -241,8 +257,31 @@ def meta(conn: sqlite3.Connection) -> dict:
 	return {row["key"]: row["value"] for row in conn.execute("SELECT key, value FROM meta")}
 
 
+def address_offset(meta: dict) -> int:
+	"""The Ghidra-to-file address offset an analysis recorded, 0 when it did not record one.
+
+	`meta` values come back as strings (`write` stores `str(value)`), so an analysis made
+	before a format could answer the question holds the text "None" and `int()` of it raises in
+	the middle of an otherwise working command. A PE always resolves to 0 - Ghidra loads the
+	image at its own image base - and that is an answer, not a missing one.
+	"""
+	try:
+		return int(meta.get("address_offset"))
+	except (TypeError, ValueError):
+		return 0
+
+
+def has_table(conn: sqlite3.Connection, name: str) -> bool:
+	"""Does this cache have a table at all? Caches written before a field was added do not, and
+	saying so beats raising: the analyses already on disk predate MS-1."""
+	return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)) \
+		.fetchone() is not None
+
+
 def counts(conn: sqlite3.Connection) -> dict:
-	tables = ("functions", "instructions", "refs", "symbols", "strings", "sections", "calls")
+	tables = ["functions", "instructions", "refs", "symbols", "strings", "sections", "calls"]
+	if has_table(conn, "units"):
+		tables.append("units")
 	out = {name: conn.execute("SELECT count(*) FROM %s" % name).fetchone()[0] for name in tables}
 	out["bodies"] = conn.execute("SELECT count(*) FROM functions WHERE kind='function'").fetchone()[0]
 	out["thunks"] = conn.execute("SELECT count(*) FROM functions WHERE kind='thunk'").fetchone()[0]
@@ -367,6 +406,116 @@ def section_of(conn: sqlite3.Connection, address: int) -> str | None:
 	row = conn.execute("SELECT name FROM sections WHERE start <= ? AND end >= ? ORDER BY start DESC LIMIT 1",
 		(address, address)).fetchone()
 	return row["name"] if row else None
+
+
+# --------------------------------------------------------------------------------------
+# the file's own function table (Docs/MSVC-Plan.md MS-1)
+
+_UNIT_SELECT = "SELECT source, entry, end, size, unwind, section FROM units"
+
+
+def unit_rows(conn: sqlite3.Connection, limit: int = 0) -> list[sqlite3.Row]:
+	"""Every unit the file's own table names, in address order ([] when it has none)."""
+	if not has_table(conn, "units"):
+		return []
+	sql = "SELECT source, entry, end, size, unwind, section FROM units ORDER BY entry"
+	return conn.execute(sql + (" LIMIT ?" if limit else ""), ([limit] if limit else [])).fetchall()
+
+
+def unit_at(conn: sqlite3.Connection, entry: int) -> sqlite3.Row | None:
+	"""The unit the file's table says *starts* here."""
+	if not has_table(conn, "units"):
+		return None
+	return conn.execute(_UNIT_SELECT + " WHERE entry = ?", (entry,)).fetchone()
+
+
+def unit_covering(conn: sqlite3.Connection, address: int) -> sqlite3.Row | None:
+	"""The unit the file's table says this address is inside - a function the analysis placed in
+	the middle of a unit the compiler had already bounded."""
+	if not has_table(conn, "units"):
+		return None
+	return conn.execute(_UNIT_SELECT + " WHERE entry <= ? AND end > ? ORDER BY entry DESC LIMIT 1",
+		(address, address)).fetchone()
+
+
+def unit_neighbours(conn: sqlite3.Connection, address: int) -> tuple[sqlite3.Row | None, sqlite3.Row | None]:
+	"""The units just below and just above an address the table does not name: the gap an
+	analysis-only function sits in."""
+	if not has_table(conn, "units"):
+		return None, None
+	before = conn.execute(_UNIT_SELECT + " WHERE end <= ? ORDER BY end DESC LIMIT 1", (address,)) \
+		.fetchone()
+	after = conn.execute(_UNIT_SELECT + " WHERE entry > ? ORDER BY entry LIMIT 1", (address,)) \
+		.fetchone()
+	return before, after
+
+
+def unit_sizes(conn: sqlite3.Connection, entries: list[int]) -> dict[int, dict]:
+	"""{entry: {source, size}} for the units starting at these addresses - what `find` annotates
+	an entry that is not in the table, or is a different size in it, with."""
+	if not entries or not has_table(conn, "units"):
+		return {}
+	marks = ",".join("?" * len(entries))
+	return {int(row["entry"]): {"source": row["source"], "size": int(row["size"])}
+		for row in conn.execute("SELECT entry, size, source FROM units WHERE entry IN (%s)" % marks,
+			entries)}
+
+
+def unit_reconciliation(conn: sqlite3.Connection) -> dict:
+	"""The file's own function table against the analysis' bodies.
+
+	Not a verdict about which side is right: a count of where they agree and of every place they
+
+do not, which is what `decomp analyze` prints, what `show` repeats for one function, and what
+	the MS-1 check asserts (Docs/MSVC-Plan.md §3 item 5 is the baseline it must improve on).
+	"""
+	units = unit_rows(conn)
+	if not units:
+		return {"source": None, "units": 0}
+	by_entry = {int(row["entry"]): row for row in units}
+	out = {"source": units[0]["source"], "units": len(units),
+		"code_bytes": sum(int(row["size"]) for row in units), "sections": {},
+		"agree": 0, "analysis_shorter": 0, "analysis_longer": 0,
+		"not_in_analysis": [], "not_in_table": [], "sizes": {}}
+	for row in units:
+		name = row["section"] or "?"
+		out["sections"][name] = out["sections"].get(name, 0) + int(row["size"])
+	for row in conn.execute("SELECT name, entry, size, kind FROM functions"):
+		unit = by_entry.get(int(row["entry"]))
+		if unit is None:
+			if row["kind"] == "function":
+				out["not_in_table"].append({"name": row["name"], "entry": int(row["entry"]),
+					"size": int(row["size"])})
+			continue
+		if int(row["size"]) == int(unit["size"]):
+			out["agree"] += 1
+			continue
+		if int(row["size"]) < int(unit["size"]):
+			out["analysis_shorter"] += 1
+		else:
+			out["analysis_longer"] += 1
+		out["sizes"][hex(int(row["entry"]))] = [int(row["size"]), int(unit["size"])]
+	known = {int(row["entry"]) for row in conn.execute("SELECT entry FROM functions")}
+	out["not_in_analysis"] = [{"entry": int(row["entry"]), "size": int(row["size"]),
+		"section": row["section"]} for row in units if int(row["entry"]) not in known]
+	return out
+
+
+def unit_lines(rec: dict, width: int = 12) -> list[str]:
+	"""Print the reconciliation: the table first, then the disagreement in both directions."""
+	if not rec.get("units"):
+		return ["  %-*s none: this file carries no function table" % (width, "unit table")]
+	sections = ", ".join("%s %d" % (name, size) for name, size in sorted(rec["sections"].items()))
+	lines = ["  %-*s %s: %d units, %d bytes - the file's own boundaries (%s)" % (
+		width, "unit table", rec["source"], rec["units"], rec["code_bytes"], sections)]
+	lines.append("  %-*s %d agree with the analysis, %d the analysis reports shorter, %d longer, "
+		"%d of its units are not a function entry in the analysis" % (
+			width, "", rec["agree"], rec["analysis_shorter"], rec["analysis_longer"],
+			len(rec["not_in_analysis"])))
+	lines.append("  %-*s %d analysis function entries are not in %s - the analysis made those up, "
+		"usually in an alignment gap between units" % (
+			width, "", len(rec["not_in_table"]), rec["source"]))
+	return lines
 
 
 # --------------------------------------------------------------------------------------

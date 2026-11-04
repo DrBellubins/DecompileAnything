@@ -166,6 +166,17 @@ def analyze(
 	note = toolchain.build_note(target)
 	offset, basis = _address_offset(analysis["sections"], note.get("sections") or {},
 		int(analysis["meta"]["image_base"]))
+	# The function table the file carries itself (MS-1: a PE's `.pdata`) is kept in the cache next
+	# to the analysis' ranges, biased into the analysis' addresses. It is the only source of unit
+	# boundaries a shipped, stripped binary gives, and it is the compiler's rather than a
+	# recovery, so `extract.original_function` prefers it and reports where the two disagree.
+	image = extract.TargetImage(target, offset)
+	analysis["units"] = image.analysis_units()
+	analysis["meta"].update({
+		"unit_source": image.unit_source or None,
+		"unit_count": len(analysis["units"]),
+		"unit_note": image.unit_note or None,
+	})
 	analysis["meta"].update({
 		"ghidra_version": analysis["meta"].get("ghidra_version")
 			or config.application_properties(install_dir).get("application.version"),
@@ -205,6 +216,7 @@ def analyze(
 	conn = cache.create(db_path)
 	try:
 		cache.write(conn, analysis)
+		reconciled = cache.unit_reconciliation(conn)
 	finally:
 		conn.close()
 
@@ -218,6 +230,9 @@ def analyze(
 	if offset:
 		echo("  addresses Ghidra %s = file %s (via %s) - `nm`/objdump speak the file's" % (
 			_hex(meta["image_base"]), _hex(meta["image_base"] - offset), basis or "the section map"))
+	elif basis:
+		echo("  addresses Ghidra = the file's own: a %s image is loaded at its image base, so no"
+			" offset is needed (matched on %s)" % (meta.get("target_format") or "ELF", basis))
 	if meta.get("build_notes"):
 		echo("  built by  %s" % meta["build_notes"])
 	elif meta.get("build_error"):
@@ -227,6 +242,14 @@ def analyze(
 		meta["external_function_count"]))
 	echo("  exported  %s instructions, %s references, %s strings, %s pseudo-code" % (
 		meta["instruction_count"], meta["reference_count"], meta["string_count"], meta["decompiled_count"]))
+	for line in cache.unit_lines(reconciled):
+		echo(line)
+	if meta.get("unit_note"):
+		echo("  %-*s %s" % (12, "unit note", meta["unit_note"]))
+	if reconciled.get("not_in_table"):
+		examples = ", ".join("%s (%d)" % (_hex(row["entry"]), row["size"])
+			for row in reconciled["not_in_table"][:6])
+		echo("  %-*s e.g. %s" % (12, "", examples))
 	echo("  timing    import %.1fs, analysis %.1fs, decompile %.1fs, export %.1fs (total %.1fs)" % (
 		timings.get("import", 0), timings.get("analyze", 0), timings.get("decompile", 0),
 		timings.get("export", 0), timings.get("total", 0)))
@@ -263,6 +286,9 @@ def status(
 		echo("  %s bodies + %s thunks, %s instructions, %s references, %s pseudo-code  analysed %s" % (
 			values.get("body_count", "?"), values.get("thunk_count", "?"), values.get("instruction_count", "?"),
 			values.get("reference_count", "?"), values.get("decompiled_count", "?"), values.get("analyzed_at", "?")))
+		if values.get("unit_count"):
+			echo("  function table: %s, %s units (the file's own boundaries)" % (
+				values.get("unit_source", "?"), values.get("unit_count", "?")))
 		echo("  ghidra %s / pyghidra %s  db %s" % (values.get("ghidra_version", "?"),
 			values.get("pyghidra_version", "?"), values.get("db")))
 		echo("  ghidra project: %s" % ("present" if store.has_project(values.get("target_key", "")) else "missing"))
@@ -292,7 +318,7 @@ def show(
 	conn, values = open_analysis(store, binary, key)
 	try:
 		meta = cache.meta(conn)
-		offset = int(meta.get("address_offset") or 0)
+		offset = cache.address_offset(meta)
 		rows = cache.resolve_function(conn, function, _other_addresses(function, offset))
 		if not rows:
 			raise Stop(EXIT_NOT_FOUND,
@@ -310,6 +336,7 @@ def show(
 			except json.JSONDecodeError:  # pragma: no cover - written by us
 				row[json_field] = []
 		fn_id = row["id"]
+		unit = _unit_note(conn, int(row["entry"]), int(row["size"]))
 		if as_json:
 			payload = dict(row)
 			payload["bytes"] = row["bytes"].hex() if row["bytes"] else ""
@@ -320,6 +347,7 @@ def show(
 			payload["callers"] = cache.callers(conn, fn_id)
 			payload["callees"] = cache.callees(conn, fn_id)
 			payload["meta"] = meta
+			payload["unit"] = unit
 			echo(json.dumps(payload, indent=1))
 			raise typer.Exit(EXIT_OK)
 
@@ -341,6 +369,8 @@ def show(
 			echo("; tags %s" % row["tags"])
 		if row["comment"]:
 			echo("; comment %s" % row["comment"])
+		for line in unit["lines"]:
+			echo("; %s" % line)
 		echo("; source bytes: %s" % _hex_bytes(row["bytes"]))
 		echo("; analysis: %s  %s  (key %s, variant %s)" % (meta.get("language_id"),
 			meta.get("ghidra_version"), meta.get("target_key"), meta.get("variant")))
@@ -355,6 +385,84 @@ def show(
 			_print_asm(conn, fn_id, max_lines)
 	finally:
 		conn.close()
+
+
+def _mark_units(conn, rows: list[dict]) -> None:
+	"""Annotate found entries with what the file's own function table says about them (MS-1): a
+	different size there, or no unit at all. `find` is where a decompiler picks its next target, so
+	it must not present an invented function and a real one identically.
+	"""
+	if not rows or not cache.has_table(conn, "units"):
+		return
+	table = cache.unit_rows(conn, 1)
+	if not table:
+		return
+	units = cache.unit_sizes(conn, [int(row["entry"]) for row in rows])
+	for row in rows:
+		unit = units.get(int(row["entry"]))
+		if unit is None:
+			if row.get("kind") == "function":
+				row["not_in_table"] = True
+				row["unit_source"] = table[0]["source"]
+		elif int(unit["size"]) != int(row["size"]):
+			row["unit_size"] = int(unit["size"])
+			row["unit_source"] = unit["source"]
+
+
+def _unit_note(conn, entry: int, size: int) -> dict:
+	"""What the file's own function table (MS-1) says about one analysed function.
+
+	Both answers are printed: the unit boundary the compiler recorded and the body the analysis
+	recovered. Where they differ the difference is the interesting fact - it says the analysis cut
+	a unit short, or invented one in a gap the compiler emitted no function for - and saying it is
+	what `Docs/MSVC-Plan.md` MS-1 asks for instead of silently taking one side.
+	"""
+	out = {"unit": None, "covers": None, "gap": None, "lines": []}
+	if not cache.has_table(conn, "units"):
+		return out
+	found = cache.unit_at(conn, entry)
+	if found is not None:
+		record = {"source": found["source"], "entry": int(found["entry"]), "end": int(found["end"]),
+			"size": int(found["size"]), "section": found["section"]}
+		out["unit"] = record
+		if record["size"] == size:
+			out["lines"].append("%s %s-%s (%d bytes): the file's own function table and the analysis "
+				"agree on this unit" % (record["source"], _hex(record["entry"]),
+					_hex(record["end"]), record["size"]))
+		else:
+			out["lines"].append(
+				"%s %s-%s (%d bytes): the file's own function table, the analysis' body is %d - "
+				"`decomp try` compares the unit and says so" % (record["source"], _hex(record["entry"]),
+					_hex(record["end"]), record["size"], size))
+		return out
+	covering = cache.unit_covering(conn, entry)
+	if covering is not None:
+		record = {"source": covering["source"], "entry": int(covering["entry"]),
+			"end": int(covering["end"]), "size": int(covering["size"]),
+			"section": covering["section"]}
+		out["covers"] = record
+		out["lines"].append(
+			"%s has no unit at %s, but its unit %s-%s (%d bytes) covers this address: the analysis "
+			"split one unit the compiler bounded as one" % (record["source"], _hex(entry),
+				_hex(record["entry"]), _hex(record["end"]), record["size"]))
+		return out
+	before, after = cache.unit_neighbours(conn, entry)
+	out["gap"] = {"units_end_at": int(before["end"]) if before is not None else None,
+		"units_start_again_at": int(after["entry"]) if after is not None else None}
+	where = ""
+	if before is not None and after is not None:
+		where = "its units end at %s and start again at %s, a %d-byte gap" % (
+			_hex(int(before["end"])), _hex(int(after["entry"])),
+			int(after["entry"]) - int(before["end"]))
+	elif before is not None:
+		where = "its last unit below ends at %s" % _hex(int(before["end"]))
+	elif after is not None:
+		where = "its first unit above starts at %s" % _hex(int(after["entry"]))
+	source = (cache.unit_rows(conn, 1) or [None])[0]
+	name = source["source"] if source is not None else "the function table"
+	out["lines"].append("%s names no unit at %s: this function is the analysis' own%s"
+		% (name, _hex(entry), (" - " + where) if where else ""))
+	return out
 
 
 def _limit(lines: list[str], max_lines: int, label: str) -> list[str]:
@@ -646,8 +754,9 @@ def find(
 	bits = 64 if ":64:" in (cache.meta(conn).get("language_id") or "") else 32
 	try:
 		meta = cache.meta(conn)
-		offset = int(meta.get("address_offset") or 0)
+		offset = cache.address_offset(meta)
 		hits = discover.search(conn, meta, query, limit, _other_addresses(query, offset))
+		_mark_units(conn, hits["functions"])
 		addresses = discover.addresses_named(conn, hits)
 		report = {"target": values.get("target_path"), "target_key": values.get("target_key"),
 			"address_offset": offset, "query": query, **hits, "addresses": addresses}
@@ -686,7 +795,12 @@ def find(
 		"  addresses: Ghidra = file + 0x%x" % offset if offset else ""))
 	echo("functions (%d):" % len(hits["functions"]))
 	for row in hits["functions"]:
-		echo("  %s  %-6s %6s  %s" % (_hex(row["entry"]), row["kind"], row["size"], row["name"]))
+		mark = ""
+		if row.get("unit_size"):
+			mark = "  <- %s says %s" % (row["unit_source"], row["unit_size"])
+		elif row.get("not_in_table"):
+			mark = "  <- not in %s" % row["unit_source"]
+		echo("  %s  %-6s %6s  %s%s" % (_hex(row["entry"]), row["kind"], row["size"], row["name"], mark))
 	if hits["symbols"]:
 		echo("symbols and data (%d):" % len(hits["symbols"]))
 		for row in hits["symbols"]:
@@ -776,7 +890,7 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	original = extract.original_function(conn, meta, row, size or None)
 	outcome["original"] = original
 	outcome["warnings"] += original.warnings
-	if row["kind"] == "thunk":
+	if row["kind"] == "thunk" and cache.unit_at(conn, int(row["entry"])) is None:
 		outcome["warnings"].append("the analysis classifies this function as a thunk: at -O2 its "
 			"body may be a jump into another function, so the cached range may be shorter than "
 			"the compiler's - pass --size <the symbol's size> to compare the whole range")
@@ -784,7 +898,7 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		outcome["error"] = "nothing to compare: the cache holds no bytes for this function"
 		return outcome
 
-	image = extract.TargetImage(Path(meta.get("target_path") or ""), int(meta.get("address_offset") or 0))
+	image = extract.TargetImage(Path(meta.get("target_path") or ""), cache.address_offset(meta))
 	bind_original, _ = extract.original_bindings(conn, meta, row, image)
 
 	object_file = extract.CandidateObject(object_path)
@@ -839,7 +953,8 @@ def try_cmd(
 		help="default: the variant the analysis was run with"),
 	include: list[str] = typer.Option([], "--include", help="-I for the candidate build"),
 	size: int = typer.Option(0, "--size", help="compare only N bytes of the original "
-		"(use the compiler's symbol size where the analysis' own range differs, e.g. at -O2)"),
+		"(use the compiler's symbol size where the analysis' own range differs, e.g. at -O2; a "
+		"PE's own .pdata unit is already used without this)"),
 	register_abstract: bool = typer.Option(False, "--register-abstract",
 		help="treat a different register choice as a match (Phase 5; reported separately today)"),
 	max_diff: int = typer.Option(16, "--max-diff"),
@@ -865,7 +980,7 @@ def try_cmd(
 			cfg = load_config(recorded)
 			echo("config: %s (the one this analysis was run with)" % cfg["path"])
 		rows = cache.resolve_function(conn, function, _other_addresses(function,
-			int(meta.get("address_offset") or 0)))
+			cache.address_offset(meta)))
 		if not rows:
 			raise Stop(EXIT_NOT_FOUND, "no function matches %r in the analysis of %s" % (function,
 				values.get("target_path")), "see what is there with: decomp find %s" % function)

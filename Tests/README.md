@@ -68,6 +68,34 @@ stripped and unstripped builds, `--family` must bring back every unit of a famil
 vtable's slots must resolve to that class's methods. (That is why the *unstripped* build is
 analysed too: name and vtable queries need names to find.)
 
+## A real proprietary target (`Tests/Proprietary/`, gitignored)
+
+`notepad.exe` is a shipped MSVC binary, PE32+ (Docs/MSVC-Plan.md §2 says what it is and how to
+re-measure it). It is not built by `eval.py` and has no `answer_key.json`: its answer key is
+the `.pdata` function table and the public PDB Microsoft serves for it (MSVC-Plan §4) - and
+since MS-1 the tool reads that table itself. To check the tool's own PE support (MS-0 + MS-1):
+
+```sh
+.venv/bin/decomp analyze Tests/Proprietary/notepad.exe     # ~110 s, needs Ghidra once
+.venv/bin/python Tests/tools/check_pe_target.py
+```
+
+Nothing there needs a compiler - it is the target side only. It asserts the facts the file
+carries (container, 28 imports, the v141 toolset cross-read from the Rich build id, the PDB
+GUID and its URL, POGO/LCTG), reads a `.rdata` string's bytes at the address the analysis
+named, asks what the PE's own address offset is (0, with the basis named), re-reads a COFF
+`.obj` if a COFF-emitting compiler is installed, and runs `decomp find`/`show` as the CLI runs
+them.
+
+Its MS-1 group is the function-table half: all 186 `.pdata` units are in the cache with the
+extents the file gives, the disagreement with the analysis is reported with the numbers
+MSVC-Plan §3 measured by hand (154 agree, 32 the analysis reports shorter, 0 longer, 0 units
+without an entry, 35 entries the file names no unit for), a unit the analysis cut short is
+compared at the compiler's extent, a body split across ranges with a gap in it is read
+contiguously across that gap, and `find`/`show` say which entries the table does not name. It
+then re-checks the ELF path, which has no unit table and must be unchanged. Exit 1 means a
+fact came out wrong; exit 2 means the target or its analysis is missing.
+
 ## The binary
 
 `main.cpp` only parses the mode and hands a `CSelfTest` to the three test classes:
