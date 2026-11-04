@@ -1,6 +1,6 @@
 ![Decompile Anything](Images/DecompileAnythingBanner.png)
 
-DecompileAnything is a set of tools that lets LLMs decompile into human-readible code that is byte-for-byte identical to the original.
+DecompileAnything is a set of tools that let LLMs decompile into human-readible code, that is byte-for-byte identical to the original.
 
 * [Docs/Design-Plan.md](Docs/Design-Plan.md) - the plan, phases, and the design decisions.
 * [Docs/Setup.md](Docs/Setup.md) - the environment (Ghidra, JDK, venv) and why it is set up that way.
