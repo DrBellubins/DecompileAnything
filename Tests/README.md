@@ -104,22 +104,35 @@ Docs/Setup.md §6 on PATH (and `WINEPREFIX` set, since the wrappers shell out to
 ```sh
 PATH=$PWD/toolchains/msvc/bin/x64:$PATH WINEPREFIX=$PWD/.wine \
   .venv/bin/python Tests/eval.py build --variant msvc-o0
-.venv/bin/python Tests/tools/check_msvc_toolchain.py      # exit 2 = no toolchain / no Windows SDK
+.venv/bin/python Tests/tools/check_msvc_toolchain.py      # exit 0 = the toolchain and its SDK
 ```
 
 `msvc-o0`/`msvc-o2` are real MSVC variants (`cl /Od`, `/O2`, `/MT`). `mingw-o0` is **not** an
 MSVC variant and never a stand-in for one (Docs/MSVC-Plan.md §1) — it is here because it is the
-only PE this machine can build without a Windows SDK, so it is what exercises eval.py's PE half:
+only PE this machine can build without an MSVC toolchain, so it is what exercises eval.py's PE half:
 the answer key comes from the file's `.pdata` function table (read with stdlib only) plus names
 from COFF symbols or from a linker map, `strip` is skipped (a PE from `link` has no symbol table
 to strip), and the reference binary is run through `wine64`.
 
-Measured on `mingw-o0`: `answer key: 89 units (89 markers in source)` and `selfcheck` →
-`89 cases, 0 failures`. Note the difference in what the two PEs say: an **MSVC**-built x64 PE has
-one `.pdata` record per function (`notepad.exe`: exactly 186), a **GCC**-built one splits a
-function across several records, so eval.py prints that it fell back to symbol spacing for the
-extents. `decomp check` prints the same facts about the installed toolchain (versions, the
-toolset family, the Windows SDK state).
+Measured on **both `msvc-o0` and `msvc-o2`**: `answer key: 89 units (89 markers in source)`, no
+unresolved marker, and `selfcheck` → `89 cases, 0 failures`. Measured on `mingw-o0`: the same
+`89 units` and `89 cases, 0 failures`. Note the difference in what the two kinds of PE say: an
+**MSVC**-built x64 PE has one `.pdata` record per function (`notepad.exe`: exactly 186) — **except**
+for functions the compiler gave no prologue and no epilogue, which get no unwind record at all
+(12 of 89 at `/Od`); a **GCC**-built one splits a function across several records. eval.py prints
+the count from each source and falls back to symbol spacing for the extents it cannot get from
+`.pdata`. Two build rules that only the MSVC driver enforced, both measured:
+
+* **Only the top source directory goes on the include path.** With `TestFunctions/` on it, `cl`
+  finds that directory's `math.h` for the C runtime's own `<math.h>` (cl searches `-I`/`/I`
+  directories for angle includes; GCC's `<cmath>` escapes them with `#include_next`) and the CRT
+  headers then fail on their own using-declarations
+  (`cstdlib(20): error C2039: 'fabs' is not a member of '`global namespace''`).
+* **`/link` comes last.** `/Fe:` and the objects precede it; an object after `/link` is
+  `cl : Command line error D8003 : missing source filename`.
+
+`decomp check` prints the same facts about the installed toolchain (versions, the toolset family,
+the Windows SDK state).
 
 ## The binary
 
@@ -210,9 +223,9 @@ per-function difficulty is representative.
 * **-m32 normalisation is weak** (87% ceiling): 32-bit addressing forms (`movl 0x804a2c4`,
   `$displ,%eax` + `R_386_*`) are not all mapped to names. x86 is *not* a stand-in for MSVC
   either - "-m32 as the closer match to the 32-bit MSVC targets" in `project.toml` is about
-  addressing forms only. A real `msvc-*` variant of this benchmark (PE/COFF, `cl` or
-  `clang-cl`, an answer key from `.pdata`/the PDB instead of `nm --print-size`) is phase MS-2
-  of [../Docs/MSVC-Plan.md](../Docs/MSVC-Plan.md).
+  addressing forms only. A real `msvc-*` variant of this benchmark (PE/COFF, `cl`, an answer key
+  from `.pdata` and `link /MAP` instead of `nm --print-size`) has been in and passing since MS-2;
+  `try` against a COFF candidate is MS-3 of [../Docs/MSVC-Plan.md](../Docs/MSVC-Plan.md).
 * **Goldens are per-variant, not portable.** `crosscheck` treats a same-arch difference as
   a bug (there are none) and x87-vs-SSE float differences as expected: `-m32` computes
   `SineApprox` and `InitVehicleDescriptor`'s grip in float registers with different

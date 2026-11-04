@@ -20,7 +20,7 @@ it reports facts about the original binary and scores a candidate the model wrot
 | 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | not implemented |
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
-| MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **partly** - toolset v141 14.12 installed and compiling, the Windows SDK cannot be extracted here (`python Tests/tools/check_msvc_toolchain.py`, exit 2) |
+| MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **done** - toolset v141 14.12 + Windows SDK 10.0.19041: `cl`/`link` build and run a PE under Wine, and the benchmark itself builds with `cl` at `/Od` and `/O2` with an 89/89 answer key (`python Tests/tools/check_msvc_toolchain.py`, exit 0) |
 | MS-3..MS-5 | COFF candidates for `try`, MSVC flags, MSVC C++ | not implemented |
 
 ## Use it
@@ -285,10 +285,12 @@ all three scripts print OK on this machine).
   so does its own function table, `.pdata`, whose 186 unit boundaries the tool keeps, prefers for
   a unit's extent, and reports its disagreement with the analysis with. Since MS-2 there *is* an
   MSVC compiler here - `cl`/`link`/`lib`/`dumpbin` 14.12.25835.7 (v141, the era `detect` names
-  for that file), built through `decomp compile` at `/Od` and `/O2`, and its COFF objects open in
-  `extract.CandidateObject` with each function in its own `.text$mn`. Still missing: `try` on a
-  COFF candidate (MS-3 - the section-as-extent and no-addend relocation rules), and any *link*
-  with `cl`, because the Windows SDK of that prefix is an empty placeholder (below).
+  for that file), built through `decomp compile` at `/Od` and `/O2`, its COFF objects open in
+  `extract.CandidateObject` with each function in its own `.text$mn`, and `cl` **links**: the
+  benchmark's own test binary builds with `cl` and runs under Wine (`Tests/eval.py build
+  --variant msvc-o0`, 89 units of its own answer key, `selfcheck` 89 cases 0 failures), and
+  `detect --probe` measures `cl /Od|/O1|/O2` shapes. Still missing: `try` on a COFF candidate
+  (MS-3 - the section-as-extent and no-addend relocation rules).
   [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
 * Ghidra's function boundaries at `-O2` differ from the compiler's, and a `-O2` body can be
   split across `.text` and `.text.unlikely`; only the first range is compared today.
@@ -296,17 +298,26 @@ all three scripts print OK on this machine).
   gives one contiguous range and the bytes are read across it - see MS-1.)
 * `detect --range` still samples a PE's `.text` cut at every `ret` rather than over the unit
   table it now has. MS-4's shape profiles should sample the units.
+* `.pdata` is the compiler's function table **only for functions that need unwinding**: measured on
+  a `cl /Od` build of this benchmark, 12 of 89 units have no unwind record, and they are exactly
+  the functions with no prologue and no epilogue (shadow space only, no `rsp` change, no call,
+  one `ret`). An `/O2` or `/GL` build has no such gap (notepad.exe: 186 of 186). So on an `/Od`
+  PE the unit table under-counts and the extents of those functions come from the next named
+  boundary instead - `Tests/eval.py` prints the two counts; MS-1's `original_function` falls back
+  to the analysis' body for such an entry, which is the honest answer but not the compiler's.
 * A vtable or other object defined in another translation unit is named by the `.o` and
   reached through a pointer slot in the linked image (STRUCT-24 above). Phase 4.
 * A candidate that calls a helper it does not define reaches it by name, while the analysis of
   a stripped target knows it by address only: that call reads as an operand difference, and
   the symbol table prints both names so the loop can still see what happened.
-* The MSVC toolchain here is complete except for its **Windows SDK**: the SDK ships as payload
-  MSIs, and this machine has no way to extract them - `msitools`/`msiextract` needs root, and
-  Wine 9.21's `msiexec /a` stops at `InstallAdminPackage` with 1627 on those MSIs (the cabs alone
-  are no use: their entries are named `cat<hash>`, the tree lives in the MSI tables). So `cl`
-  compiles freestanding code and nothing more; `toolchains/install_msvc.py` + Docs/Setup.md §6.10
-  reproduce the install, and `decomp check` says which part is missing. `clang-cl` is installed
+* The MSVC toolchain here is **complete**: `cl`/`link`/`lib`/`dumpbin` 14.12.25835.7 with the
+  headers and import libraries of Windows SDK 10.0.19041, driven through msvc-wine's wrappers by
+  `toolchains/install_msvc.py`. Getting the SDK in took `sudo pacman -S msitools` (Wine's
+  `msiexec /a` stops at `InstallAdminPackage` with 1627 on those WiX MSIs) and **two package names
+  that are not what they sound like**: the desktop C/C++ headers and `kernel32.lib` ship in the
+  payloads named "Windows SDK for Windows Store Apps Headers/Libs", not the "Desktop" ones, and
+  `msvcrt.lib`/`oldnames.lib` - which `cl` auto-links - only in `…CRT.x64.OneCore.Desktop`.
+  Docs/Setup.md §6.10-§6.11 measure both, and the driver handles them. `clang-cl` is installed
   but is clang's codegen, never an MSVC variant; `lld-link` is absent.
   MinGW-w64 gcc produces PE/COFF but with GCC codegen, so it can test the container, never the
   match. The setup steps for every toolset era, VS2005 - VS2026, 32-bit and 64-bit, are

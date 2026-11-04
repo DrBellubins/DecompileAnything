@@ -55,11 +55,15 @@ the candidate needs; `[include_dirs]` in the target's `project.toml` does it per
   Both are a named gap phased in `Docs/MSVC-Plan.md`, not something to debug mid-task.
   Since MS-2 there is an MSVC toolchain here — `cl`/`link`/`lib`/`dumpbin` **14.12.25835.7**
   (v141, the era `detect` names for that target) at `toolchains/msvc/bin/x64`, needing
-  `PATH=…:$PATH WINEPREFIX=$PWD/.wine`. It compiles (freestanding: its Windows SDK is an empty
-  placeholder this machine cannot extract) and its `.obj` files show one `.text$<name>` COMDAT per
-  function, which is where a COFF function's exact extent comes from. `decomp check` identifies
-  all of it by banner and refuses impostors (`/usr/bin/link` is GNU coreutils; `clang-cl` is
-  clang) — read its `msvc *` rows before believing any MSVC variant is usable.
+  `PATH=…:$PATH WINEPREFIX=$PWD/.wine`. It **compiles, links and runs** PE programs under Wine
+  (`Tests/eval.py build --variant msvc-o0|msvc-o2` builds the benchmark's own test binary: 89/89
+  answer-key units, `selfcheck` 89 cases 0 failures), and `detect --probe` measures its
+  `/Od|/O1|/O2` shapes. Its `.obj` files show one `.text$<name>` COMDAT per function, which is
+  where a COFF function's exact extent comes from. Two argument rules: `/link` last (everything
+  after it goes to the linker), and only the top source directory on the include path (a
+  project `math.h` in an `-I` directory shadows the CRT's `<math.h>` for `cl`). `decomp check`
+  identifies all of it by banner and refuses impostors (`/usr/bin/link` is GNU coreutils;
+  `clang-cl` is clang) — read its `msvc *` rows before believing any MSVC variant is usable.
   An x64 PE carries the compiler's own function table in `.pdata` (186 units on that file) and
   the tool reads it: `analyze` caches it and prints the reconciliation with the analysis (154
   agree, 32 the analysis reports shorter, 35 entries the file names no unit for), a unit's extent

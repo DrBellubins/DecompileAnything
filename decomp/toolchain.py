@@ -673,8 +673,22 @@ def probe_signatures(compiler: str, bits: int, std: str = "c++17",
 	signatures = []
 	for level in levels:
 		object_path = directory / ("decomp_probe_o%d%s.o" % (level, "-m32" if bits == 32 else ""))
-		command = [compiler, "-std=%s" % std] + (["-m32"] if bits == 32 else []) + [
-			"-O%d" % level, "-c", str(source), "-o", str(object_path)]
+		if msvc(compiler):
+			# cl's own flag spellings and driver_form's argument order; no 32-bit target from this
+			# machine's MSVC (Docs/Setup.md §6.7). /Gy gives one `.text$…` COMDAT per function,
+			# which is also what makes the bodies readable in a COFF object (below).
+			if bits != 64:
+				problems.append("%s: no 32-bit x86 target from this machine's MSVC (Docs/Setup.md §6.7)"
+					% compiler)
+				continue
+			flags = ["/std:%s" % std, "/Gy",
+				"/Od" if level == 0 else ("/O1" if level == 1 else "/O2")]
+			if level >= 3:
+				flags.append("/Ob2")		# MSVC has no -O3: the nearest is inlining everything
+			command = driver_form(compiler, flags, [source], object_path)
+		else:
+			command = [compiler, "-std=%s" % std] + (["-m32"] if bits == 32 else []) + [
+				"-O%d" % level, "-c", str(source), "-o", str(object_path)]
 		try:
 			finished = subprocess.run(command, capture_output=True, text=True, timeout=180)
 		except (OSError, subprocess.TimeoutExpired) as exc:
@@ -691,16 +705,24 @@ def probe_signatures(compiler: str, bits: int, std: str = "c++17",
 		contents = {str(section.name): bytes(section.content)
 			for section in binary.sections if section.size}
 		bodies = []
-		for symbol in binary.symbols:
-			try:
-				section = str(symbol.section.name) if symbol.section is not None else ""
-				if not symbol.is_function or not symbol.size or section not in contents:
+		if not hasattr(binary, "format"):
+			# A COFF object: its symbols carry no size and no function flag (MSVC-Plan §8), so a
+			# section is a function - which is what /Gy above arranges.
+			for name, data in contents.items():
+				if name.startswith(".text"):
+					bodies.append([normalize.format_instruction(item.mnemonic, item.op_str)
+						for item in handle.disasm(data, 0)])
+		else:
+			for symbol in binary.symbols:
+				try:
+					section = str(symbol.section.name) if symbol.section is not None else ""
+					if not symbol.is_function or not symbol.size or section not in contents:
+						continue
+					data = contents[section][int(symbol.value):int(symbol.value) + int(symbol.size)]
+				except Exception:  # noqa: BLE001 - a section-less symbol carries nothing
 					continue
-				data = contents[section][int(symbol.value):int(symbol.value) + int(symbol.size)]
-			except Exception:  # noqa: BLE001 - a section-less symbol carries nothing
-				continue
-			bodies.append([normalize.format_instruction(item.mnemonic, item.op_str)
-				for item in handle.disasm(data, int(symbol.value))])
+				bodies.append([normalize.format_instruction(item.mnemonic, item.op_str)
+					for item in handle.disasm(data, int(symbol.value))])
 		if not bodies:
 			problems.append("%s -O%d produced no function symbols in %s" % (compiler, level,
 				object_path.name))

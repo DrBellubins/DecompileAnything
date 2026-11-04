@@ -119,13 +119,30 @@ def probe_link(variant: dict, work: Path, objects: dict[int, Path]) -> None:
 		print("  skip link: the Windows SDK of this prefix is not usable - %s" % sdk.get("detail"))
 		failures.append("the installed MSVC prefix has no usable Windows SDK (%s)" % sdk.get("detail"))
 		return
+	# The probe source is a set of functions with no entry point - that is what makes it useful
+	# for shape probing and useless for linking, so the program is completed here.
+	entry = work / "main.cpp"
+	entry.write_text(MAIN)
+	entry_object = work / "main.obj"
+	built = build_.build([entry], entry_object, compiler=variant["compiler"],
+		flags=toolchain.build_flags(variant), includes=[])
+	expect(built.ok, "cl compiles the entry point for the link probe")
+	if not built.ok:
+		return
 	for level, obj in sorted(objects.items()):
 		exe = work / ("probe_O%d.exe" % level)
-		command = [variant["compiler"], "/Fe:%s" % exe, "/link", *toolchain.link_flags(variant)] + [str(obj)]
+		# cl takes everything after `/link` to the linker, so the objects and `/Fe:` come first.
+		command = [variant["compiler"], "/Fe:%s" % exe, str(obj), str(entry_object), "/link",
+			*toolchain.link_flags(variant)]
 		proc = subprocess.run(command, capture_output=True, text=True, timeout=300)
 		expect(proc.returncode == 0, "cl links /O%d -> PE (%s)" % (level, Path(exe).name))
 		if proc.returncode:
-			print("      " + "\n      ".join((proc.stderr or proc.stdout).splitlines()[:10]))
+			# Both streams: the msvc-wine wrappers put the banner on stderr and the diagnostics
+			# on stdout, and cl/link print the error last.
+			print("      " + " ".join(command))
+			for stream in (proc.stdout, proc.stderr):
+				for line in [x for x in stream.splitlines() if "Fontconfig" not in x][-8:]:
+					print("      " + line)
 			continue
 		note = toolchain.build_note(exe)
 		expect(note.get("format") == "PE" and note.get("arch"), "the linked file is a PE: %s %s"

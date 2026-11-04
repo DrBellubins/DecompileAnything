@@ -13,10 +13,15 @@ wrappers. It exists because the plain upstream command does not finish on this m
   CRT headers and its x64 import libraries, and the Windows SDK: 10 packages, 1.9 GB.
 * `--msvc-version 15.5` pins the SDK to 10.0.16299, which the 15.9 channel no longer
   serves (only 10.0.19041 here), so `--sdk-version` has to be passed.
-* Its Windows SDK extraction calls `msiextract` (msitools), which cannot be installed
-  without root; `toolchains/msiextract.py` stands in for it, put on PATH below.
+* Its Windows SDK extraction calls `msiextract` (msitools) - use that when installed; it
+  reads the MSI file table and expands the SDK's external cabinets. `toolchains/msiextract.py`
+  stands in for machines without it, by running `wine msiexec /a` - which does NOT work for
+  the Windows SDK's WiX MSIs on this Wine (Docs/Setup.md §6.10).
 * Extracting every SDK MSI is ~4 GB of files, most of them ARM/WinRT/App-Certification
-  parts we never use; `SDK_KEEP` keeps the desktop x64 + UCRT ones.
+  parts we never use; `SDK_KEEP` keeps the desktop x64 + UCRT ones. Note that the desktop
+  C/C++ headers and the base import libraries (kernel32, user32, uuid, WindowsApp) are NOT
+  in the payloads named "Desktop Headers/Libs" - see the comment on SDK_KEEP.
+* The desktop CRT package does not ship every library cl auto-links; see `fill_missing_libs`.
 
 Nothing here is committed except this file and msiextract.py - `toolchains/` and `.wine/`
 are gitignored (the toolset is under a non-redistributable licence).
@@ -46,21 +51,32 @@ WINEPREFIX = REPO / ".wine"             # gitignored; shared with the wrappers a
 # The upstream default for a VS2017-era channel is the whole product. These are the packages
 # a compiler needs: the pinned toolset, its own CRT headers and x64 libraries (not the
 # versionless 14.16 ones, which would put a second, newer VC under VC/tools/msvc and make
-# install.sh pick that one), and the Windows SDK.
+# install.sh pick that one), and the Windows SDK. `crt.x64.onecore.desktop` is not optional
+# in practice - the desktop CRT package leaves out msvcrt.lib/oldnames.lib and the rest, see
+# fill_missing_libs.
 KEEP = re.compile(
 	r"^("
 	r"microsoft\.visualstudio\.component\.vc\.tools\.[\d.]+"		# the pinned toolset component
 	r"|microsoft\.visualc\.\d+\.\d+\.tools(\.|$)"				# cl/c1/c2/link/lib/ml
-	r"|microsoft\.visualc\.\d+\.\d+\.crt\.(headers|source|x64\.desktop)"	# STL+CRT headers, import libs
+	r"|microsoft\.visualc\.\d+\.\d+\.crt\.(headers|source|x64\.desktop|x64\.onecore\.desktop)"	# STL+CRT headers, import libs
 	r"|win1[01]sdk"												# the Windows SDK
 	r")", re.I)
 
 # Which Windows SDK payloads to unpack. Every .cab stays: the MSIs name their own external
 # cabinet, and an admin install fails when the cabinet is not next to the MSI.
+#
+# The "…Desktop Headers/Libs x64" payloads are NOT what their names suggest: their File
+# tables hold 3 and 346 entries, and none of them is windows.h or kernel32.lib. In the SDK
+# as served through the VS channel, the desktop C/C++ headers (Include/*/um, most of the
+# shared/ set) and the base import libraries (kernel32.Lib, User32.Lib, Uuid.Lib,
+# WindowsApp.lib, OneCoreUAP*.Lib) ship in the payloads named "…for Windows Store Apps…",
+# which install into the same Windows Kits/10/Include/<v>/um and Lib/<v>/um/<arch> trees.
+# Keeping only the "Desktop" ones gives an SDK with no <windows.h> and no kernel32.lib.
 SDK_KEEP = re.compile(
 	r"^("
 	r"Windows SDK$|Windows SDK EULA|Kits Configuration Installer"
 	r"|Windows SDK Desktop (Headers|Libs) x64"
+	r"|Windows SDK for Windows Store Apps (Headers|Libs|Contracts)"
 	r"|Universal CRT Headers Libraries and Sources"
 	r"|Universal CRT Tools x64"
 	r"|Windows SDK Signing Tools"
@@ -72,6 +88,62 @@ SDK_KEEP = re.compile(
 MAJOR, MSVC_VERSION, SDK_VERSION = "15", "15.5", "10.0.19041"
 TRIM = ["--with-workload", "no", "--with-asan", "no", "--with-atl", "no",
 	"--with-dia", "no", "--with-msbuild", "no", "--with-devcmd", "no"]
+
+
+def prune_dangling_links(dest: str) -> int:
+	"""Remove symlinks whose target is gone, so msvc-wine's install.sh can be re-run.
+
+	install.sh creates the case-insensitive aliases a build expects (`msvcrt.lib` ->
+	`MSVCRT.lib`) with `ln_s() { if [ ! -e "$2" ]; then ln -s "$1" "$2"; fi; }`. `-e` follows
+	the link, so a *dangling* alias from an earlier, partial run passes the test and `ln -s`
+	then fails with "File exists" - which, under `set -e`, aborts the whole install. The v141
+	toolset payload really has no msvcrt.lib/msvcrtd.lib/oldnames.lib (they live in the CRT
+	redist packages), so those three aliases are always dangling here.
+	"""
+	removed = []
+	for dirpath, dirnames, filenames in os.walk(dest):
+		for name in dirnames + filenames:
+			path = os.path.join(dirpath, name)
+			if os.path.islink(path) and not os.path.exists(path):
+				os.unlink(path)
+				removed.append(path)
+	if removed:
+		print("removed %d dangling symlink(s) left by an earlier partial install:" % len(removed))
+		for path in removed:
+			print("  " + os.path.relpath(path, dest))
+	return len(removed)
+
+
+def fill_missing_libs(dest: str) -> int:
+	"""Point the desktop lib directory at the library the desktop CRT package does not ship.
+
+	Measured on the 15.9 channel: `Microsoft.VisualC.14.12.CRT.x64.Desktop` ships 30 files
+	under `VC/Tools/MSVC/<ver>/lib/x64` - the static CRT (libcmt/libcpmt/libvcruntime),
+	the concrt variants and msvcmrt - and nothing else. `msvcrt.lib`, `msvcrtd.lib`,
+	`oldnames.lib`, `msvcprt.lib`, `legacy_stdio_definitions.lib`, `vccorlib.lib`,
+	`vcomp.lib` and the PGO/DIA support libs are only in the sibling package
+	`…CRT.x64.OneCore.Desktop`, under `lib/onecore/x64`. cl auto-links oldnames.lib, so
+	every link, including msvc-wine's own msvctricks.cpp, stops at
+	`LNK1104: cannot open file 'OLDNAMES.lib'` without it.
+
+	For every file name the desktop directory lacks, symlink the OneCore copy next to it and
+	print it. Nothing already there is touched, so the CRT flavour the build uses is unchanged.
+	"""
+	added = 0
+	for toolset in sorted((Path(dest) / "VC/Tools/MSVC").glob("*")):
+		onecore, desktop = toolset / "lib/onecore/x64", toolset / "lib/x64"
+		if not onecore.is_dir() or not desktop.is_dir():
+			continue
+		for source in sorted(onecore.iterdir()):
+			target = desktop / source.name
+			if target.exists():
+				continue
+			target.symlink_to(os.path.relpath(source, desktop))
+			added += 1
+			print("  %-32s (from %s/lib/onecore/x64)" % (source.name, toolset.name))
+	if added:
+		print("linked %d library/libraries the desktop CRT package does not ship" % added)
+	return added
 
 
 def msiextract_shim() -> "Path | None":
@@ -188,6 +260,10 @@ def main() -> int:
 
 	if not args.no_install_sh:
 		if not args.no_sdk:
+			print("\n=== libraries the desktop CRT package does not ship ===")
+		fill_missing_libs(dest)
+		prune_dangling_links(dest)
+		if not args.no_sdk:
 			print("\n=== msvc-wine install.sh (wrappers) ===")
 			subprocess.run(["sh", str(CLONE / "install.sh"), dest], check=True)
 		else:
@@ -205,6 +281,7 @@ def main() -> int:
 			print("         not extracted, so this toolset can compile but not build a real program.")
 			print("         It needs `msiextract` (msitools) or a Wine whose msiexec extracts them;")
 			print("         this machine's Wine 9.21 stops at InstallAdminPackage with 1627.")
+		print("\nNow: PATH=%s/bin/x64:$PATH  WINEPREFIX=%s" % (dest, WINEPREFIX))
 		return 0
 
 	print("\nNow: PATH=%s/bin/x64:$PATH" % dest)

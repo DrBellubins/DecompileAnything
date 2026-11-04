@@ -152,7 +152,7 @@ def msvc_simple_name(decorated):
 	owner = [p for p in parts[1:] if p and not p.startswith("?")]
 	if "?" in name or not name:
 		return decorated
-	return "::".join(reversed(owner) + [name]) if owner else name
+	return "::".join(list(reversed(owner)) + [name]) if owner else name
 
 
 def demangle(names):
@@ -219,7 +219,11 @@ def pe_sections(path):
 		head = optional + size_optional + index * 40
 		name = data[head:head + 8].split(b"\0")[0].decode("latin-1")
 		vsize, rva, rawsize, rawptr = struct.unpack_from("<IIII", data, head + 8)
-		sections[name] = {"va": image_base + rva, "vsize": vsize, "rawptr": rawptr, "rawsize": rawsize}
+		characteristics = struct.unpack_from("<I", data, head + 36)[0]
+		sections[name] = {"va": image_base + rva, "vsize": vsize, "rawptr": rawptr,
+			"rawsize": rawsize,
+			# IMAGE_SCN_CNT_CODE and IMAGE_SCN_MEM_EXECUTE are alternatives, not both set (MSVC-Plan §8).
+			"executable": bool(characteristics & 0x20000020)}
 	return image_base, sections
 
 
@@ -276,45 +280,64 @@ def pe_names(binary, units, image_base, sections):
 
 
 def msvc_map_names(binary, image_base, sections):
-	"""`link /MAP`: the "Publics by Value" table, whose rows are `section:offset`."""
-	path = Path(str(binary) + ".map")
-	if not path.is_file():
-		path = path.with_suffix("")  # <stem>.map, not <stem>.exe.map
-	if not path.is_file():
+	"""Names from `link /MAP`, measured on a v141 map of this benchmark.
+
+	The "Publics by Value" rows are
+	` 0001:00000270  main  0000000140001270 f  main.o` - a `group:offset` pair, the symbol,
+	then `Rva+Base`, then flags and the object file. Two things that are not obvious from the
+	documentation and were wrong here until a real map was read:
+
+	* there is no section-*name* column to anchor on. The `0001:` index numbers the table of
+	  "Start Length Name Class" at the top of the file, which lists merge groups (here
+	  `.text$mn`, `.text$mn$00` and `.text$x` are all group 0001), so it is not a section
+	  name and cannot be looked up in the PE's own section table.
+	* the `Rva+Base` column is the final address - image base included - so it needs no
+	  arithmetic at all. Rows of section `0000` are `<absolute>`/`<linker-defined>` symbols
+	  (0x0, 0x100, the image base itself), which is exactly why the address is also required
+	  to land inside an executable section of the file.
+	"""
+	for path in (Path(str(binary) + ".map"), Path(binary).with_suffix(".map")):
+		# `link /MAP` names the file after the output: da_tests -> da_tests.map, u.exe -> u.map
+		# (removing the ".map" from the first candidate would ask for the binary itself).
+		if path.is_file():
+			break
+	else:
 		return {}
 	text = path.read_text(errors="replace")
 	if "Publics by Value" not in text:
 		return {}
-	# The map's `0001:` indexes name image sections; the RVAs are read from the file itself,
-	# which is the same fact stated once.
+	range_of = [(info["va"], info["va"] + info["vsize"])
+		for info in sections.values() if info.get("executable")]
 	names = {}
 	body = text.split("Publics by Value", 1)[1]
 	for line in body.splitlines():
-		match = re.match(r"^\s*([0-9a-f]{4}):([0-9a-f]{8})\s+(.*)$", line)
-		if not match:
+		match = re.match(r"^\s*([0-9a-f]{4}):([0-9a-f]{8})\s+(\S+)\s+([0-9a-f]{16})\b", line)
+		if not match or match.group(1) == "0000":
 			continue
-		index, offset = int(match.group(1), 16), int(match.group(2), 16)
-		fields = match.group(3).split()
-		# The row is `<ordinal> <hits> <thunk> <#bytes> <type> <section> <symbol> <object>`;
-		# anchoring on the section field is what survives the columns changing between linker
-		# versions, and the symbol is the field that follows it.
-		position = next((i for i, field in enumerate(fields) if field.startswith((".text", ".data", ".rdata", "INIT"))), None)
-		if position is None or position + 1 >= len(fields):
+		address = int(match.group(4), 16)
+		if not any(start <= address < end for start, end in range_of):
 			continue
-		section = fields[position]
-		if section not in sections:
-			continue
-		names[sections[section]["va"] + offset] = fields[position + 1]
+		names.setdefault(address, match.group(3))
 	return names
 
 def pe_symbols(binary):
 	"""The same entry shape `symbols()` returns for an ELF, built from `.pdata` + names.
 
 	An MSVC-built x64 PE has one `.pdata` record per function, which is the exact answer key
-	(MSVC-Plan §4). GCC splits a function into one record per block group, so on a MinGW-built
-	PE most records name no symbol. When that happens the units are taken from the symbols
-	instead, with an extent that runs to the next one - stated out loud, because it is a worse
-	answer and any score built on it inherits that.
+	(MSVC-Plan §4) - with one exception measured here, on a v141 /Od build of this benchmark:
+	**12 of the 89 units have no `.pdata` record at all**. The ones that are missing are the
+	functions the compiler gave no prologue and no epilogue - they only write the caller's
+	shadow space, never touch `rsp`, make no call and have a single `ret`, so there is nothing
+	for unwind info to describe and `link` emits neither `$unwind$…` nor `$pdata$…` for them.
+	(Confirmed on a four-function control: `int other(int a,int b){return a-b;}` has no record,
+	`int leaf_no_frame(int a,int b){return a<b?a:b;}` - which spills to a frame - does.)
+	So `.pdata` is the compiler's function table for the functions that need unwinding, which
+	for an /O2 or /GL build is every function (notepad.exe: 186 of 186), and is not complete
+	for an /Od one. Both sources are therefore used, and the count from each is printed.
+
+	GCC splits a function into one record per block group, so on a MinGW-built PE most records
+	name no symbol. When that happens the units are taken from the symbols instead - stated out
+	loud, because it is a worse answer and any score built on it inherits that.
 	"""
 	image_base, sections = pe_sections(binary)
 	units = pe_units(binary)
@@ -333,6 +356,22 @@ def pe_symbols(binary):
 			"by MSVC (GCC splits one function across several unwind records), so the units below "
 			"come from the symbol table with extents up to the next symbol" % (named, len(entries), binary))
 		entries = symbol_units(names)
+	else:
+		# Functions the unwind table does not describe, named by the map: added with an extent
+		# up to the next boundary, which is the same fallback the paragraph above describes.
+		boundaries = sorted([entry["address"] for entry in entries] + list(names))
+		covered = [(entry["address"], entry["address"] + entry["size"]) for entry in entries]
+		missing = [(address, name) for address, name in sorted(names.items())
+			if not any(start <= address < end for start, end in covered)]
+		if missing:
+			print("  note: %d named functions of %s have no .pdata record - MSVC emits none for a "
+				"function with no prologue or epilogue; their extent comes from the next boundary"
+				% (len(missing), Path(binary).name))
+		for address, name in missing:
+			nexts = [boundary for boundary in boundaries if boundary > address]
+			end = nexts[0] if nexts else address
+			entries.append({"address": address, "size": end - address, "mangled": name,
+				"name": simple_name(name), "type": "t"})
 	# A PE built by GCC still uses Itanium names; MSVC decorations are handled by simple_name.
 	itanium = [entry["mangled"] for entry in entries if entry["mangled"].startswith("_Z")]
 	if itanium:
@@ -749,6 +788,13 @@ def compile_source(compiler, flags, source, output):
 	sh([compiler] + flags + ["-c", str(source), "-o", str(output)])
 
 
+def include_flags(compiler, directories):
+	"""The include-path arguments for this driver (`-I` vs `/I`; cl reads `-I` as an option
+	too, but spelling it the driver's own way keeps the command line copy-pasteable)."""
+	flag = "/I" if is_msvc(compiler) else "-I"
+	return [x for directory in directories for x in (flag, str(directory))]
+
+
 def link_binary(compiler, flags, objects, linkflags, binary):
 	"""Link the benchmark. `cl` names the output with /Fe and passes the rest to the linker
 	after /link; a gcc driver uses -o (Docs/MSVC-Plan.md §7, MS-2)."""
@@ -770,7 +816,15 @@ def cmd_build(config, variants, capture=True):
 		for source in SOURCES:
 			object_path = out_dir / (Path(source).stem + ".o")
 			print("  %s %s" % (variant, source))
-			compile_source(compiler, flags + ["-I", str(SOURCE_DIR), "-I", str(SOURCE_DIR / "TestFunctions")],
+			# Only the top source directory goes on the include path, even though the sources
+			# under TestFunctions/ are named "math.h", "strings.h", "structs.h": every include
+			# of a sibling is quoted and resolves next to the including file. Listing
+			# TestFunctions/ too makes `cl` find TestFunctions/math.h for the C runtime's own
+			# <math.h> - a driver that searches the -I directories for angle brackets, unlike
+			# GCC, whose <cmath> escapes them with #include_next - and the CRT headers then
+			# fail on their own using-declarations (cstdlib: "'fabs' is not a member of
+			# '`global namespace``'").
+			compile_source(compiler, flags + include_flags(compiler, [SOURCE_DIR]),
 				SOURCE_DIR / source, object_path)
 			objects.append(object_path)
 		binary = out_dir / "da_tests"

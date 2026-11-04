@@ -396,10 +396,17 @@ def msvc_sdk(cl_path: str | None = None) -> dict:
 	"""The Windows SDK that goes with an msvc-wine style toolchain prefix.
 
 	`cl` finds its headers through the wrapper's environment, so the honest question is not
-	"is there a directory" but "is there a UCRT to link against": `libucrt.lib` for this
-	target arch, plus the CRT/Win32 import libraries. A toolchain prefix with an empty
-	placeholder (which is what a machine that cannot extract the SDK payload MSIs ends up
-	with) answers no.
+	"is there a directory" but "is there a C runtime and a Win32 import library to link
+	against": `<version>/um/windows.h`, `<version>/ucrt/x64/libucrt.lib` and
+	`<version>/um/x64/kernel32.lib`. A toolchain prefix with an empty placeholder (which is
+	what a machine that cannot extract the SDK payload MSIs ends up with) answers no.
+
+	Measured on SDK 10.0.19041 as served by the VS2017 channel: `um/windows.h` and
+	`kernel32.lib` are NOT in the payload MSIs named "Windows SDK Desktop Headers/Libs x64"
+	(their File tables hold 3 and 346 entries, none of them these) - they come from the
+	payloads named "Windows SDK for Windows Store Apps Headers/Libs", which install into the
+	same Windows Kits trees. `oldnames.lib`, which an earlier version of this probe asked for,
+	is a VC toolset library and is not in the SDK at all (Docs/Setup.md §6.11).
 	"""
 	path = cl_path or shutil.which("cl")
 	out = {"root": None, "version": None, "detail": "no cl on PATH - cannot locate a toolchain prefix"}
@@ -414,16 +421,15 @@ def msvc_sdk(cl_path: str | None = None) -> dict:
 		return out
 	out["root"] = str(root)
 	kits = root / "Windows Kits" / "10"
-	versions = sorted(p.name for p in kits.glob("Lib") if p.is_dir()) if kits.is_dir() else []
 	include_versions = sorted(p.name for p in (kits / "Include").glob("10.*")) if (kits / "Include").is_dir() else []
 	if not include_versions:
 		out["detail"] = "Windows Kits/10 has no Include/10.* - the SDK payload MSIs were never extracted"
 		out["complete"] = False
 		return out
 	version = include_versions[-1]
-	libs = kits / "Lib" / version
-	wanted = [str(libs / "ucrt/x64/libucrt.lib"), str(libs / "um/x64/kernel32.lib"),
-		str(libs / "um/x64/oldnames.lib")]
+	include, libs = kits / "Include" / version, kits / "Lib" / version
+	wanted = [str(include / "um/windows.h"), str(libs / "ucrt/x64/libucrt.lib"),
+		str(libs / "um/x64/kernel32.lib")]
 	missing = [w for w in wanted if not Path(w).is_file()]
 	out["version"] = version
 	out["complete"] = not missing

@@ -534,7 +534,8 @@ Measured, in the order it happened:
   with `err:msi:ITERATE_Actions Execution halted, action L"InstallAdminPackage" returned 1627`
   (measured on `Windows SDK EULA` and on `Universal CRT Headers Libraries and Sources`); a real
   install, `msiexec /i`, exits 0 and installs nothing. `msiextract` (msitools) is the tool
-  vsdownload actually wants and it is not installable without root. The 165 cabs cannot stand in:
+  vsdownload actually wants and it was not installable without root at the time - it is now
+  installed, and §6.11 is what finishing the SDK then revealed. The 165 cabs cannot stand in:
   `7z l` shows their entries as `cat<hash>` - the file names live in each MSI's `File` table and
   the paths in its `Directory` table.
 * `install.sh` refuses to build the wrappers without a `Windows Kits/10/include/10.*` directory,
@@ -551,3 +552,41 @@ Measured, in the order it happened:
 * `decomp check` must report: the toolchain dir exists, the `cl` banner, whether a 32-bit host PE
   runs at all (§6.7), and that `#include <vector>` compiles — the last one is what catches a
   headers-without-compiler setup.
+
+### 6.11 Finishing the SDK: msitools and two package names (2026-11-04, same day)
+
+`sudo pacman -S msitools` (msiextract 0.106) then re-running `toolchains/install_msvc.py` completed
+the install: `Build msvctricks done.` from `install.sh`, `decomp check` all ok, and
+`cl /MT /O2 hello.cpp` → `wine64 hello.exe` prints. Four things had to change, all measured:
+
+* **msitools' `msiextract` is the tool vsdownload wants, and it does what Wine's `msiexec /a`
+  could not**: it reads the MSI `File`/`Directory` tables itself and expands the external
+  cabinets - `Universal CRT Headers Libraries and Sources` → 590 files / 284 MB in **0.85 s**, in
+  the `Program Files/Windows Kits/10/...` layout `moveVCSDK` expects. `install_msvc.py` now uses
+  `msiextract` from PATH when present and keeps `toolchains/msiextract.py` (the Wine shim) only as
+  the fallback, printing which one it picked.
+* **The desktop headers and the base import libraries are not in the payloads named "Desktop".**
+  `Windows SDK Desktop Headers x64` has **3** files in its `File` table and `…Desktop Libs x64`
+  has 346 - no `windows.h`, no `kernel32.lib`, no `user32.lib`, no `uuid.lib`, while `shell32.lib`
+  and `Gdi32.Lib` are there. They ship in the payloads named **`Windows SDK for Windows Store Apps
+  Headers` / `Libs` / `Contracts`**, which install into the same `Include/<v>/um` and
+  `Lib/<v>/um/<arch>` trees (the `Libs` one is where `kernel32.Lib`, `User32.Lib`, `Uuid.Lib`,
+  `WindowsApp.lib` and `OneCoreUAP*.Lib` come from). Adding those three names to the driver's
+  `SDK_KEEP` took `Include/…/um` from 0 to 662 files and `Lib/…/um/x64` from 346 to 659.
+* **The desktop CRT package does not ship every library `cl` auto-links.**
+  `Microsoft.VisualC.14.12.CRT.x64.Desktop` holds 30 files under `lib/x64` - the static CRT, the
+  concrt variants, `msvcmrt` - and every link, including msvc-wine's own `msvctricks.cpp`, stops
+  at `LNK1104: cannot open file 'OLDNAMES.lib'`. `msvcrt.lib`, `msvcrtd.lib`, `oldnames.lib`,
+  `msvcprt.lib`, `legacy_stdio_definitions.lib`, `vccorlib.lib`, `vcomp.lib` and the PGO/DIA libs
+  are only in **`Microsoft.VisualC.14.12.CRT.x64.OneCore.Desktop`**, under `lib/onecore/x64`.
+  The driver now keeps that package (11 packages / 513 MB) and links the 22 names the desktop
+  directory lacks out of `lib/onecore/x64`, printing each one. Note that `oldnames.lib` is a *VC*
+  library: an earlier version of `decomp check`'s SDK probe asked for it under
+  `Windows Kits/10/Lib/…/um/x64`, where it has never been; the probe now asks for
+  `Include/<v>/um/windows.h`, `Lib/<v>/ucrt/x64/libucrt.lib` and `Lib/<v>/um/x64/kernel32.lib`.
+* **`install.sh` is not re-runnable over a partial install.** Its case-alias helper is
+  `ln_s() { if [ ! -e "$2" ]; then ln -s "$1" "$2"; fi; }`; `-e` follows the link, so a *dangling*
+  alias from an earlier run (which is what `MSVCRT.lib`/`OLDNAMES.lib` are when their targets were
+  never shipped) passes the test and `ln -s` then fails with "File exists", which under `set -e`
+  aborts the install. `install_msvc.py` prunes dangling symlinks under the prefix first and says
+  what it removed.

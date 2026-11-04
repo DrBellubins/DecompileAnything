@@ -311,10 +311,10 @@ Still open after MS-1, deliberately: `detect --range` still samples `.text` cut 
 (`toolchain.target_shape`), so it does not use the unit table yet; MS-4's shape profiles should
 sample real units.
 
-**MS-2: put a compiler on the machine.** *Partly done 2026-11-04 - the toolset is installed and
-works, the Windows SDK is the part this machine cannot extract.* Everything tool-side is in and
-gated; the two checks that need a link are reported as skipped with the reason named, and the
-benchmark's PE path is proven on a PE built by MinGW instead.
+**MS-2: put a compiler on the machine.** *Done 2026-11-04 - v141 14.12 plus a usable Windows
+SDK; `Tests/tools/check_msvc_toolchain.py` exits 0.* The Windows SDK was the blocker earlier and
+what unblocked it is §6.11 of Setup.md (msitools + two package names this driver had filtered
+out).
 
 What is on the machine (all re-runnable with `toolchains/install_msvc.py`, §6.10 of Setup.md):
 
@@ -374,9 +374,43 @@ answer to `--version` as well as `/?`.
   case (§4, one record per function) is what the exact form is for - `notepad.exe` still yields
   exactly 186 units through this code.
 
-Still open in MS-2, all of it behind the same missing SDK: the probe **link** and its run, and
-`eval.py build/selfcheck --variant msvc-o0`. And deliberately not here: reading COFF *candidate*
-symbols, which is MS-3 (the probe objects above are the evidence for it).
+Measured now, with the real thing (all of it in `check_msvc_toolchain.py`, groups 3 and 4):
+
+* `cl /MT /O2 hello.cpp` → a PE → `wine64` prints `sum=135`. The whole path - driver, linker,
+  CRT, Wine - works with stock flags, no `/NODEFAULTLIB` or other workarounds.
+* The gate's probe **links and runs** at /Od and /O2 (an entry point is compiled separately:
+  the shape probe has no `main`, which is what makes it useful for shapes and useless for
+  linking). `eval.py build/selfcheck --variant msvc-o0` and `msvc-o2`: **answer key 89 units
+  (89 markers), 0 unresolved, `selfcheck` 89 cases 0 failures** for both.
+* `.pdata` is **not** complete for an /Od build, and that is a correction to §4: 12 of this
+  benchmark's 89 units have no unwind record at all. The missing ones are exactly the functions
+  the compiler gave **no prologue and no epilogue** - they only write the caller's shadow space,
+  never touch `rsp`, call nothing, and have a single `ret`, so there is nothing for unwind info
+  to describe and `link` emits neither `$unwind$…` nor `$pdata$…` for them. A four-function
+  control separates the two cases cleanly (`int other(int a,int b){return a-b;}`: no record;
+  `int leaf_no_frame(int a,int b){return a<b?a:b;}`, which spills to a frame: one). An /O2 or
+  /GL build gives every function a frame or inlines it, which is why notepad.exe has 186 of
+  186. eval.py now uses `.pdata` first and adds the named functions it does not describe, with
+  the count printed.
+* The MSVC map parser needed a real map to get right: a "Publics by Value" row has **no
+  section-name column** (`0001:` indexes the map's own merge groups - `.text$mn`, `.text$mn$00`
+  and `.text$x` are all group 0001 here), and the `Rva+Base` column is already final, image
+  base included. Rows of group `0000` are the `<absolute>`/`<linker-defined>` symbols.
+* `cl` argument order is now asserted rather than assumed: everything after `/link` goes to the
+  linker, so `/Fe:` and the objects come **before** it (`D8003: missing source filename` is what
+  happens otherwise, and the gate had that bug until it could run).
+* The benchmark's own headers are a portability case: `TestFunctions/math.h` on the include path
+  shadows the C runtime's `<math.h>` for `cl`, which searches the `-I` directories for angle
+  brackets; GCC's `<cmath>` escapes them with `#include_next`. eval.py puts only the top source
+  directory on the path now, and says why.
+* `decomp detect <PE> --probe` works: it compiles the shape probe with `cl /Od|/O1|/O2 /Gy`
+  through the wrappers and reads the COFF objects. A COFF object has no symbol sizes, so its
+  bodies are its `.text$…` sections (that is what /Gy is for here). On notepad.exe it answers
+  `optimize = 0` from 9 bodies cut at `ret` - the sample, not the answer: MS-4 should score
+  against real `.pdata` units, and -O1/-O2 of v141 are weakly separable at best.
+
+Deliberately not here: reading COFF *candidate* symbols, which is MS-3 (the probe objects above
+are the evidence for it).
 
 **MS-3: the COFF candidate side - this is where `try` starts working on PE.**
 `extract.CandidateObject` (`extract.py:334`) needs a COFF branch: sections and relocations come
