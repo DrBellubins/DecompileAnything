@@ -161,6 +161,12 @@ Relevant details for this tool, all from reading that repo:
   doing the same normalisation.
 * Missing prerequisites here: `msitools`/`msiextract`, `libgcab ≥ 1.2`, `winbind` (the C1902
   "Program database manager mismatch" fix), plus ~1-2 GB of download. Wine itself is present.
+* This section stays the *why*; the *how*, for every era from VS2005 to VS2026 and for both 32-bit
+  and 64-bit hosts and targets, is [Setup.md](Setup.md) §6. Two things it settled that this section
+  assumed: the `--msvc-version` → toolset/SDK mapping (the probe target's 14.12 is
+  `--major 15 --msvc-version 15.5`), and the fact that `msitools` cannot be installed on this
+  machine at all (no root), plus that its Wine cannot start a *32-bit* PE - which decides whether
+  the VS2013-and-older toolchains are reachable here at all (Setup.md §6.7).
 
 **B. `clang-cl` / `clang --target=x86_64-pc-windows-msvc` - native, no Wine.** Installed
 (clang 23) and it produces correct COFF today (`clang-cl /O2 /c t2.cpp /Fot2.obj` →

@@ -11,3 +11,8 @@ Tests/Proprietary/
 
 # Ghidra analysis cache (Docs/Setup.md §3): the Ghidra project + analysis.db per target
 cache/
+
+# MSVC toolchains and the Wine prefix (Docs/Setup.md §6): downloaded under Microsoft's
+# non-redistributable licence, rebuilt by the setup steps, never committed.
+toolchains/
+.wine/

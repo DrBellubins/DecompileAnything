@@ -300,6 +300,10 @@ all three scripts print OK on this machine).
   (real `cl` under Wine via msvc-wine, or `clang-cl` with the MSVC/Windows SDK headers) are
   both missing pieces on this machine - `msitools`/`winbind`, the SDK headers, and `lld-link`.
   MinGW-w64 gcc produces PE/COFF but with GCC codegen, so it can test the container, never the
-  match. The diff supports x86 only (`x86:LE:32/64`); `try` says so rather than guessing.
+  match. The setup steps for every toolset era, VS2005 - VS2026, 32-bit and 64-bit, are
+  [Docs/Setup.md](Docs/Setup.md) §6 - including the two facts that decide reachability here: the
+  manifest route's extractor cannot be installed without root, and this Wine cannot start a
+  32-bit PE, so VS2013-and-older host tools need multilib Wine or wibo. The diff supports x86
+  only (`x86:LE:32/64`); `try` says so rather than guessing.
 * `[ghidra] language` in `project.toml` is validated but not wired into the importer;
   Ghidra's auto-selection is used and the chosen language is recorded.
