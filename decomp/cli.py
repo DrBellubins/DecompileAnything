@@ -19,8 +19,8 @@ from typing import Optional
 
 import typer
 
-from . import (__version__, cache, check, compile, config, discover, diff, extract, ghidra,
-	normalize, toolchain)
+from . import (__version__, cache, check, compile, config, discover, diff, extract,
+	ghidra, normalize, structures, toolchain)
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_FOUND = 0, 1, 2, 3
 
@@ -308,6 +308,8 @@ def show(
 	code: bool = typer.Option(True, "--code/--no-code", help="Ghidra pseudo-code"),
 	asm: bool = typer.Option(True, "--asm/--no-asm", help="the original instruction stream"),
 	refs: bool = typer.Option(True, "--refs/--no-refs", help="symbols and data this function touches"),
+	structure: bool = typer.Option(True, "--structure/--no-structure",
+		help="what this function is to its class: a vtable slot, a constructor, a destructor"),
 	calls: bool = typer.Option(True, "--calls/--no-calls", help="callers and callees"),
 	max_lines: int = typer.Option(120, "--max-lines", help="0 prints everything"),
 	as_json: bool = typer.Option(False, "--json", help="the whole record, no caps"),
@@ -377,6 +379,12 @@ def show(
 
 		if calls:
 			_print_callers_callees(conn, fn_id, max_lines)
+		if structure:
+			recovered = structures.Recovery(conn, meta).build()
+			for line in recovered.show_lines(int(row["entry"])):
+				echo("structure: %s" % line)
+			for note in recovered.notes:
+				echo("structure note: %s" % note)
 		if refs:
 			_print_refs(conn, fn_id, max_lines)
 		if code:
@@ -899,7 +907,13 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		return outcome
 
 	image = extract.TargetImage(Path(meta.get("target_path") or ""), cache.address_offset(meta))
-	bind_original, _ = extract.original_bindings(conn, meta, row, image)
+	# What the recovered C++ structure says about this unit, if anything: it is what names a
+	# vtable or type_info reference on the original side, the same object the candidate
+	# reaches by symbol (Docs/Design-Plan.md Phase 4).
+	recovered = structures.Recovery(conn, meta, image).build()
+	bound = _structures_for(recovered, row)
+	outcome["structures"] = bound
+	bind_original, _ = extract.original_bindings(conn, meta, row, image, structures=recovered)
 
 	object_file = extract.CandidateObject(object_path)
 	if object_file.error:
@@ -1053,8 +1067,59 @@ def try_cmd(
 	raise typer.Exit(EXIT_OK if verdict.passed else EXIT_FAIL)
 
 
-# --------------------------------------------------------------------------------------
-# later phases
+def _structures_for(recovered, row) -> dict:
+	"""What the recovered structure says about one function - for the report, not for the score."""
+	bound = {"classes": [], "roles": []}
+	for entry in recovered.role_of(int(row["entry"])):
+		bound["roles"].append(entry)
+		if entry["class"] not in bound["classes"]:
+			bound["classes"].append(entry["class"])
+	if bound["classes"]:
+		reached = set()
+		for item in cache.ref_summary(recovered.conn, int(row["id"])):
+			address = item.get("to_address")
+			if not address:
+				continue
+			object_ = recovered.object_at(int(address))
+			if object_ and object_.get("class"):
+				reached.add(object_["class"])
+		for name in sorted(reached):
+			if name not in bound["classes"]:
+				bound["classes"].append(name)
+	return bound
+
+
+def _type_lines(recovered, only: str = "", limit: int = 40) -> list[str]:
+	"""What was recovered, and how it knows - the text form of `decomp types`."""
+	lines = ["note: %s" % note for note in recovered.notes]
+	for name, klass in sorted(recovered.classes.items())[:limit]:
+		lines.append("%s%s" % (name, "  : public " + ", public ".join(klass.bases)
+			if klass.bases else ""))
+		lines.append("  vtable %s, type_info %s%s" % (
+			_hex(klass.vtable) if klass.vtable else "not found in this file",
+			_hex(klass.typeinfo),
+			", abstract (%d pure slots)" % klass.pure_count if klass.pure_count else ""))
+		for line in klass.evidence:
+			lines.append("    - %s" % line)
+		for line in klass.notes:
+			lines.append("    ! %s" % line)
+		if klass.methods:
+			lines.append("  vtable slots:")
+			for method in klass.methods:
+				lines.append("    slot %-2d +%-#4x  %-8s %s%s" % (method.index, method.offset,
+					method.kind, method.name or ("0x%x" % method.address if method.address
+						else "-"), "  [calls operator delete]" if method.deleting else ""))
+		if klass.fields:
+			lines.append("  fields (offsets the class's own code uses through `this`):")
+			for offset, item in klass.fields.items():
+				lines.append("    +%-#4x %-2d bytes  read %-2d written %-2d  %s" % (offset,
+					item.size, item.reads, item.writes, ", ".join(item.sites[:3])
+					+ ("" if len(item.sites) <= 3 else ", +%d more" % (len(item.sites) - 3))))
+		else:
+			lines.append("  fields: none attributable (no member function could be identified)")
+		lines.append("  size: at least %d bytes (the highest offset the code reaches)"
+			% klass.lower_bound)
+	return lines
 
 
 @app.command("types")
@@ -1062,10 +1127,56 @@ def types_cmd(
 	binary: Optional[Path] = typer.Option(None, "--bin"),
 	key: Optional[str] = typer.Option(None, "--key"),
 	config_file: Optional[str] = typer.Option(None, "--config", "-C"),
+	write: Optional[Path] = typer.Option(None, "--write",
+		help="write the shared header here (a directory gets types.h inside it)"),
+	show_class: Optional[str] = typer.Option(None, "--class", help="one class in full"),
+	limit: int = typer.Option(40, "--limit"),
+	as_json: bool = typer.Option(False, "--json"),
 ) -> None:
-	"""The shared struct/class definitions recovered so far. Not implemented until Phase 4."""
-	echo("`decomp types` is Phase 4 (Docs/Design-Plan.md): vtables, RTTI and the shared header.")
-	raise typer.Exit(EXIT_NOT_FOUND)
+	"""The C++ structure the target itself proves: vtables, RTTI, constructors, destructors,
+	and the field offsets - and the shared header a candidate can include (Phase 4).
+
+	Nothing here needs Ghidra or symbols: a class with a key function emits a `type_info`
+	object naming its own type, and the vtable points at it, so the class name, its base,
+	its method slots and the offsets its code uses are all in the file.
+	"""
+	cfg = load_config(config_file)
+	store = cache.Cache(config.cache_dir(cfg))
+	conn, values = open_analysis(store, binary, key)
+	try:
+		meta = cache.meta(conn)
+		recovered = structures.Recovery(conn, meta).build()
+		summary = recovered.summary()
+		if write is not None:
+			target = Path(write)
+			if target.is_dir() or str(write).endswith("/"):
+				target = target / "types.h"
+			target.parent.mkdir(parents=True, exist_ok=True)
+			target.write_text(recovered.header())
+			on_path = [str(path) for path in config.include_dirs(cfg) if path.is_dir()]
+			echo("wrote %s (%d classes)" % (target, summary["classes"]))
+			echo("  a candidate in that directory can include types.h directly: `decomp try` "
+				"puts the source's own directory on the include path already%s"
+				% ("" if str(target.parent) in on_path else
+					" - add -I%s with --include, or put it in [include_dirs]" % target.parent))
+		if as_json:
+			echo(json.dumps(dict(summary, detail=recovered.as_json()["detail"]), indent=1,
+				default=str))
+			raise typer.Exit(EXIT_OK if summary["classes"] else EXIT_NOT_FOUND)
+		echo("; %s (key %s) %d-bit" % (values.get("target_path"), values.get("target_key"),
+			summary["bits"]))
+		echo("recovered in %.3fs: %d classes, %d vtables, %d type_info objects (%d candidate "
+			"addresses probed)" % (summary["seconds"], summary["classes"], summary["vtables"],
+				summary["typeinfos"], summary["probed"]))
+		for line in _type_lines(recovered, show_class or "", limit):
+			echo(line)
+		if not summary["classes"]:
+			echo("nothing recovered: this file carries no Itanium-ABI vtable/RTTI. A PE built "
+				"by MSVC keeps its RTTI in a different form (Docs/MSVC-Plan.md MS-5), and a "
+				"C binary has none.")
+	finally:
+		conn.close()
+	raise typer.Exit(EXIT_OK if summary["classes"] else EXIT_NOT_FOUND)
 
 
 # --------------------------------------------------------------------------------------

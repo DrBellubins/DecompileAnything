@@ -43,7 +43,7 @@ To check the tool's own decompilation loop against this benchmark's ceiling:
 ```
 
 It feeds the untouched original source through `decomp try`'s code path for every unit and
-compares with what `eval.py self` reports (99.94% mean, 88/89 pass at gcc-o0 vs the
+compares with what `eval.py self` reports (100.00% mean, 89/89 pass at gcc-o0 vs the
 harness's own 99.53%, 83/89), then re-scores the deliberately wrong candidates in
 `Tests/examples/candidate_math_bad.cpp` and requires the report to name the kind of problem
 they are. Current result: 89/89
@@ -67,6 +67,23 @@ unit addresses and the source's own names: a string search must reach the same c
 stripped and unstripped builds, `--family` must bring back every unit of a family, and a
 vtable's slots must resolve to that class's methods. (That is why the *unstripped* build is
 analysed too: name and vtable queries need names to find.)
+
+To check the tool's own C++ structure recovery (Phase 4):
+
+```sh
+.venv/bin/python Tests/tools/check_phase4_structures.py
+```
+
+Nothing here may use a symbol name, so it runs against `build/gcc-o0/da_tests.stripped`. The
+classes, their bases, their vtable slots, their constructors/destructors and their member
+offsets are judged against `answer_key.json` (which names the compiler's own ctors, dtors and
+virtual methods with their addresses) and against the layout in
+`TestBinary/TestFunctions/structs.h`, including the 32-bit one (`gcc-o0-x86`: members at
+`+0x4`/`+0x8`, not `+0x8`/`+0xc`). It also compiles the header `decomp types --write`
+produces (`g++ -std=c++17 -fsyntax-only`) - a wrong layout has to fail the candidate's build,
+not the tool's opinion - re-scores STRUCT-24 to prove both sides name the same `type_info`,
+and requires the opposite result on `Tests/Proprietary/notepad.exe`: an MSVC binary's RTTI is
+not this format, so claiming a class there would be a false positive.
 
 ## A real proprietary target (`Tests/Proprietary/`, gitignored)
 

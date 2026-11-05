@@ -113,10 +113,41 @@ onto a Linux machine, and why the byte gate cannot be promised for a `/GL`+`/LTC
 and MS-1 change nothing in the ELF path; MS-3 (COFF candidates) is the phase that makes `try`
 work on PE at all.
 
-**Phase 4: C++ structure recovery**
+**Phase 4: C++ structure recovery** - done, 2026-11-04
 1. Identify vtables, constructors, and destructors from Ghidra data and RTTI where present.
-2. Maintain a shared header (`types.h`) that candidates include, updated as struct layouts are confirmed.
-3. Expose it via `decomp types`.
+   (Done, and RTTI is the anchor rather than Ghidra's naming: a `type_info` is recognised by
+   "a pointer slot at +ptr resolves to a printable mangled type name", which works on a
+   stripped binary; the bare type name (`16CCharacterEntity`) is demangled by asking for
+   `_ZTV<name>` and dropping the "vtable for " the ABI puts in front. A vtable is offset-to-top
+   at +0 with a `type_info` pointer at +ptr. Constructors are the functions that store
+   `vtable + 2*ptr`; a deleting destructor calls `operator delete` and is called by one; a
+   function that is itself a slot 0/1 of a vtable is a destructor. Measured: 3 classes in the
+   stripped 64-bit build, 9 in the statically linked 32-bit one, against the answer key's own
+   names and addresses.)
+2. Maintain a shared header (`types.h`) that candidates include, updated as struct layouts are
+   confirmed. (Done: `decomp types --write <dir>` writes it; the benchmark's own
+   `include_dirs` already contains that dir, and `driver_form` adds every source's directory to
+   the include path, so a candidate beside `types.h` compiles it without extra flags. The
+   header is real C++ - `g++ -std=c++17 -fsyntax-only` accepts it - with bases, explicit
+   padding, `void *vptr_`, placeholder field names (`f0x8`) whose *types* are labelled guesses,
+   virtual signatures as comments, and `static_assert(sizeof(X) >= N)` lower bounds so a wrong
+   layout fails the candidate's build rather than the tool's opinion.)
+3. Expose it via `decomp types`. (Done, with `--class`, `--json`, `--limit`, `--write`;
+   `decomp show` prints one `structure:` line for a function it can place, and `decomp try`
+   says so when the target has no recoverable structure.)
+
+The gap this phase existed for is closed: the `dynamic_cast` unit (STRUCT-24) reads three
+`type_info` objects, and the `.o` named them while the linked image named pointer slots.
+`normalize.Ref` now carries an `identity` for an object (a `type_info`/vtable is identified by
+what it describes, not by the offset the code happens to read), the candidate side keys objects
+by their symbol where a COMDAT section gives one, and the original side names them from RTTI -
+so both sides print `typeinfo for CVehicleEntity`. That fix also gained the `-m32` row three
+units: in a non-PIE 32-bit object, `pushl $_ZTI14CVehicleEntity` is an immediate of `0` with an
+`R_386_32` on the four bytes, and an immediate operand was not a bindable slot before.
+Acceptance is `Tests/tools/check_phase4_structures.py`: classes/bases/vtable slots/ctor-dtor
+addresses/member offsets judged against `answer_key.json` and the layout in `structs.h`
+(including the 32-bit one), the generated header compiled, and the opposite required of an MSVC
+PE - Itanium RTTI is not that format, so claiming a class there would be a false positive.
 
 **Phase 5: Hardening**
 1. Move to `-O2` test builds and handle inlining and register-allocation noise (register-abstracted comparison mode).

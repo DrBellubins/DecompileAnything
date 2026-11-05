@@ -19,6 +19,8 @@ python3 eval.py units                                       # what is in the bin
 ../.venv/bin/decomp find coin --family 2                    # the group of functions a request means
 ../.venv/bin/decomp show 0x2834 --bin build/gcc-o0/da_tests.stripped          # reads the cache
 ../.venv/bin/decomp try 0x2834 cand/math.cpp --fn AbsDiff                     # build, diff, score
+../.venv/bin/decomp types                                                   # the classes this binary has
+../.venv/bin/decomp types --write TestBinary/TestFunctions                   # and the header to use
 ```
 
 Per unit: `decomp show` (pseudo-code + the original instruction stream + resolved
@@ -108,6 +110,12 @@ problem.
   `0 failures`, and `eval.py crosscheck` must show no same-arch differences. The 89
   hand-checked expectations are the ground truth - if a `Want*` disagrees with the code,
   work out which one is wrong instead of editing the expectation to match the run.
+* `decomp types` recovers the C++ structure the file carries: classes named from their RTTI,
+  their bases, their vtables (slot by slot, nulls reported as null), their constructors and
+  destructors, and the member **offsets** and widths its own code touches. `--write <dir>`
+  turns that into a `types.h` a candidate can include (the header says which types are guesses;
+  field names are placeholders like `f0x8`). `decomp show` adds one `structure:` line for a
+  function it can place. Nothing is claimed for an MSVC/PE target: that RTTI format is MS-5.
 * `decomp try` compares **symbolically**: branches inside the function are function-relative
   labels, and calls/data references become positional tokens (`SYM0`, `DAT0`) matched by order,
   then checked by what they reach (a real name both sides know, the bytes there, the size). So

@@ -14,7 +14,7 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 | 1 | package, config, startup checks, `analyze`, analysis cache | **implemented** |
 | 2 | `try`: compile -> extract -> normalise -> diff | **implemented** |
 | 3 | `detect`: compiler/object/flags from the file; `find`: xrefs, vtables, related functions | **implemented** |
-| 4 | `types`: vtables, RTTI, the shared header | not implemented |
+| 4 | `types`: vtables, RTTI, the shared header | **implemented** - see "The C++ underneath (`decomp types`)"; acceptance is `python Tests/tools/check_phase4_structures.py` |
 | 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | not implemented |
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
@@ -32,6 +32,8 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 .venv/bin/decomp find coin --family 2                          # the functions that belong together
 .venv/bin/decomp show 0x2834 --bin Tests/build/gcc-o0/da_tests.stripped
 .venv/bin/decomp try 0x2834 my/math.cpp --fn AbsDiff           # build, diff, score
+.venv/bin/decomp types                                      # the classes this binary has
+.venv/bin/decomp types --write Tests/TestBinary              # and the header a candidate can use
 ```
 
 Only `analyze` starts Ghidra (about 10 s for a 193-function binary, once per binary).
@@ -49,7 +51,7 @@ phase.
 
 ```
 decomp/
-  cli.py        typer commands: check, analyze, status, detect, show, find, try, (types)
+  cli.py        typer commands: check, analyze, status, detect, show, find, try, types
   config.py     project.toml discovery, Ghidra install resolution, cache path rules
   check.py      startup checks, each naming what it looked for and the fix
   ghidra.py     the only JVM code: import, auto-analyse, export
@@ -59,6 +61,7 @@ decomp/
   compile.py    build the candidate source -> .o with the target's own variant flags
   extract.py    one function out of either side: the cache (original) or the .o (candidate)
   normalize.py  the shared decoder and the tokeniser: both sides -> one token stream
+  structures.py vtables, RTTI, constructors/destructors, field offsets, the shared header
   diff.py       align, score, categorise, and say what counts as done
   project.toml  the default target config, used only when nothing closer is found
 ```
@@ -238,6 +241,69 @@ A unit counts as done at `match >= threshold` **and** `opcode 0` **and** `reloca
 else. `--json`, `--max-diff`, `--max-symbols`, `--size`, `--include`, `--fn` and
 `--register-abstract` are documented in `decomp try --help`.
 
+## The C++ underneath (`decomp types`)
+
+`decomp types` reads the Itanium-ABI structures the compiler left in the file and answers the
+question a candidate cannot otherwise ask: what object is this code working on, what is its
+layout, and which of these functions are its constructor and destructor.
+
+```
+$ .venv/bin/decomp types -C Tests/project.toml --bin Tests/build/gcc-o0/da_tests.stripped --class CVehicleEntity
+class CVehicleEntity (type_info 0x111d78, vtable 0x111d00)
+  type_info name: 14CVehicleEntity -> vtable for CVehicleEntity
+  base: CEntityBase (type_info 0x111d90)
+  evidence: 0x10a504, 0x10a60c, 0x111d00, 0x111d78, 0x111d90
+  note: vtable slot +0x0 is null in this file (no relocation and no bytes there): this class
+\thas a destructor the file does not name at this slot
+  vtable 0x111d00 (4 slots):
+    +0x00  (this file leaves it null)
+    +0x08  FUN_0010d3b6            (destructor)
+    +0x10  FUN_0010d2b2            GetHealth
+    +0x18  FUN_0010d342            Classify
+  fields (offset, width, which member functions touch them):
+    +0x00  8 bytes  read+written by FUN_0010d1f2
+    +0x08  4 bytes  read by 1 function, written by 1
+    +0x10  4 bytes  read by 1 function, written by 1
+    +0x14  4 bytes  read by 1 function, written by 1
+  object size at least 24 bytes (from its last field)
+```
+
+**Measured** (`python Tests/tools/check_phase4_structures.py`, whose expectations come from
+`answer_key.json` and from the field offsets in `TestBinary/TestFunctions/structs.h`):
+
+```
+gcc-o0 stripped        3 classes, 3 vtables, 3 type_info in 0.03 s
+gcc-o0 with symbols    the same, plus method names from the file's own symbols
+gcc-o0-x86 stripped    9 classes, 7 vtables, 9 type_info in 0.2 s - the extra ones are the
+\t\tC++ runtime's own (__class_type_info, __si_class_type_info, the exception types),
+\t\tbecause that build is statically linked
+notepad.exe (MSVC PE)  0 classes, and it says so instead of guessing
+```
+
+Judged against the answer key and the source, not against the tool's own opinion:
+
+* every class is named from its `type_info` name string - `_ZTV`/`_ZTI` symbols are not used,
+  so this works on a stripped binary; the name is decoded by demangling `_ZTV<name>` and
+  dropping the "vtable for " the ABI puts in front of it;
+* the base/derived relation is right, including that `CEntityBase` has no base;
+* each class's real `GetHealth`/`Classify` are found at their real vtable slots, and the
+  abstract class's pure slot resolves to `__cxa_pure_virtual`;
+* every address the tool calls a constructor or destructor is one the compiler really built
+  for that class, and the real ones are identified where the file makes that possible;
+* every member offset in the source is recovered - `+0x8`/`+0xc` in the 64-bit build,
+  `+0x4`/`+0x8` in the 32-bit one - with the widths the instructions imply, and no recovered
+  offset lies outside the object;
+* `types --write` produces a header that compiles: `g++ -std=c++17 -fsyntax-only` accepts it,
+  and the `static_assert(sizeof(X) >= N)` inside it is what fails if a layout is wrong - so a
+  wrong layout breaks the candidate's build, which is evidence rather than an opinion.
+
+What it does not claim: the *names* and *types* of members (the header spells them `f0x8` and
+`int` and says the type is a guess), member functions that are in no vtable and are neither a
+constructor nor a destructor, multiple or virtual inheritance, and anything about an MSVC PE -
+that ABI stores an RTTI Complete Object Locator per function instead, which is MS-5. A vtable
+whose slots the file leaves null (the abstract base's, in the `-m32` and `-O2` builds) is
+reported as null slots rather than filled with guesses.
+
 ## Verified on the loop (measured here, 2026-11-03)
 
 `python Tests/tools/check_phase2_try.py` feeds the **untouched original source** through
@@ -247,15 +313,20 @@ binutils only):
 
 | variant | units scored | mean match | byte-identical | pass the gate | eval.py self (the ceiling) |
 |---|---|---|---|---|---|
-| gcc-o0 (x86-64) | 89 / 89 | **99.94 %** | 54 | **88 / 89** | 99.53 %, 83 / 89 |
-| gcc-o0-x86 (-m32, static) | 89 / 89 | 99.21 % | 58 | 78 / 89 | 87.19 %, 11 / 89 |
+| gcc-o0 (x86-64) | 89 / 89 | **100.00 %** | 54 | **89 / 89** | 99.53 %, 83 / 89 |
+| gcc-o0-x86 (-m32, static) | 89 / 89 | 99.38 % | 58 | 81 / 89 | 87.19 %, 11 / 89 |
 | gcc-o2 (x86-64) | 89 / 89 | 65.88 % | 29 | 34 / 89 | 98.27 %, 72 / 89 |
 
-Only the -O0 rows gate: at -O0 the untouched source has to be accepted, and it is for every
-unit except STRUCT-24 (a vtable defined in another translation unit - the `.o` relocates
-against `_ZTV...+16` while the PIE link reads a `.data.rel.ro` pointer slot, so the two sides
-genuinely name different objects; vtables and RTTI are Phase 4). The -O2 row is reported, not
-gated: 51 of those 89 units have bodies split into a hot part and a cold one and Ghidra's
+Only the -O0 rows gate: at -O0 the untouched source has to be accepted, and since Phase 4 it
+is accepted for **every** unit of the 64-bit build. STRUCT-24, the `dynamic_cast` unit whose
+every data reference is a `type_info`, was the last one out: the `.o` relocates `_ZTI...` while
+the linked image reads a `.data.rel.ro` pointer slot, so the two sides named different objects
+until `decomp types` gave both of them the same identity and the same name
+(`typeinfo for CVehicleEntity`). The `-m32` row went from 78 to 81 for a related reason: a
+non-PIE 32-bit object writes `pushl $_ZTI14CVehicleEntity` as an immediate of `0` with an
+`R_386_32` on the four bytes, and an immediate operand was not a bindable slot before. The
+remaining `-m32` differences are 32-bit data references through a shared section, and the -O2
+row is reported, not gated: 51 of those 89 units have bodies split into a hot part and a cold one and Ghidra's
 function boundaries differ from the compiler's symbol ranges - which is precisely the Phase 5
 `-O2` work. `--size <the compiler's symbol size>` is the escape hatch today, and
 `--register-abstract` (already reported separately as the `register` category) is the Phase 5
@@ -303,8 +374,10 @@ all three scripts print OK on this machine).
   PE the unit table under-counts and the extents of those functions come from the next named
   boundary instead - `Tests/eval.py` prints the two counts; MS-1's `original_function` falls back
   to the analysis' body for such an entry, which is the honest answer but not the compiler's.
-* A vtable or other object defined in another translation unit is named by the `.o` and
-  reached through a pointer slot in the linked image (STRUCT-24 above). Phase 4.
+* Structure recovery names classes, bases, vtable slots and member **offsets**; it does not
+  recover member **names** or **types** (the generated header writes `f0x8` and an inferred
+  `int`, and says so), it assumes single inheritance, and it reads Itanium RTTI only - an MSVC
+  PE stores an RTTI Complete Object Locator per function instead, which is MS-5.
 * A candidate that calls a helper it does not define reaches it by name, while the analysis of
   a stripped target knows it by address only: that call reads as an operand difference, and
   the symbol table prints both names so the loop can still see what happened.

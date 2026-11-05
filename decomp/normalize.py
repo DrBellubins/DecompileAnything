@@ -157,6 +157,9 @@ class Ref:
 	raw: str = ""                # as the tool named it
 	name: str = ""               # cleaned (demangled, no addend/@plt)
 	address: int | None = None
+	# The object a *name* identifies, when a name does: a vtable or a type_info reached at
+	# different offsets is one object, and both sides have to count it as one (Phase 4).
+	identity: str = ""
 	section: str = ""
 	size: int | None = None      # declared size in bytes when known
 	content: bytes | None = None  # the bytes there, when it is meaningful to compare them
@@ -224,8 +227,11 @@ class Vocabulary:
 		`diff.refs_compatible`, which only claims a difference when both sides have evidence."""
 		prefix = "SYM" if ref.cls == "sym" else "DAT"
 		# keyed by the address where one exists: a side may name a whole array while the
-		# other names each element inside it, and they have to meet element by element
-		key = ("0x%x" % ref.address) if ref.address is not None else (ref.raw or ref.name or "?")
+		# other names each element inside it, and they have to meet element by element. An
+		# object a name identifies wins over that: reading `vtable+16` and `vtable+40` is
+		# reading one object twice, and the other side may only ever name the symbol.
+		key = (ref.identity or (("0x%x" % ref.address) if ref.address is not None
+			else (ref.raw or ref.name or "?")))
 		cached = self._tokens.get((side, prefix, key))
 		if cached:
 			return cached
@@ -339,9 +345,13 @@ def _slots(handle: Cs, instruction) -> list[Slot]:
 		elif operand.type == CS_OP_IMM and control:
 			kind = "call" if is_call else "branch"
 			slots.append(Slot(index, kind, operand.imm, 1))
-		elif operand.type == CS_OP_IMM and abs(operand.imm) >= 0x10000:
-			# a big immediate in position-dependent code is often a relocated address
-			slots.append(Slot(index, "imm", operand.imm, instruction.size - 8))
+		elif operand.type == CS_OP_IMM:
+			# An immediate can carry a relocation: in a non-PIE 32-bit object `pushl $0` is
+			# `pushl $_ZTI14CVehicleEntity` with an R_386_32 sitting on the four bytes, and
+			# before the link the value is 0. Low-address immediates in position-dependent code
+			# are relocated addresses for the same reason high ones are. These slots are last in
+			# line when relocations are paired with operands, so a memory operand still wins.
+			slots.append(Slot(index, "imm", operand.imm, instruction.size - 4))
 	return slots
 
 

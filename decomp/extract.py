@@ -344,6 +344,10 @@ class TargetImage:
 			if allocated and size and name.startswith(_POINTER_SECTIONS)]
 
 
+def _hexkey(value) -> str:
+	return "%x" % value if isinstance(value, int) else str(value)
+
+
 def _string_lengths(conn: sqlite3.Connection, addresses: list[int]) -> dict[int, tuple[int, str]]:
 	if not addresses:
 		return {}
@@ -419,11 +423,17 @@ def original_function(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 
 
 def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
-	image: TargetImage | None = None) -> tuple[callable, list[Ref]]:
+	image: TargetImage | None = None, structures=None) -> tuple[callable, list[Ref]]:
 	"""A `bind(instruction)` for the tokeniser, built from the resolved references.
 
 	Each cached reference knows the instruction it came from and the address it points at, so
 	it binds to the operand that encodes that same address - no guessing.
+
+	`structures` (a `decomp.structures.Recovery`) is what lets a reference to a vtable or a
+	type_info be named: in a stripped PIE those objects are `PTR_vtable_00111d78` to the
+	analysis, while the candidate's `.o` relocates against `_ZTI14CVehicleEntity`. RTTI says
+	the same thing about the same bytes, so both sides can say "typeinfo for CVehicleEntity"
+	and a difference there means something (Phase 4).
 	"""
 	rows = cache.refs(conn, row["id"])
 	by_address: dict[int, list[sqlite3.Row]] = {}
@@ -452,6 +462,14 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		function = functions.get(to_address)
 		ref = Ref(kind=kind, raw=item["to_name"] or "", name=name, address=to_address,
 			section=item["section"] or "")
+		if structures is not None and to_address is not None and kind != "function":
+			object_ = structures.object_at(to_address)
+			if object_:
+				# the file's own name for this object, as the candidate's symbol names it
+				ref.name = object_["name"] or ref.name
+				ref.identity = "%s@%s" % (object_["role"], _hexkey(object_["address"]))
+				ref.size = ref.size or object_["size"]
+				ref.content = None   # a vtable is pointers; its bytes are never comparable
 		if function is not None:
 			# a body's bytes are not comparable (in a `.o` the references inside it are
 			# still placeholders), but its size is, and that is what catches "same shape,
@@ -475,14 +493,19 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		for slot in slots:
 			if slot.value is None:
 				continue
-			match = sorted((item for item in here if int(item["to_address"] or 0) == int(slot.value)),
+			# a reference with no address (an import) is not the same thing as an operand that
+			# encodes address 0, so the comparison is made only on real addresses
+			match = sorted((item for item in here if item["to_address"] is not None
+				and int(item["to_address"]) == int(slot.value)),
 				key=lambda item: -ranked.get(item["to_kind"] or "address", 0))
 			if match:
 				chosen[slot.operand] = build(match[0])
 		# then anything left over, only when the pairing is unambiguous
-		left = [item for item in here if not any(int(item["to_address"] or 0) == slot.value
-			for slot in slots if slot.value is not None)]
-		free = [slot for slot in slots if slot.operand not in chosen]
+		left = [item for item in here if item["to_address"] is not None and not any(
+			int(item["to_address"]) == slot.value for slot in slots if slot.value is not None)]
+		free = [slot for slot in slots if slot.operand not in chosen and slot.kind != "imm"]
+		if not free:
+			free = [slot for slot in slots if slot.operand not in chosen]
 		if left and len(left) == 1 and len(free) == 1:
 			chosen[free[0].operand] = build(left[0])
 		return chosen
@@ -671,9 +694,11 @@ class CandidateObject:
 			if key in seen:
 				return seen[key]
 			target = self._target(symbol_name, addend, symbol_section)
-			named = symbol_name or target["display"]
+			# a relocation against a section symbol names no object: the object defined at the
+			# addend's offset does, and `_target` looked it up
+			named = target.get("name") or symbol_name or target["display"]
 			where = target["address"]
-			ref = Ref(kind=target["kind"],
+			ref = Ref(kind=target["kind"], identity=target.get("identity", ""),
 				raw=named or ("%s at %s+0x%x" % (kind, target["section"] or "?", addend)),
 				name=clean_symbol(named) if named else (
 					"%s+0x%x" % (target["section"], where) if where is not None else ""),
@@ -697,21 +722,36 @@ class CandidateObject:
 				# or taking that helper's address. The analysis resolves the same target from
 				# the reference Ghidra recorded, so both sides have to name it.
 				for slot in slots:
+					if slot.kind == "imm":
+						continue          # with no relocation to fix it up, an immediate is a constant
 					named = self._in_section(function, slot.value) if slot.value is not None else ""
 					if named:
 						chosen[slot.operand] = reference(slot.value, "in-section", named, 0)
 				return chosen
-			free = list(slots)
-			if len(free) == len(here):
+			# An immediate is the least likely thing a relocation belongs to: pair the address
+			# operands first, and fall back to an immediate only when a relocation is left over
+			# with nothing else that could carry it - which is how a non-PIE 32-bit object
+			# writes `pushl $_ZTI14CVehicleEntity`: an R_386_32 on an immediate of 0.
+			address_slots = [slot for slot in slots if slot.kind != "imm"]
+			immediates = [slot for slot in slots if slot.kind == "imm"]
+			taken: list = []
+			if len(address_slots) == len(here):
 				# one relocation per remaining address operand, in the same order (usual case)
-				for slot, item in zip(free, here):
+				for slot, item in zip(address_slots, here):
 					chosen[slot.operand] = reference(*item)
-			elif len(free) == 1:
-				chosen[free[0].operand] = reference(*here[0])
+					taken.append(item)
+			elif len(address_slots) == 1:
+				chosen[address_slots[0].operand] = reference(*here[0])
+				taken.append(here[0])
 			else:
-				for slot in free:
-					near = min(here, key=lambda item: abs(item[0] - (instruction.address + slot.enc_offset)))
+				for slot in address_slots:
+					near = min(here, key=lambda item: abs(
+						item[0] - (instruction.address + slot.enc_offset)))
 					chosen[slot.operand] = reference(*near)
+					taken.append(near)
+			left = [item for item in here if item not in taken]
+			if len(left) == 1 and len(immediates) == 1 and immediates[0].operand not in chosen:
+				chosen[immediates[0].operand] = reference(*left[0])
 			return chosen
 
 		return bind, used
@@ -727,8 +767,11 @@ class CandidateObject:
 		section_named = symbol_name if symbol_name.startswith(".") else symbol_section
 		if section_named and not symbol_name.startswith("_"):
 			display = self._nearest_in(section_named, addend)
+			# the object defined at that offset is what the instruction reads, so it is the name
+			# to compare - `.data.rel.ro+0x18` is a section, and the other side has no such thing
 			return {"kind": "data", "address": addend, "section": section_named, "size": None,
-				"content": self._read(section_named, addend, _PROBE), "display": display}
+				"content": self._read(section_named, addend, _PROBE), "display": display,
+				"name": display}
 		found = self._all_symbols.get(symbol_name)
 		if found is None:
 			# not defined here: an import (libc, or a function of another translation unit).
@@ -744,9 +787,23 @@ class CandidateObject:
 				"content": None, "display": symbol_name}
 		# the addend is an offset inside the named object: `_ZTV9CEntityBase+16` is the first
 		# slot of that vtable, not its header
-		return {"kind": "data", "address": value + addend, "section": section,
+		own = self._names_section(symbol_name, section)
+		return {"kind": "data", "address": (None if own else value + addend), "section": section,
 			"size": size or None, "content": self._read(section, value + addend, size or _PROBE),
-			"display": symbol_name}
+			"display": symbol_name,
+			"identity": ("symbol:%s" % symbol_name) if own else ""}
+
+	def _names_section(self, symbol_name: str, section: str) -> bool:
+		"""Is this object its own section? (`.data.rel.ro._ZTI14CVehicleEntity`, or the
+		`.data.rel.ro.local._ZTV…` form.)
+
+		GCC emits a vtable or type_info as a COMDAT of one symbol, so the symbol sits at
+		offset 0 of a section named after it and an "address" of 0 says nothing - three
+		different type_infos would all look like the same object. There, the name is the
+		identity, and `normalize.Vocabulary` keys the token by that instead.
+		"""
+		return bool(symbol_name) and (section == symbol_name or
+			section.endswith("." + symbol_name))
 
 	def _nearest_in(self, section: str, offset: int) -> str:
 		"""The name of the symbol defined at (or just below) an offset inside a section."""
