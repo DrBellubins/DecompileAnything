@@ -114,9 +114,87 @@ _POINTER_SECTIONS = (".data.rel.ro", ".rodata", ".rdata", ".data", ".got", ".got
 # The function table a file carries itself. An x64 PE's `.pdata` is the unwind table the loader
 # reads: (begin, end, unwind) for every function, with no symbols, after stripping - the
 # compiler's own answer to "where does this unit end", and the only one a shipped proprietary
-# binary gives (Docs/MSVC-Plan.md §4). ELF answers the same question with symbol sizes, which
-# Design-Plan Phase 5 reads; Mach-O carries neither.
+# binary gives (Docs/MSVC-Plan.md §4). ELF answers the same question twice: `.eh_frame`'s FDEs
+# (one per function *partition*, so a hot/cold split at -O2 gives two), and `st_size` where the
+# file kept its symbols. Phase 5 reads both; Mach-O carries neither.
 _PDATA_RECORD = struct.Struct("<III")
+
+# DW_EH_PE_* - the pointer encodings `.eh_frame` writes its pc values in (DWARF §7.6.4, and the
+# Itanium C++ ABI's LSDA chapter, which is where GCC and LLVM take them). Two spellings of the
+# *signed* forms are in the wild (DWARF >= 3 numbers them 0x05..0x08, the older libdwarf table
+# 0x09..0x0c); both are accepted here, because a real GCC object writes 0x1b = pcrel|sdata4
+# while a DWARF-spelled one writes 0x17 for the same thing.
+_PE_FORMAT = 0x0f
+_PE_PC_REL, _PE_TEXTREL, _PE_DATA_REL, _PE_FUNC_REL, _PE_INDIRECT = 0x10, 0x20, 0x30, 0x40, 0x80
+_PE_ULEB, _PE_SLEB, _PE_PTR = "uleb", "sleb", "ptr"
+_PE_FORMS = {
+	0x00: (_PE_PTR, False), 0x01: (_PE_ULEB, False), 0x02: (2, False), 0x03: (4, False),
+	0x04: (8, False), 0x05: (_PE_SLEB, True), 0x06: (2, True), 0x07: (4, True),
+	0x08: (8, True), 0x09: (_PE_SLEB, True), 0x0a: (2, True), 0x0b: (4, True), 0x0c: (8, True),
+}
+
+
+def _sleb(data: bytes, position: int) -> tuple[int, int]:
+	value = 0
+	shift = 0
+	while position < len(data):
+		octet = data[position]
+		position += 1
+		value |= (octet & 0x7f) << shift
+		shift += 7
+		if not octet & 0x80:
+			if octet & 0x40:
+				value -= 1 << shift
+			return value, position
+	raise ValueError("truncated SLEB in .eh_frame")
+
+
+def _uleb(data: bytes, position: int) -> tuple[int, int]:
+	value = 0
+	shift = 0
+	while position < len(data):
+		octet = data[position]
+		position += 1
+		value |= (octet & 0x7f) << shift
+		if not octet & 0x80:
+			return value, position
+		shift += 7
+	raise ValueError("truncated ULEB in .eh_frame")
+
+
+def _read_encoded(data: bytes, position: int, encoding: int, *, at: int, pointer_size: int) -> tuple[int | None, int]:
+	"""One `.eh_frame` pointer value: (the address it means, the next position).
+
+	`at` is the section offset of the field itself, which is what a pc-relative value is added
+	to. The next position is returned even when the value cannot be resolved: an indirect slot
+	or one the link still has to write is a location in the table, not a pc, but its *size* is
+	still what says where the next field starts.
+	"""
+	form, signed = _PE_FORMS.get(encoding & _PE_FORMAT, (_PE_PTR, False))
+	if form is _PE_ULEB:
+		value, position = _uleb(data, position)
+	elif form is _PE_SLEB:
+		value, position = _sleb(data, position)
+	elif isinstance(form, int):
+		if position + form > len(data):
+			raise ValueError("truncated encoded pointer in .eh_frame")
+		value = int.from_bytes(data[position:position + form], "little", signed=signed)
+		position += form
+	else:
+		width = pointer_size
+		if position + width > len(data):
+			raise ValueError("truncated encoded pointer in .eh_frame")
+		value = int.from_bytes(data[position:position + width], "little", signed=signed)
+		position += width
+	if encoding & _PE_PC_REL:
+		value += at
+	elif encoding & (_PE_TEXTREL | _PE_DATA_REL | _PE_FUNC_REL):
+		# relative to a base only the runtime knows (a shared library's text/data base, a
+		# function's start): unresolvable in the file, and never used for an FDE pc by GCC
+		return None, position
+	if encoding & _PE_INDIRECT:
+		return None, position
+	return value, position
 
 # How many bytes of a referenced object are compared when its size is not recorded.
 _PROBE = 16
@@ -134,8 +212,16 @@ class Function:
 	bytes: bytes = b""
 	section: str = ""
 	boundaries: list[tuple[int, int]] = field(default_factory=list)
+	# Where the body actually sits: (address, length) per block, the entry block first. A unit
+	# whose bytes are contiguous has one; a `-O2` function with a cold partition has two, in the
+	# order its blocks are compared (Phase 5). Empty means `address`/`size`, i.e. one block.
+	extents: list[tuple[int, int]] = field(default_factory=list)
 	language_note: str = ""           # arch/format, for error messages
 	warnings: list[str] = field(default_factory=list)
+
+	def __post_init__(self) -> None:
+		if not self.extents:
+			self.extents = [(self.address, self.size)]
 
 
 # --------------------------------------------------------------------------------------
@@ -214,39 +300,208 @@ class TargetImage:
 			self.unit_note = "reading the function table failed: %s" % exc
 
 	def _read_function_table(self, binary) -> None:
-		"""`.pdata`, the (begin, end, unwind) table an x64 PE carries, in the file's addresses.
+		"""The function table the file carries itself, in the file's own addresses.
 
-		The RVAs in it are relative to the image base, so every value goes through
-		`file_address_base()` - the bias MS-0 put in one place for exactly this reason
-		(Docs/MSVC-Plan.md §8). Only the bytes the file initialises are walked: a PE section's
-		`size` is its virtual size, which pads past the table, and reading that padding as records
-		would invent zero-length units.
+		Two formats answer this, and neither is the disassembler's guess: an x64 PE's `.pdata`
+		gives (begin, end, unwind) per function, and an ELF's `.eh_frame` gives one FDE per
+		function *partition* - so a `-O2` function with a cold partition has two, which is how
+		Phase 5 learns where its second half is. Where the file still has symbols, `st_size`
+		corroborates both. Every address in it is in the same domain as `self.sections`: for a
+		PE that means the image base is added (`file_address_base`), the bias MS-0 put in one
+		place for exactly this reason (Docs/MSVC-Plan.md §8).
 		"""
 		import lief
 
-		if not isinstance(binary, lief.PE.Binary):
+		if isinstance(binary, lief.PE.Binary):
+			self._read_pdata(binary)
 			return
+		if isinstance(binary, lief.ELF.Binary):
+			found = 0
+			try:
+				found += self._read_eh_frame(binary)
+			except Exception as exc:  # noqa: BLE001 - an unwinder table is evidence, not a requirement
+				self.unit_note = "reading .eh_frame failed: %s" % exc
+			found += self._read_symbol_sizes(binary)
+			if not found:
+				self.unit_note = ("no .eh_frame and no symbol sizes: this ELF carries no function "
+					"table, so a unit's extent comes from the analysis alone")
+			return
+		self.unit_note = "this file format carries no function table the tool knows"
+
+	def _add_unit(self, source: str, entry: int, end: int, unwind: int = 0) -> int:
+		"""One unit, merged with what another table says about the same entry.
+
+		`st_size` and an FDE usually agree; where they do not, the wider one is kept, because a
+		symbol's size stops at a hot partition while an FDE's range covers a whole one. The
+			sources are recorded so the disagreement can be reported rather than hidden.
+		"""
+		if end <= entry:
+			return 0
+		for unit in self.units:
+			if unit["entry"] != entry:
+				continue
+			if source not in unit["sources"]:
+				unit["sources"] += [source]
+			if end > unit["end"]:
+				unit["end"], unit["size"], unit["source"] = end, end - entry, source
+			return 0
+		self.units.append({"source": source, "sources": [source], "entry": entry, "end": end,
+			"size": end - entry, "unwind": int(unwind), "section": self._section_name(entry)})
+		return 1
+
+	def _read_pdata(self, binary) -> None:
+		"""`.pdata`, the (begin, end, unwind) table an x64 PE carries.
+
+		Only the bytes the file initialises are walked: a PE section's `size` is its virtual
+		size, which pads past the table, and reading that padding as records would invent
+		zero-length units.
+		"""
 		section = next((item for item in binary.sections if str(item.name) == ".pdata"), None)
 		if section is None or not section.size:
 			self.unit_note = "no .pdata section: this PE carries no function table"
 			return
 		data = bytes(section.content)
 		bias = file_address_base(binary)
-		units, skipped = [], 0
+		count = skipped = 0
 		for position in range(0, len(data) - len(data) % _PDATA_RECORD.size, _PDATA_RECORD.size):
 			begin, end, unwind = _PDATA_RECORD.unpack_from(data, position)
 			if end <= begin:
 				skipped += 1
 				continue
-			units.append({"source": ".pdata", "entry": int(begin) + bias, "end": int(end) + bias,
-				"size": int(end) - int(begin), "unwind": int(unwind) + bias,
-				"section": self._section_name(int(begin) + bias)})
-		self.units = units
+			count += self._add_unit(".pdata", int(begin) + bias, int(end) + bias,
+				int(unwind) + bias)
 		self.unit_source = ".pdata"
-		if not units:
+		if not count:
 			self.unit_note = ".pdata holds no readable function record"
 		elif skipped:
 			self.unit_note = "%d .pdata record(s) skipped: end <= begin" % skipped
+
+	def _read_eh_frame(self, binary) -> int:
+		"""Every FDE in `.eh_frame`: (initial pc, address range) for one partition of a function.
+
+		The unwinder table is what bounds a unit in a *stripped* ELF - `st_size` is gone, but the
+		exception handling data is not, because the runtime still needs it. A `-O2` build splits
+		the cold blocks of a function into their own FDE (measured on `Tests/build/gcc-o2`:
+		`RunSelfChecks` has one at 0x44d0..0x5c15 and one at 0x1140..0x1768), which is the other
+		half of a body the analysis reports as two ranges.
+		"""
+		section = next((item for item in binary.sections if str(item.name) == ".eh_frame"), None)
+		if section is None or not section.size:
+			return 0
+		data = bytes(section.content)
+		base = int(section.virtual_address) + file_address_base(binary)
+		bits = getattr(getattr(binary, "header", None), "identity_class", None)
+		pointer_size = 8 if "64" in str(bits) else 4
+		encodings: dict[int, int] = {}
+		position = 0
+		count = failed = 0
+		while position + 12 <= len(data):
+			length = int.from_bytes(data[position:position + 4], "little")
+			if length == 0:
+				position += 4
+				continue
+			if length < 4 or position + length + 4 > len(data):
+				break
+			identifier = int.from_bytes(data[position + 4:position + 8], "little")
+			if identifier == 0:
+				encoding = self._read_cie(data, position, pointer_size)
+				if encoding is not None:
+					encodings[position] = encoding
+			else:
+				# a CIE is named by how far back its start sits from the byte after this field
+				cie = position + 8 - identifier
+				encoding = encodings.get(cie, _PE_PC_REL | 0x0b)
+				try:
+					pc, next_position = _read_encoded(data, position + 8, encoding,
+						at=base + position + 8, pointer_size=pointer_size)
+					# the range uses the same form as the pc, without its pc-relative bit (the Itanium
+					# ABI's FDE layout, which is what GCC and LLVM write for a C++ .eh_frame)
+					size, _ = _read_encoded(data, next_position, encoding & _PE_FORMAT,
+						at=0, pointer_size=pointer_size)
+				except ValueError:
+					failed += 1
+					pc, size = None, 0
+				if pc is not None and size:
+					count += self._add_unit(".eh_frame", pc, pc + size, position)
+			position += length + 4
+		if count:
+			self.unit_source = self.unit_source or ".eh_frame"
+		self.units.sort(key=lambda unit: unit["entry"])
+		if failed:
+			self.unit_note = "%d FDE(s) could not be decoded" % failed
+		return count
+
+	@staticmethod
+	def _read_cie(data: bytes, position: int, pointer_size: int) -> int | None:
+		"""The FDE pointer encoding a CIE declares (its augmentation's `R` parameter)."""
+		try:
+			version = data[position + 8]
+			cursor = position + 9
+			end = position + 4 + int.from_bytes(data[position:position + 4], "little")
+			stop = data.index(0, cursor)
+			augmentation = data[cursor:stop].decode("ascii", "replace")
+			cursor = stop + 1
+			if version == 1:
+				_cursor, _ = _uleb(data, cursor)  # code alignment factor
+				cursor = _cursor
+				cursor, _ = _sleb(data, cursor)  # data alignment factor
+				cursor, _ = _uleb(data, cursor)  # return address register
+			else:
+				cursor, _ = _uleb(data, cursor)  # return address register
+				cursor, _ = _uleb(data, cursor)  # code alignment factor
+				cursor, _ = _sleb(data, cursor)  # data alignment factor
+			if augmentation.startswith("z"):
+				cursor += 1  # the LSDA encoding, which is one byte in every form in use
+				if version >= 2:
+					augment, cursor = _uleb(data, cursor)
+					end = min(end, cursor + augment)
+				if "P" in augmentation[1:]:
+					_, cursor = _read_encoded(data, cursor, data[cursor], at=cursor,
+						pointer_size=pointer_size)
+			for character in augmentation[1:]:
+				if character == "R":
+					return data[cursor] if cursor < end else None
+				if character in "SL":
+					_, cursor = _read_encoded(data, cursor, data[cursor], at=cursor,
+						pointer_size=pointer_size)
+				else:
+					cursor += 1
+		except (ValueError, IndexError):
+			return None
+		return None
+
+	def _read_symbol_sizes(self, binary) -> int:
+		"""`st_size` of every function symbol - what the file's own names say about a unit.
+
+		A symbol's size covers its hot partition only, so it never *widens* an FDE; `_add_unit`
+		keeps the wider of the two and notes both. In a linked image `st_value` is an address,
+		which is the domain `self.sections` is in; in a `.o` it is an offset in a section, and
+		that case never reaches here (`TargetImage` is only built for the target file).
+		"""
+		count = 0
+		for symbol in binary.symbols:
+			try:
+				if not symbol.size or not symbol.is_function:
+					continue
+				entry = int(symbol.value)
+			except Exception:  # noqa: BLE001 - a symbol with no section carries nothing
+				continue
+			count += self._add_unit("symtab", entry, entry + int(symbol.size))
+		if count:
+			self.unit_source = self.unit_source or "symtab"
+		return count
+
+	def unit_at(self, entry: int) -> dict | None:
+		"""The unit the file's table says *starts* here, in the *analysis'* addresses.
+
+		`original_function` uses this when the cache has no unit table of its own (a cache written
+		before Phase 5 added the ELF one), so an old cache still gets the compiler's extent.
+		"""
+		for unit in self.units:
+			if unit["entry"] + self.offset == int(entry):
+				return {**unit, "entry": unit["entry"] + self.offset,
+					"end": unit["end"] + self.offset}
+		return None
 
 	def _section_name(self, file_address: int) -> str:
 		for name, virtual, size, _offset, allocated, _writable in self.sections:
@@ -357,69 +612,151 @@ def _string_lengths(conn: sqlite3.Connection, addresses: list[int]) -> dict[int,
 	return {row["address"]: (int(row["length"] or 0), row["value"]) for row in rows}
 
 
+def _hex(value) -> str:
+	return "0x%x" % int(value)
+
+
+# A gap between two of the analysis' ranges this wide is alignment padding inside one block:
+# Ghidra ends a function before the padding the compiler put after it and resumes it after, so
+# the ranges are one block of one unit. Wider than any function alignment and the blocks are
+# genuinely elsewhere - a cold partition of the same function, which is its own extent.
+_PAD_GAP = 0x40
+
+
+def _entry_block(ranges: list[list[int]], entry: int, size: int) -> tuple[int, int]:
+	"""The block of one unit that the entry sits in, ranges and padding gaps merged."""
+	block = next(([start, stop] for start, stop in ranges if start <= entry < stop), None)
+	if block is None:
+		block = list(ranges[0]) if ranges else [entry, entry + size]
+	changed = True
+	while changed:
+		changed = False
+		for start, stop in ranges:
+			if start <= block[1] + _PAD_GAP and block[0] <= stop + _PAD_GAP:
+				if start < block[0] or stop > block[1]:
+					block = [min(block[0], start), max(block[1], stop)]
+					changed = True
+	return block[0], block[1]
+
+
 def original_function(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 	size: int | None = None) -> Function:
-	"""The cached bytes and instruction boundaries of one analysed function."""
+	"""The cached bytes and instruction boundaries of one analysed function.
+
+	What a unit *is* - how many bytes, in how many pieces - is decided here, in this order:
+
+	1. `size`, when the caller named a range (a `.o`'s symbol size, an answer key);
+	2. the function table the file carries itself - `.pdata`, an ELF's `.eh_frame`, `st_size` -
+	   which is the compiler's own boundary rather than a disassembler's recovery (MS-1 for a PE,
+	   Phase 5 for ELF, where it is what makes a stripped `-O2` target scoreable at all);
+	3. the analysis' own ranges, read as one block across the padding gaps between them; and
+	4. the analysis' body, alone.
+
+	A range the analysis puts outside that block stays a separate extent: a `-O2` function's cold
+	blocks are linked into another part of `.text` entirely (and built into `.text.unlikely` in
+	the candidate's `.o`), so the two sides are compared as entry block then cold block.
+	"""
 	entry = int(row["entry"])
 	full = int(row["size"])
-	wanted = int(size or full)
 	warnings: list[str] = []
 	try:
-		ranges = json.loads(row["ranges"] or "[]")
+		ranges = sorted(([int(a), int(b)] for a, b in json.loads(row["ranges"] or "[]")))
 	except (ValueError, TypeError):  # pragma: no cover - written by us
 		ranges = []
-	if len(ranges) > 1:
-		warnings.append("the analysis records %d separate ranges for this function; only the "
-			"first (%s..%s) is compared" % (len(ranges), hex(ranges[0][0]), hex(ranges[0][1])))
-		wanted = min(wanted, ranges[0][1] - ranges[0][0]) if ranges else wanted
-	start = ranges[0][0] if ranges else entry
-	body = bytes(row["bytes"] or b"")
-	if body and start != entry:  # pragma: no cover - entry is the first range min
-		start = entry
 	image = None
 
-	# The file's own function table (MS-1) is the compiler's extent of the unit, gaps and all, so
-	# it is what `try` should score. Its bytes are read back out of the file contiguously, which
-	# is also the fix for a body the analysis split into ranges: the unit is one range. A caller
-	# who passed `--size` asked for a range, so that answer wins over this one, and any
-	# disagreement is reported rather than taken silently.
-	unit = cache.unit_at(conn, entry)
-	if unit is not None and not size:
-		extent = int(unit["end"]) - entry
-		if extent != full:
-			warnings.append("the analysis' body of this function is %d bytes but %s says the unit is "
-				"%d (%s..%s): the %d bytes between are inside the unit, so they are compared too - "
-				"%s is the compiler's own boundary, not a disassembler's recovery"
-				% (full, unit["source"], extent, hex(entry), hex(int(unit["end"])),
-					abs(extent - full), unit["source"]))
-			image = image or TargetImage(Path(meta.get("target_path") or ""),
-				cache.address_offset(meta))
-			whole = image.read(entry, extent)
-			if whole is not None and len(whole) == extent:
-				body, wanted, start = whole, extent, entry
-			else:
-				warnings.append("those bytes could not be read from %s%s, so only the analysis' range "
-					"is compared" % (meta.get("target_path"),
-						(": " + image.error) if image.error else ""))
-	if len(body) < wanted:
-		# the cache stores the body, but a `--size` re-cut can ask past it: read the rest
-		# straight from the file the analysis was made of
+	start, end = _entry_block(ranges, entry, full)
+	source = "the analysis' own ranges"
+	if size:
+		start, end, source = entry, entry + int(size), "--size"
+	else:
+		unit = cache.unit_at(conn, entry)
+		live = False
+		if unit is None:
+			# a cache written before this table existed: read it from the file now rather than
+			# losing the compiler's boundary to an old analysis
+			image = TargetImage(Path(meta.get("target_path") or ""), cache.address_offset(meta))
+			unit = image.unit_at(entry)
+			live = unit is not None
+		if unit is not None and int(unit["end"]) - entry != end - start:
+			if live:
+				warnings.append("this analysis cache has no unit table (it predates `analyze` "
+					"reading one), so the boundary below was read from %s now" % meta.get("target_path"))
+			warnings.append("the analysis' body of this function is %d bytes but %s says the unit "
+				"is %d (%s..%s): the %d bytes between are inside the unit, so they are compared "
+				"too - %s is the compiler's own boundary, not a disassembler's recovery"
+				% (end - start, unit["source"], int(unit["end"]) - entry, _hex(entry),
+					_hex(int(unit["end"])), abs(int(unit["end"]) - entry - (end - start)),
+					unit["source"]))
+			start, end, source = entry, int(unit["end"]), unit["source"]
+		elif len(ranges) > 1 and end - start != full:
+			warnings.append("the analysis records %d ranges for this function, split at alignment "
+				"padding; they are read as one %d byte block (%s..%s) because the bytes between "
+				"them are inside the unit and the candidate has them too"
+				% (len(ranges), end - start, _hex(start), _hex(end)))
+
+	# Blocks the analysis assigns to this function but outside the entry block: a cold partition.
+	extents = [(start, end - start)]
+	for other_start, other_stop in ranges:
+		if other_stop <= start or other_start >= end:
+			extents.append((other_start, other_stop - other_start))
+			warnings.append("the analysis places a %d byte block of this function at %s..%s, away "
+				"from its entry block (a -O2 cold partition; in the candidate this is the symbol's "
+				".cold part): it is compared after the entry block, and branches to it are "
+				"compared by their position in the unit"
+				% (other_stop - other_start, _hex(other_start), _hex(other_stop)))
+
+	bodies: list[bytes] = []
+	for index, (where, length) in enumerate(extents):
+		if index == 0 and (where, length) == (entry, full) and row["bytes"]:
+			bodies.append(bytes(row["bytes"]))
+			continue
 		image = image or TargetImage(Path(meta.get("target_path") or ""),
 			cache.address_offset(meta))
-		more = image.read(entry + len(body), wanted - len(body))
-		if more:
-			body += more
-		if not body:
-			warnings.append("the cache holds no bytes for this function and %s could not supply "
-				"them%s" % (meta.get("target_path"), (": " + image.error) if image.error else ""))
-	body = body[:wanted]
+		data = image.read(where, length)
+		if data is None or len(data) < length:
+			if index == 0 and row["bytes"]:
+				warnings.append("the unit's bytes could not be read from %s%s, so the analysis' own "
+					"%d bytes are compared instead" % (meta.get("target_path"),
+						(": " + image.error) if image.error else "", full))
+				bodies.append(bytes(row["bytes"]))
+				extents = [(entry, full)]
+				break
+			warnings.append("the %d bytes at %s could not be read from %s%s, so that block is not "
+				"compared" % (length, _hex(where), meta.get("target_path"),
+					(": " + image.error) if image.error else ""))
+			continue
+		bodies.append(data)
+	body = b"".join(bodies)
+	if not body:
+		warnings.append("nothing to compare: the cache holds no bytes for this function and %s "
+			"could not supply them" % meta.get("target_path"))
 
+	covered = [(where, where + length) for where, length in extents]
 	boundaries = [(int(item["address"]), int(item["length"]))
 		for item in cache.instructions(conn, row["id"])
-		if entry <= int(item["address"]) < entry + wanted]
-	return Function(display=row["name"], raw_name=row["name"], address=start, size=wanted,
-		bytes=body, section=row["section"] or "", boundaries=boundaries,
+		if any(where <= int(item["address"]) < stop for where, stop in covered)]
+	return Function(display=row["name"], raw_name=row["name"], address=start, size=len(body),
+		bytes=body, section=row["section"] or "", boundaries=boundaries, extents=extents,
 		language_note=meta.get("language_id") or "", warnings=warnings)
+
+
+def _unit_size(conn: sqlite3.Connection, image, entry: int) -> int | None:
+	"""How big the file's own tables say the unit starting here is, if they name one.
+
+	The same three sources as `original_function`, in the same order of trust. A call to a
+	*neighbour* in the same file is compared by that callee's size, so both sides have to be
+	measuring it the same way - the analysis' body of a `-O2` function is not the compiler's
+	size of it, which is what makes a matching call look like a difference.
+	"""
+	row = cache.unit_at(conn, int(entry))
+	if row is not None:
+		return int(row["size"]) or None
+	if image is not None:
+		unit = image.unit_at(int(entry))
+		if unit is not None:
+			return int(unit["size"]) or None
+	return None
 
 
 def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
@@ -473,8 +810,9 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		if function is not None:
 			# a body's bytes are not comparable (in a `.o` the references inside it are
 			# still placeholders), but its size is, and that is what catches "same shape,
-			# different helper"
-			ref.size = int(function["size"]) or None
+			# different helper" - so it has to be the size the compiler said, from the file's
+			# own table where the file carries one
+			ref.size = _unit_size(conn, image, to_address) or int(function["size"]) or None
 		elif to_address is not None:
 			declared, _value = sizes.get(to_address, (0, ""))
 			ref.size = declared or None
@@ -517,6 +855,10 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 # the candidate side: a relocatable object produced by decomp.compile
 
 
+def _hex(value) -> str:
+	return "0x%x" % int(value)
+
+
 class SymbolNotFound(Exception):
 	"""No candidate symbol matched (or several did) - the message names what is there."""
 
@@ -545,6 +887,9 @@ class CandidateObject:
 		self._by_section_address: dict[tuple[str, int], CandidateSymbol] = {}
 		self._all_symbols: dict[str, tuple[str, int, int, bool]] = {}
 		self._relocs: dict[str, list[tuple[int, str, str, int]]] = {}
+		# the (section, address, length) of the last function handed back by `function()`, which
+		# is what its relocations have to be looked up in (a -O2 candidate spans two sections)
+		self._extent_sections: list[tuple[str, int, int]] = []
 		try:
 			import lief
 		except ImportError as exc:  # pragma: no cover
@@ -629,24 +974,36 @@ class CandidateObject:
 				except Exception:  # noqa: BLE001
 					continue
 
+	def is_partition(self, symbol: CandidateSymbol) -> bool:
+		"""Is this symbol a -O2 partition of another one (`<name>.cold`)?
+
+		It demangles to the same name as its base symbol, so it must never make `--fn` ambiguous
+		- but it is a real unit of the file too (it has its own FDE), so asking for it by its
+		exact mangled name still finds it, and `function()` reaches it as a second extent.
+		"""
+		return bool(symbol.mangled.endswith(".cold")) and symbol.mangled[:-5] in self._all_symbols
+
 	def symbols_for(self, wanted: str | None, expect_size: int | None = None) -> list[CandidateSymbol]:
 		"""The candidate symbols that could be the function being scored."""
 		if wanted:
 			text = wanted.strip()
-			for key in (lambda s: s.mangled == text, lambda s: s.name == text,
-				lambda s: s.simple == text,
+			if any(symbol.mangled == text for symbol in self.functions):
+				return [symbol for symbol in self.functions if symbol.mangled == text]
+			own = [symbol for symbol in self.functions if not self.is_partition(symbol)]
+			for key in (lambda s: s.name == text, lambda s: s.simple == text,
 				lambda s: s.simple.rsplit("::", 1)[-1] == text or s.simple.rsplit(".", 1)[-1] == text):
-				found = [symbol for symbol in self.functions if key(symbol)]
+				found = [symbol for symbol in own if key(symbol)]
 				if found:
 					return found
 			needle = text.lower()
-			return [symbol for symbol in self.functions
+			return [symbol for symbol in own
 				if needle in symbol.simple.lower() or needle in symbol.mangled.lower()]
 		if expect_size:
-			sized = [symbol for symbol in self.functions if symbol.size == expect_size]
+			sized = [symbol for symbol in self.functions
+				if symbol.size == expect_size and not self.is_partition(symbol)]
 			if len(sized) == 1:
 				return sized
-		return list(self.functions)
+		return [symbol for symbol in self.functions if not self.is_partition(symbol)]
 
 	def function(self, wanted: str | None, expect_size: int | None = None) -> Function:
 		"""Pick the candidate function (one match, or say what is there)."""
@@ -662,10 +1019,37 @@ class CandidateObject:
 				% (wanted or "", len(candidates), self.path.name, "",
 					"\n  " + "\n  ".join("%s  (%d bytes)" % (s.simple, s.size) for s in candidates[:20])))
 		symbol = candidates[0]
-		body = self._sections.get(symbol.section, b"")
-		data = body[symbol.value:symbol.value + symbol.size]
+		sections = [symbol.section]
+		extents = [(symbol.value, symbol.size)]
+		data = self._sections.get(symbol.section, b"")[symbol.value:symbol.value + symbol.size]
+		warnings: list[str] = []
+		# -O2 splits the cold blocks of a function into a second symbol, `<name>.cold`, in its own
+		# section (.text.unlikely). The linked original splits the same way, and says so by the
+		# extent it asks for: when that is longer than the hot part, the cold block is what fills
+		# it, and both sides are then compared as entry block then cold block (Phase 5). When the
+		# original's own tables bound the unit at the hot part, so is this.
+		want = int(expect_size or 0)
+		for suffix in (".cold", ".cold.1"):
+			sibling = self._all_symbols.get(symbol.mangled + suffix)
+			if sibling is None or want and want <= sum(length for _, length in extents):
+				continue
+			section, value, size, _is_function = sibling
+			if not size or section in sections:
+				continue
+			chunk = self._sections.get(section, b"")[value:value + size]
+			if not chunk:
+				continue
+			sections.append(section)
+			extents.append((value, len(chunk)))
+			data += chunk
+			warnings.append("this candidate's cold blocks are in %s (%d bytes at %s): they are "
+				"compared after its entry block, as the linked original's are"
+				% (section, len(chunk), _hex(value)))
+		self._extent_sections = [(section, where, length) for section, (where, length)
+			in zip(sections, extents)]
 		return Function(display=symbol.simple or symbol.mangled, raw_name=symbol.mangled,
-			address=symbol.value, size=symbol.size, bytes=data, section=symbol.section)
+			address=symbol.value, size=len(data), bytes=data, section=symbol.section,
+			extents=extents, warnings=warnings)
 
 	def _in_section(self, function: Function, address: int) -> str:
 		"""A symbol defined in this same section at `address`.
@@ -683,8 +1067,11 @@ class CandidateObject:
 		A relocation sits on the encoded field (for a call that is one byte past the opcode),
 		so it binds to the address operand of the instruction containing it.
 		"""
-		relocs = [item for item in self._relocs.get(function.section, [])
-			if function.address <= item[0] < function.address + function.size]
+		relocs: list[tuple[int, str, str, int, str]] = []
+		for section, where, length in self._extent_sections or [
+				(function.section, function.address, function.size)]:
+			relocs += [item for item in self._relocs.get(section, [])
+				if where <= item[0] < where + length]
 		used: list[Ref] = []
 		seen: dict[str, Ref] = {}
 
@@ -759,20 +1146,29 @@ class CandidateObject:
 	def _target(self, symbol_name: str, addend: int, symbol_section: str = "") -> dict:
 		"""What a relocation names: kind, address, section, size, comparable content, display.
 
-		A relocation that names a *section* (a section symbol, or `.rodata.cst8`) carries the
-		offset inside it as the addend; the object defined at that offset (`.LC0`, a table, a
-		vtable) is what the instruction really reads, so it is looked up there - for its name,
-		while the geometry stays the offset itself.
+		A name is tried as a *symbol* first: `.LC3` and `.LFB1` are local labels, and GCC also
+		relocates against them with an addend (`R_X86_64_PC32 .LC13 - 4`, because the merged
+		`.rodata.cst4` pool is sorted and the constant sits before the label). Treating such a
+		name as a section makes every one of them the same object at offset -4, which collapses
+		seven constants into one symbol token and then mis-pairs the two sides' n-th object.
+
+		A relocation that really does name a *section* (a section symbol, or `.rodata.cst8`)
+		carries the offset inside it as the addend; the object defined at that offset (`.LC0`, a
+		table, a vtable) is what the instruction really reads, so it is looked up there - for its
+		name, while the geometry stays the offset itself.
 		"""
+		found = self._all_symbols.get(symbol_name)
 		section_named = symbol_name if symbol_name.startswith(".") else symbol_section
-		if section_named and not symbol_name.startswith("_"):
+		if found is None and section_named and not symbol_name.startswith("_"):
 			display = self._nearest_in(section_named, addend)
 			# the object defined at that offset is what the instruction reads, so it is the name
 			# to compare - `.data.rel.ro+0x18` is a section, and the other side has no such thing
 			return {"kind": "data", "address": addend, "section": section_named, "size": None,
 				"content": self._read(section_named, addend, _PROBE), "display": display,
-				"name": display}
-		found = self._all_symbols.get(symbol_name)
+				"name": display,
+				# in an object file every section is addressed from 0, so an offset alone names
+				# nothing: `.rodata+0x18` and `.rodata.cst4+0x18` are different objects
+				"identity": "%s+0x%x" % (section_named, addend)}
 		if found is None:
 			# not defined here: an import (libc, or a function of another translation unit).
 			# Its name is the only thing the two sides share - which is also what makes it
@@ -788,10 +1184,11 @@ class CandidateObject:
 		# the addend is an offset inside the named object: `_ZTV9CEntityBase+16` is the first
 		# slot of that vtable, not its header
 		own = self._names_section(symbol_name, section)
-		return {"kind": "data", "address": (None if own else value + addend), "section": section,
-			"size": size or None, "content": self._read(section, value + addend, size or _PROBE),
+		where = value + addend
+		return {"kind": "data", "address": (None if own else where), "section": section,
+			"size": size or None, "content": self._read(section, where, size or _PROBE),
 			"display": symbol_name,
-			"identity": ("symbol:%s" % symbol_name) if own else ""}
+			"identity": ("symbol:%s" % symbol_name) if own else "%s+0x%x" % (section, where)}
 
 	def _names_section(self, symbol_name: str, section: str) -> bool:
 		"""Is this object its own section? (`.data.rel.ro._ZTI14CVehicleEntity`, or the

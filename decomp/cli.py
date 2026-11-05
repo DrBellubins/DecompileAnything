@@ -901,7 +901,8 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	if row["kind"] == "thunk" and cache.unit_at(conn, int(row["entry"])) is None:
 		outcome["warnings"].append("the analysis classifies this function as a thunk: at -O2 its "
 			"body may be a jump into another function, so the cached range may be shorter than "
-			"the compiler's - pass --size <the symbol's size> to compare the whole range")
+			"the compiler's - the file's own function table (.eh_frame, .pdata, st_size) is what "
+			"bounds a unit now, and --size overrides it")
 	if not original.bytes:
 		outcome["error"] = "nothing to compare: the cache holds no bytes for this function"
 		return outcome
@@ -934,10 +935,12 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		outcome["error_code"] = EXIT_NOT_FOUND
 		return outcome
 	outcome["candidate"] = candidate
+	outcome["warnings"] += candidate.warnings
 
 	instructions_original = normalize.decode_function(handle, original.address, original.bytes,
-		original.boundaries)
-	instructions_candidate = normalize.decode_function(handle, candidate.address, candidate.bytes)
+		original.boundaries, original.extents)
+	instructions_candidate = normalize.decode_function(handle, candidate.address, candidate.bytes,
+		extents=candidate.extents)
 	if not instructions_candidate:
 		outcome["error"] = ("no instructions could be decoded at %s in %s"
 			% (_hex(candidate.address), object_path.name))
@@ -946,11 +949,13 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 
 	vocabulary = normalize.Vocabulary()
 	tokens_original = normalize.normalize_function(vocabulary, "original", instructions_original,
-		bind_original, original.address, original.size, register_abstract)
+		bind_original, original.address, original.size, register_abstract, original.extents)
 	tokens_candidate = normalize.normalize_function(vocabulary, "candidate", instructions_candidate,
-		object_file.bindings(candidate)[0], candidate.address, candidate.size, register_abstract)
+		object_file.bindings(candidate)[0], candidate.address, candidate.size, register_abstract,
+		candidate.extents)
 	outcome["verdict"] = diff.compare(tokens_original, tokens_candidate, vocabulary,
 		threshold=config.threshold(cfg), original_bytes=original.bytes, candidate_bytes=candidate.bytes)
+	outcome["verdict"].register_abstract = bool(register_abstract)
 	return outcome
 
 

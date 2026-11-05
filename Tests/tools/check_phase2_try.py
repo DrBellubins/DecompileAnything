@@ -41,7 +41,29 @@ KNOWN_GAPS = {
 		# into a pointer slot in .data.rel.ro (what the analysis then names). The two sides
 		# genuinely name different objects, so the tokens differ. Vtables and RTTI are
 		# Phase 4 (Docs/Design-Plan.md).
-		"STRUCT-24": "externally defined vtable: .o relocates _ZTV+16, the link reads a .data.rel.ro slot",
+		# ClassifyEntity's vtable references, before Phase 4 gave both sides the same identity
+		# for a type_info. It passes now; the reason is kept so the gap is not re-invented.
+		"STRUCT-24": "was: externally defined vtable, .o relocates _ZTV+16, link reads a .data.rel.ro slot",
+	},
+	"gcc-o0-x86": {
+		# A 32-bit non-PIE object reaches its data through one shared section, so the reference
+		# names the section and an offset rather than an object; the linked image has a symbol
+		# there. Nothing honest pairs the two. (8 units, measured.)
+		"MATH-13": "32-bit data reference through a shared section",
+		"MATH-20": "32-bit data reference through a shared section",
+		"MATH-22": "32-bit data reference through a shared section",
+		"MATH-23": "32-bit data reference through a shared section",
+		"STR-18": "32-bit data reference through a shared section",
+		"STR-19": "32-bit data reference through a shared section",
+		"STRUCT-20": "32-bit data reference through a shared section",
+		"STRUCT-25": "32-bit data reference through a shared section",
+	},
+	"gcc-o2": {
+		# Not an extent problem - Tests/tools/check_phase5_o2.py requires the tool's extent to
+		# equal the compiler's for all 89 units of this build. What is left is one unit whose
+		# only differences are `leaq` of code the file names no unit for: nothing on either side
+		# can name it, so nothing pairs it.
+		"STRUCT-24": "a reference to an unnamed unit elsewhere in the binary",
 	},
 }
 
@@ -130,13 +152,15 @@ def main(argv=None) -> int:
 		print("%s: %d/%d units scored, mean %.2f%%, byte-identical %d, pass the gate %d"
 			% (variant, len(scores), len(units), sum(percent) / len(percent), byte_identical, passed))
 		if split:
-			print("   %d units have a body in more than one range (a hot part and a cold"
-				" one); only the first is compared - Phase 5's -O2 work" % split)
+			print("   %d units whose body the analysis draws in more than one range: each is"
+				" compared as one block over the extent the file's own function table gives"
+				" (the extent gate is Tests/tools/check_phase5_o2.py)" % split)
 		if recut:
 			recut_percent = [item.match_percent for item in recut]
-			print("   %d units whose cached range differs from the answer key's: re-scored with"
-				" --size -> mean %.2f%%, pass the gate %d/%d" % (len(recut),
-					sum(recut_percent) / len(recut_percent),
+			print("   %d units the analysis describes with a size other than the answer key's:"
+				" re-scored over the answer key's range instead -> mean %.2f%%, pass the gate"
+				" %d/%d - the cross-check that the extent the tool derives is the compiler's"
+				% (len(recut), sum(recut_percent) / len(recut_percent),
 					sum(1 for item in recut if item.passed), len(recut)))
 		reference = TESTS / "build" / variant / "self_scores.json"
 		if reference.is_file():
@@ -160,10 +184,11 @@ def main(argv=None) -> int:
 			if unit_id in gaps:
 				print("   KNOWN GAP %s: %s" % (unit_id, gaps[unit_id]))
 		failing = [item for item in below if item.split()[0] not in gaps]
-		if variant.endswith("o0") and failing:
-			# at -O0 the untouched source must pass for every unit; the -O2 numbers are
-			# reported for the record - Ghidra's function boundaries and the hot/cold split
-			# of a -O2 body are Phase 5 work (Docs/Design-Plan.md)
+		if failing:
+			# Every variant is gated: the untouched source must pass for every unit except the
+			# ones named in KNOWN_GAPS above. -O0 has no exceptions; -m32 and -O2 do, and each
+			# one says why. (Before Phase 5 the -O2 row was only reported, because its extent
+			# was Ghidra's range rather than the compiler's.)
 			failures += 1
 
 	if not args.no_controls:

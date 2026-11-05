@@ -15,7 +15,7 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 | 2 | `try`: compile -> extract -> normalise -> diff | **implemented** |
 | 3 | `detect`: compiler/object/flags from the file; `find`: xrefs, vtables, related functions | **implemented** |
 | 4 | `types`: vtables, RTTI, the shared header | **implemented** - see "The C++ underneath (`decomp types`)"; acceptance is `python Tests/tools/check_phase4_structures.py` |
-| 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | not implemented |
+| 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | **implemented** for the unit extents and the diff - a `-O2` unit's extent now comes from the file's own function table (`.eh_frame` FDEs, `st_size` where symbols survive), so 89/89 units are compared over the compiler's own range and the `-O2` row is 99.91 % mean / 88 of 89 past the gate, above the harness's own 98.27 %/72; acceptance is `python Tests/tools/check_phase5_o2.py`. The Unicorn behaviour check and the `objdiff-cli` `.o` synthesis are not done - see [Docs/Design-Plan.md](Docs/Design-Plan.md) |
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
 | MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **done** - toolset v141 14.12 + Windows SDK 10.0.19041: `cl`/`link` build and run a PE under Wine, and the benchmark itself builds with `cl` at `/Od` and `/O2` with an 89/89 answer key (`python Tests/tools/check_msvc_toolchain.py`, exit 0) |
@@ -146,6 +146,15 @@ binary (`Tests/Proprietary/notepad.exe`) reports `compiler = msvc`, link.exe 14.
 the PDB's GUID with the address Microsoft serves that PDB from. `find`, `show`, `detect` and
 `detect --range` work on it (`python Tests/tools/check_pe_target.py`), and the report says
 plainly that a `/GL` image cannot be reproduced byte-for-byte by a single-file compile.
+
+An x64 ELF carries one too, and since Phase 5 the tool reads it the same way: the `.eh_frame`
+FDE records name every unit that needs unwinding with its exact extent (on the `-O2` build, 138
+units, verified against `readelf --debug-dump=frames-interp`), and `st_size` from `.symtab` where
+symbols survive. `decomp analyze` prints the reconciliation: 65 of the analysis' function entries
+agree with the table, 73 it draws shorter than the unit, 0 longer, and 7 entries it made up in
+alignment gaps where the file names no unit. `try` then compares the unit, `show` prints both
+numbers when they differ, and 51 units whose bodies the analysis drew as 2-5 ranges are read as
+the one block they are. This is what turned the `-O2` row from 65.88 %/34 into 99.91 %/88.
 
 An x64 PE also carries the compiler's own function table, and since MS-1 the tool uses it.
 `decomp analyze` reads `.pdata` into the cache next to the analysis' ranges and prints the
@@ -315,22 +324,28 @@ binutils only):
 |---|---|---|---|---|---|
 | gcc-o0 (x86-64) | 89 / 89 | **100.00 %** | 54 | **89 / 89** | 99.53 %, 83 / 89 |
 | gcc-o0-x86 (-m32, static) | 89 / 89 | 99.38 % | 58 | 81 / 89 | 87.19 %, 11 / 89 |
-| gcc-o2 (x86-64) | 89 / 89 | 65.88 % | 29 | 34 / 89 | 98.27 %, 72 / 89 |
+| gcc-o2 (x86-64) | 89 / 89 | **99.91 %** | 55 | **88 / 89** | 98.27 %, 72 / 89 |
 
-Only the -O0 rows gate: at -O0 the untouched source has to be accepted, and since Phase 4 it
-is accepted for **every** unit of the 64-bit build. STRUCT-24, the `dynamic_cast` unit whose
-every data reference is a `type_info`, was the last one out: the `.o` relocates `_ZTI...` while
-the linked image reads a `.data.rel.ro` pointer slot, so the two sides named different objects
-until `decomp types` gave both of them the same identity and the same name
+Only the -O0 row gated this table before Phase 5; now all three are measured the same way and
+the -O2 row is in the same order of magnitude as the -O0 one. At -O0 the untouched source is
+accepted for **every** unit of the 64-bit build. STRUCT-24, the `dynamic_cast` unit whose every
+data reference is a `type_info`, was the last one out: the `.o` relocates `_ZTI...` while the
+linked image reads a `.data.rel.ro` pointer slot, so the two sides named different objects until
+`decomp types` gave both of them the same identity and the same name
 (`typeinfo for CVehicleEntity`). The `-m32` row went from 78 to 81 for a related reason: a
 non-PIE 32-bit object writes `pushl $_ZTI14CVehicleEntity` as an immediate of `0` with an
 `R_386_32` on the four bytes, and an immediate operand was not a bindable slot before. The
-remaining `-m32` differences are 32-bit data references through a shared section, and the -O2
-row is reported, not gated: 51 of those 89 units have bodies split into a hot part and a cold one and Ghidra's
-function boundaries differ from the compiler's symbol ranges - which is precisely the Phase 5
-`-O2` work. `--size <the compiler's symbol size>` is the escape hatch today, and
-`--register-abstract` (already reported separately as the `register` category) is the Phase 5
-knob.
+remaining `-m32` differences are 32-bit data references through a shared section.
+
+What the `-O2` row used to be, and what fixed it: 51 of those 89 units have a body the analysis
+draws as several ranges (alignment padding between blocks), and a dozen more have their cold
+blocks in `.text.unlikely`, so a range-based body was the wrong extent - 65.88 % mean, 34 of 89.
+The fix is not a wider range: at -O2 ELF and PE have the same shape, a function table that names
+every unit with its exact extent, and `extract` now reads it. The `-O2` row is then 99.91 % mean
+with 88 of 89 past the gate, which is above the independent harness's own ceiling for the same
+source. `Tests/tools/check_phase5_o2.py` gates that: it requires the tool's extent to equal the
+answer key's `(address, size)` for all 89 units of all three builds, scored from the *stripped*
+file alone.
 
 The same script re-scores the deliberately wrong candidates in
 `Tests/examples/candidate_math_bad.cpp` and requires the report to name the kind of problem
@@ -361,10 +376,28 @@ all three scripts print OK on this machine).
   `detect --probe` measures `cl /Od|/O1|/O2` shapes. Still missing: `try` on a COFF candidate
   (MS-3 - the section-as-extent and no-addend relocation rules).
   [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
-* Ghidra's function boundaries at `-O2` differ from the compiler's, and a `-O2` body can be
-  split across `.text` and `.text.unlikely`; only the first range is compared today.
-  Extracting across ranges is Phase 5. (An x64 PE no longer has that problem: the unit table
-  gives one contiguous range and the bytes are read across it - see MS-1.)
+* Ghidra's function boundaries at `-O2` differ from the compiler's, and a `-O2` body can be split
+  across `.text` and `.text.unlikely`. `extract` now takes the unit's extent from the file's own
+  function table instead (`.eh_frame` FDEs, `st_size` where symbols survive), which is what the
+  compiler bounded, and the labels in a normalised body are unit-relative, so a body the analysis
+  drew in several ranges compares as the one block it is. What is *not* handled: when the analysis
+  puts a unit's cold partition somewhere the file's table does not connect to the entry block, the
+  two are still scored as two units (`decomp analyze` names the FDEs and the analysis' made-up
+  entries either way), and a candidate call to a label inside another section resolves to a
+  `<section>+<offset>` token, which can collapse several such calls to one name. That affects only
+  functions with a `.cold` partition; no unit of this benchmark has one in its compared extent.
+* Masking register choice (`decomp try --register-abstract`) makes the same choice in different
+  registers compare equal - measured: `movl %eax, %ecx` vs `movl %r9d, %r8d` match only with it,
+  and a *different* choice (`addl %r8d, %r9d` vs `addl %edx, %ecx`) still does not. It changes no
+  score in this benchmark: the untouched source has zero register differences at every level, and
+  the 8 remaining `-m32` units and the one `-O2` unit are unchanged by it. So the remaining gaps
+  are data-reference and naming differences, not register allocation. It is a first-appearance
+  mapping per side, so it cannot tell `mov a, b` from `mov b, a` in isolation - the widths and the
+  operand order still distinguish them in context.
+* A `-O2` reference to *another* unnamed unit (`leaq` of code the file names no unit for) has
+  nothing to pair on: the original side can only call it the address Ghidra drew, the candidate
+  side calls it the object that covers that offset. That is the one unit below the gate at -O2
+  (STRUCT-24, 96.36 %), named in `Tests/tools/check_phase5_o2.py`.
 * `detect --range` still samples a PE's `.text` cut at every `ret` rather than over the unit
   table it now has. MS-4's shape profiles should sample the units.
 * `.pdata` is the compiler's function table **only for functions that need unwinding**: measured on

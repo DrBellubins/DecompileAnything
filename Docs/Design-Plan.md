@@ -149,10 +149,33 @@ addresses/member offsets judged against `answer_key.json` and the layout in `str
 (including the 32-bit one), the generated header compiled, and the opposite required of an MSVC
 PE - Itanium RTTI is not that format, so claiming a class there would be a false positive.
 
-**Phase 5: Hardening**
-1. Move to `-O2` test builds and handle inlining and register-allocation noise (register-abstracted comparison mode).
-2. Optional: Unicorn-based behavioral check for functions that are semantically correct but not byte-identical.
-3. Optional: synthesize a target `.o` (via `.reloc`) so `objdiff-cli` can be used as an alternate backend.
+**Phase 5: Hardening** - done for 1, 2026-11-05; 2 and 3 not started
+1. Move to `-O2` test builds and handle inlining and register-allocation noise (register-abstracted comparison mode). (Done. **The extent, not the flags, was what -O2 broke.** At `-O2` a function's body is not contiguous: GCC orders it by hotness and pads between blocks, so Ghidra draws one unit as 2-5 ranges (51 of the 89), and puts the cold blocks of another in `.text.unlikely` as a second function. A range-based body is then the wrong byte string, and no amount of normalising fixes that: 65.88 % mean, 34 of 89 past the gate. What fixes it is the same thing MS-1 found in a PE: **the file already has a function table.** `extract._read_eh_frame()` parses the `.eh_frame` CIE/FDE records and `_read_symbol_sizes()` reads `st_size` where symbols survive, `TargetImage` keeps it (verified against `readelf --debug-dump=frames-interp`: 138 FDEs, 0 disagreements), `original_function()` prefers it over the analysis' ranges - explicit `--size` > the kept table > a live read of the file > the analysis' span > the analysis' body - and `decomp analyze` reports the disagreement instead of hiding it (on `-O2`: 73 units the analysis draws short, 7 analysis entries that are not units at all, made up in alignment gaps). Result: the untouched source at -O2 is **99.91 % mean, 88 of 89 past the gate**, above the independent harness's own ceiling of 98.27 % / 72; at -O0 nothing changed (100.00 %, 89/89) and neither did -m32 (99.38 %, 81/89). Acceptance is `python Tests/tools/check_phase5_o2.py`: it requires the tool's extent to equal the answer key's `(address, size)` for all 89 units of all three builds from the *stripped* file, requires the -O2 loop to hold, and demonstrates the two things the -O2 path needs: a body in two blocks tokenises with unit-relative labels (`jmp L6`/`jmp L0`, positions in the unit's byte stream, not addresses), and a register-only difference matches only under `--register-abstract` while a different register choice still does not.)
+2. Optional: Unicorn-based behavioral check for functions that are semantically correct but not byte-identical. (Not started. Nothing measured here argues for it yet: the remaining differences in this benchmark are not semantic-equivalence cases - 8 of the 9 non-passing units are 32-bit data references through a shared section, and the 9th is a reference to an unnamed unit elsewhere in the binary.)
+3. Optional: synthesize a target `.o` (via `.reloc`) so `objdiff-cli` can be used as an alternate backend. (Not started. Note for whoever does: objdiff's own function extents have the same problem this phase fixed - it uses the analysis' boundaries - so a synthesized `.o` needs the *unit table* carried across (`.eh_frame` for ELF, `.pdata` + `.pdata$x` for PE), not just the bytes.)
+
+What Phase 5 learned, for whoever extends it:
+
+* **A `.cold` partition is a separate unit, not half of one.** GCC emits it under its own symbol
+  (`<mangled>.cold`) with its own FDE, and the *linked* image has it in `.text.unlikely`. So the
+  file's table does not join it to the entry block, and neither does anything else have the right
+  to: `symbols_for` excludes `.cold` symbols from name lookup (a `--fn CMathTests::RunSelfChecks`
+  would otherwise match two), and the candidate side appends a `.cold` extent only when the
+  original's own extent claims more bytes than the base symbol has.
+* **A label is a position in the unit, not an address.** With extents in separate blocks, `L<addr
+  - entry>` gives two different names for the same edge; `L<position in the concatenated byte
+  stream>` gives one. Resolving the target means `ref.address` when the relocation names a symbol
+  and the encoded operand otherwise - a `.o` call to a label in its own section has a placeholder
+  displacement that only the relocation makes meaningful.
+* **A section symbol is not an address.** `R_X86_64_PLT32 .rodata.cst16-4` names the whole section,
+  so a constant pool label (`.LC13`) has no symbol of its own in a linked PIE either; naming such a
+  target by the section it lives in removed a whole class of `-O2` operand differences (the float
+  constants of `WrapAngle180`, `SineApprox`, `Atan2Approx`), and the `-4` in a PLT32 addend is the
+  PC bias, not an offset - which is why a call into another section still resolves badly.
+* The analysis' own numbers did not change and are not wrong about themselves:
+  `check_analysis_cache.py` still reports 38 of 89 Ghidra function sizes matching the answer key's
+  at -O2. That is the analysis describing its own boundaries; `try` no longer takes extents from it,
+  and `decomp analyze` prints the disagreement in both directions.
 
 ## Test Plan
 

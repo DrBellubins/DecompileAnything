@@ -219,6 +219,19 @@ class Vocabulary:
 		# counted per side, so the n-th callee of the original and of the candidate meet at
 		# the same token and `diff` can compare what they each mean
 		self._next = {side: {"SYM": 0, "DAT": 0} for side in ("original", "candidate")}
+		# ... and the same for registers, in --register-abstract mode: the k-th register this
+		# side touches is r<k>, so two sides that made the same choice in different registers
+		# meet, and one that made a different choice (a different operand pair) still differs
+		self._registers: dict[str, dict[str, str]] = {side: {} for side in ("original", "candidate")}
+
+	def register_name(self, side: str, register: str) -> str:
+		"""This side's name for a register: first appearance wins, aliases of one register
+		(%rax/%eax/%ax/%al) count as one, so a width-changing instruction is not hidden."""
+		key = REGISTER_ALIASES.get(register, register)
+		table = self._registers[side]
+		if key not in table:
+			table[key] = "r%d" % len(table)
+		return table[key]
 
 	def token_for(self, side: str, ref: Ref) -> str:
 		"""A positional token per side: the n-th function this body calls, the n-th object it
@@ -248,14 +261,35 @@ class Vocabulary:
 
 
 def decode_function(handle: Cs, base: int, data: bytes,
-	boundaries: list[tuple[int, int]] | None = None) -> list[Instruction]:
+	boundaries: list[tuple[int, int]] | None = None,
+	extents: list[tuple[int, int]] | None = None) -> list[Instruction]:
 	"""Decode a function body.
 
 	`boundaries` = [(address, length), ...] to honour - the original side passes the
 	instruction boundaries from the analysis cache, which are Ghidra's and match how
 	`decomp show` prints the same function. Without them the bytes are swept linearly, which
 	is what a `.o` gives.
+
+	`extents` = [(address, length), ...], the blocks `data` is made of, in the order they are
+	compared (entry block first, a -O2 cold partition second). Without it `data` is one block
+	starting at `base`. Each block is decoded in its own address domain, and the streams are
+	concatenated in that order - which is how the same split in the candidate's `.o`
+	(`.text` then `.text.unlikely`) lines up with it.
 	"""
+	if not extents:
+		extents = [(base, len(data))]
+	out: list[Instruction] = []
+	offset = 0
+	for address, length in extents:
+		chunk = data[offset:offset + length]
+		offset += length
+		if chunk:
+			out.extend(_decode_block(handle, address, chunk, boundaries))
+	return out
+
+
+def _decode_block(handle: Cs, base: int, data: bytes,
+	boundaries: list[tuple[int, int]] | None = None) -> list[Instruction]:
 	out: list[Instruction] = []
 	if boundaries:
 		for address, length in boundaries:
@@ -364,6 +398,17 @@ _REGISTER = re.compile(
 	r"\b(e[a-d]x|[a-d][sl][pi]|r[abcd]x|r\d{1,2}[wdb]?|sip|dil|sil|bpl|spl|al|cl|dl|bl|"
 	r"xmm\d+|ymm\d+|st\(\d\)|mm\d+)\b")
 
+# The same physical register under its widths: abstracting a register *choice* must not also
+# abstract away the width an instruction works at, or `movl %eax, %edx` and `movq %rax, %rdx`
+# would read as the same operation.
+_GPR_WIDTHS = [("rax", "eax", "ax", "al", "ah"), ("rbx", "ebx", "bx", "bl", "bh"),
+	("rcx", "ecx", "cx", "cl", "ch"), ("rdx", "edx", "dx", "dl", "dh"),
+	("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
+	("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl")] + [
+	("r%d" % index, "r%dd" % index, "r%dw" % index, "r%db" % index)
+	for index in range(8, 16)]
+REGISTER_ALIASES = {alias: base for base, *others in _GPR_WIDTHS for alias in [base] + others}
+
 
 def _operand_spans(operands: str) -> list[tuple[int, int]]:
 	"""Split capstone's AT&T operand text into operand spans (commas inside a memory
@@ -388,13 +433,29 @@ def _operand_spans(operands: str) -> list[tuple[int, int]]:
 
 
 def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruction],
-	bind, base: int, size: int, register_abstract: bool = False) -> list[Token]:
+	bind, base: int, size: int, register_abstract: bool = False,
+	extents: list[tuple[int, int]] | None = None) -> list[Token]:
 	"""Tokenise one function.
 
 	`bind(instruction) -> {operand index: Ref}` says what each address operand refers to:
 	the original side answers from the analysis cache's resolved references, the candidate
 	side from the `.o`'s relocation entries. That is the only difference between the sides.
+
+	A branch inside the unit becomes `L<offset>`, the offset being the target's position in the
+	bytes being compared (`extents`) rather than a raw address: a unit whose cold half was
+	linked into another part of `.text`, and a candidate whose cold half sits in
+	`.text.unlikely`, then agree on the same label for the same edge.
 	"""
+	blocks = list(extents) if extents else [(base, size)]
+
+	def position_of(value: int) -> int | None:
+		cursor = 0
+		for start, length in blocks:
+			if start <= value < start + length:
+				return cursor + (value - start)
+			cursor += length
+		return None
+
 	tokens: list[Token] = []
 	for instruction in instructions:
 		bound = bind(instruction) or {}
@@ -407,12 +468,23 @@ def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruct
 			ref = bound.get(slot.operand)
 			start, stop = spans[slot.operand]
 			text = operands[start:stop]
-			inside = slot.value is not None and base <= slot.value < base + size
+			# Where does this operand really point? On the original side the analysis answers;
+			# on the candidate side an unrelocated `call` in a `.o` encodes a displacement of 0
+			# (the link fills it in), so its encoded value is the next instruction and only the
+			# relocation behind the reference says where it goes.
+			target = ref.address if (ref is not None and ref.address is not None) else slot.value
+			here = position_of(target) if target is not None else None
 			replacement = None
-			if slot.kind in ("branch", "call") and inside and (ref is None or ref.kind == "label"):
-				# a jump inside this function is a label, not a symbol: made relative, so a
-				# moved function or a different link address does not read as a change
-				replacement = "L%x" % (slot.value - base)
+			if here is not None and slot.kind in ("branch", "call") and (
+					ref is None or ref.kind != "external"):
+				# a jump or call that lands inside this unit is an edge inside the unit, not a
+				# symbol: made relative to the start of the unit, so a moved function or a
+				# different link address does not read as a change, a body in two blocks reads the
+				# same on both sides, and a self-recursive call reads as a call to a label on both.
+				# What the analysis happened to call the target does not matter: a tail jump to an
+				# address the file puts *inside this unit* is inside it, however many functions the
+				# disassembler drew there - and the candidate's own body agrees by jumping to it
+				replacement = "L%x" % here
 			elif ref is not None:
 				replacement = vocab.token_for(side, ref)
 				refs.append(ref)
@@ -428,7 +500,8 @@ def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruct
 				operands = operands[:start] + replacement + operands[start:]
 		text = format_instruction(instruction.mnemonic, operands.strip())
 		if register_abstract:
-			text = _REGISTER.sub(lambda match: "{" + match.group(0) + "}", text)
+			text = _REGISTER.sub(lambda match: "{" + vocab.register_name(side, match.group(0))
+				+ "}", text)
 		tokens.append(Token(text=text, mnemonic=instruction.mnemonic, address=instruction.address,
 			refs=refs))
 	return tokens

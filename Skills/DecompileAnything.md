@@ -35,6 +35,11 @@ on the candidate is one command away. `--fn` names the symbol in the candidate t
 (without it, the object must define exactly one function). `--include` adds `-I` for a header
 the candidate needs; `[include_dirs]` in the target's `project.toml` does it permanently.
 
+The extent it compares is the one the **file** gives: `.eh_frame`'s FDE records for ELF (`.pdata`
+for PE), so at `-O2` a body the disassembler drew in several ranges is still one unit, and a
+`jumps past the end of the range you gave it` warning means the extent is wrong, not the code.
+`--size` overrides it; `decomp analyze` prints where the file's table and the analysis disagree.
+
 # Driving `decomp`
 
 * Start a new target with `decomp detect <bin> --write project.toml`: it reads the compiler and
@@ -91,7 +96,7 @@ the candidate needs; `[include_dirs]` in the target's `project.toml` does it per
 | `opcode: n` | wrong operation: cmov vs branch, imul vs shifts, signed vs unsigned load | fix the operation; `movzbl` vs `movsbl` and `idiv` vs `shrd` are the usual ones |
 | `operand: n` | right operation, wrong offset/constant/type | field offsets, struct layout, the type of an array element, a truncated buffer bound |
 | `relocation: n` | same shape of code, reaching for something else: a different callee, a different table, different bytes in it | the report's `symbols` line names both sides - fix the callee or reproduce the data (tables and string literals are part of the answer). Bytes are only compared when both sides know what object they are: an anonymous `.rodata` pool is laid out per build |
-| `register: n` | register allocation only | not yours to fix; use `--register-abstract` when comparing at -O2 (Phase 5) |
+| `register: n` | register allocation only | not yours to fix; `--register-abstract` maps each side's registers to the order they first appear, so the same choice in different registers matches. Measured on this benchmark it changes no score - the untouched source has 0 register differences at every `-O` - so treat it as a reading aid, not a way to pass |
 | `missing`/`extra` | control flow or size differs | loop form (counted vs conditional), hoisted invariant, inlined vs called helper, early return vs branch |
 | `size_delta` large with high % | something is inlined or vectorised that should not be (or the reverse) | compare at the variant's own `-O`; never compare -O0 asm to -O2 asm |
 

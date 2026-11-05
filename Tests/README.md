@@ -46,10 +46,26 @@ It feeds the untouched original source through `decomp try`'s code path for ever
 compares with what `eval.py self` reports (100.00% mean, 89/89 pass at gcc-o0 vs the
 harness's own 99.53%, 83/89), then re-scores the deliberately wrong candidates in
 `Tests/examples/candidate_math_bad.cpp` and requires the report to name the kind of problem
-they are. Current result: 89/89
-addresses and sizes exact for both `-O0` variants; at `-O2` all 89 addresses still match but
-51 sizes differ (Ghidra's own function boundaries), and STR-04/STR-11 are classified as
-thunks because their -O2 body is a tail call.
+they are. Every variant is gated against its own `KNOWN_GAPS` list: none at -O0, eight
+32-bit data references at `-m32`, one unnamed-unit reference at `-O2`. For the -O2 row it also
+re-scores each unit whose *analysis* size differs from the answer key's over the answer key's
+range, which is the cross-check that the extent the tool derives is the compiler's.
+
+To check the `-O2` work itself (Phase 5):
+
+```sh
+.venv/bin/python Tests/tools/check_phase5_o2.py
+```
+
+Three claims, none of them this tool's own opinion. **The extent:** for every unit of all three
+ELF builds, the `(address, size)` that `extract` settles on equals the answer key's - which comes
+from the *unstripped* build's symbol table, while the tool is only allowed the stripped file
+(89/89 on each). **The loop:** the untouched source at `-O2` through `decomp try`'s own path must
+hold (measured 99.91% mean, 88/89 past the gate, against the harness's 98.27%/72). **The two
+mechanisms that make a split body comparable:** a unit whose bytes sit at 0x1000 and 0x9000
+tokenises as one stream with unit-relative labels (`jmp L6`/`jmp L0` - positions, not addresses),
+and `--register-abstract` makes `movl %eax, %ecx` and `movl %r9d, %r8d` the same token while a
+*different* choice stays different.
 
 To check the tool's own discovery and toolchain detection (Phase 3):
 
@@ -247,9 +263,13 @@ per-function difficulty is representative.
   a bug (there are none) and x87-vs-SSE float differences as expected: `-m32` computes
   `SineApprox` and `InitVehicleDescriptor`'s grip in float registers with different
   rounding, and `ChecksumDescriptorBytes` therefore hashes different struct bytes.
-* The -O2 gap is real codegen, not normalisation: builtins (`sqrtf` inlined as `sqrtsd`
-  in a `.o` but called through the PLT in the linked binary) and jump-table layout.
-  Behavioural checking (Phase 5, goldens + Unicorn) is the way to close those.
+* The -O2 gap that was real codegen is now mostly extent: the tool was comparing Ghidra's range
+  instead of the compiler's unit. Since Phase 5 it reads the file's own function table
+  (`.eh_frame` FDEs, `st_size` where symbols survive), and the -O2 row moved from 65.88%/34 to
+  99.91%/88. What is left of "semantically right but not byte-identical" in this benchmark is
+  builtins (`sqrtf` inlined as `sqrtsd` in a `.o` but called through the PLT in the linked
+  binary) and jump-table layout - the honest case for the optional behavioural check
+  (goldens + Unicorn), which is not implemented.
 
 ## Adding or changing a unit
 

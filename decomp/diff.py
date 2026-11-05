@@ -36,6 +36,7 @@ class Verdict:
 	candidate_bytes: int = 0
 	identical: bool = False
 	bytes_equal: bool = False
+	register_abstract: bool = False
 	warnings: list[str] = field(default_factory=list)
 
 	@property
@@ -211,6 +212,10 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 	lines.append("  instructions %d vs %d (%+d)  categories: %s" % (
 		verdict.original_instructions, verdict.candidate_instructions, verdict.size_delta_instructions,
 		", ".join("%s %d" % (name, verdict.categories[name]) for name in CATEGORIES)))
+	if verdict.register_abstract:
+		lines.append("  register-abstracted: every register name on a side is replaced by the order "
+		"it first appears in, so the same choice in different registers matches and a different "
+		"choice still does not - a unit is gated on the strict comparison, not this one")
 	if verdict.bytes_equal and verdict.match_percent == 100.0:
 		lines.append("  the candidate assembles to exactly the original bytes")
 	if with_symbols and verdict.symbols:

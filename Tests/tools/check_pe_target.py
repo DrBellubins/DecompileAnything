@@ -525,7 +525,12 @@ def check_units() -> list[str]:
 # 6. the ELF path is untouched: a cache with no unit table still works and says nothing false
 
 
+# --------------------------------------------------------------------------------------
+# 6. the ELF path: an old cache with no unit table still works, and a unit has its own extent
+
+
 def check_unchanged_path() -> list[str]:
+	"""What a PE may not change: the ELF path, and what Phase 5 made it."""
 	elf = TESTS / "build" / "gcc-o0" / "da_tests.stripped"
 	cfg = config.load(str(TESTS / "project.toml"))
 	store = cache.Cache(config.cache_dir(cfg))
@@ -537,43 +542,53 @@ def check_unchanged_path() -> list[str]:
 	conn = None
 	try:
 		conn = cache.open_readonly(Path(status["db"]))
-		if cache.has_table(conn, "units") and cache.unit_rows(conn):
-			bad.append("the ELF analysis carries a unit table (%d units) - ELF has none to read"
-				% len(cache.unit_rows(conn)))
-		if cache.unit_rows(conn) or cache.unit_at(conn, 0x1000) is not None \
-				or cache.unit_covering(conn, 0x1000) is not None:
-			bad.append("a unit lookup on an analysis without a table returned something")
-		if cache.unit_reconciliation(conn).get("units"):
-			bad.append("unit_reconciliation invented units for an analysis without a table")
+		units = cache.unit_rows(conn) if cache.has_table(conn, "units") else []
+		if units:
+			# Phase 5: an ELF analysis carries the file's own table too - `.eh_frame`, and
+			# `st_size` where the file kept it. Any other source would be an invention.
+			sources = {row["source"] for row in units}
+			if not sources <= {".eh_frame", "symtab"}:
+				bad.append("an ELF unit table with sources %s" % ", ".join(sorted(sources)))
+			print("   ELF analysis carries %d units from %s"
+				% (len(units), ", ".join(sorted(sources))))
+		else:
+			# a cache written before either table existed: read tolerantly, and say nothing false
+			if cache.unit_at(conn, 0x1000) is not None \
+					or cache.unit_covering(conn, 0x1000) is not None:
+				bad.append("a unit lookup on an analysis without a table returned something")
+			if cache.unit_reconciliation(conn).get("units"):
+				bad.append("unit_reconciliation invented units for an analysis without a table")
 		row = conn.execute("SELECT * FROM functions WHERE kind = 'function' AND size > 40"
 			" ORDER BY entry LIMIT 5").fetchall()
 		if not row:
 			bad.append("no function in the ELF analysis to re-check")
 		else:
-			# A body the analysis split into ranges was already clamped to its first range before
-			# MS-1 and still is: nothing on this path may change. The single-range one is the case
-			# that must be byte for byte as it was.
+			# A single-range body is compared exactly as it always was. A body the analysis
+			# split at alignment padding is now read as the one block it is (Phase 5): the
+			# bytes between the ranges are inside the unit, and the candidate's `.o` has them.
 			single = [item for item in row if len(json.loads(item["ranges"] or "[]")) <= 1]
 			split = [item for item in row if len(json.loads(item["ranges"] or "[]")) > 1]
 			cases = []
 			if single:
 				cases.append((single[0], int(single[0]["size"])))
 			for item in split[:1]:
-				first = json.loads(item["ranges"])[0]
-				cases.append((item, int(first[1]) - int(item["entry"])))
+				ranges = json.loads(item["ranges"])
+				span = max(stop for _start, stop in ranges) - min(start for start, _stop in ranges)
+				cases.append((item, span))
 			for item, want in cases:
 				function = extract.original_function(conn, cache.meta(conn), item)
-				if function.size != want or any(".pdata" in claim or "unit table" in claim
-						for claim in function.warnings):
-					bad.append("original_function changed on the ELF path at %s: %d bytes vs %d, %r"
+				if function.size != want or any(".pdata" in claim for claim in function.warnings):
+					bad.append("original_function on the ELF path at %s: %d bytes, want %d, %r"
 						% (hex(item["entry"]), function.size, want, function.warnings))
 				else:
-					print("   ELF path unchanged: %s @ %s, %d bytes compared, no unit claims"
-						% (item["name"], hex(item["entry"]), function.size))
+					print("   ELF path: %s @ %s, %d bytes compared (%s)"
+						% (item["name"], hex(item["entry"]), function.size,
+							"one range" if len(json.loads(item["ranges"] or "[]")) <= 1
+							else "one block across %d ranges" % len(json.loads(item["ranges"]))))
 	finally:
 		if conn is not None:
 			conn.close()
-	report("the ELF path (no unit table)", bad)
+	report("the ELF path (its own unit, never a PE one)", bad)
 	return bad
 
 
