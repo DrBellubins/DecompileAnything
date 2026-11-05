@@ -12,6 +12,14 @@ reason rather than chasing it.
 ## What works
 
 - `decomp analyze`, `find`, `show` and `detect` work on a PE. The reference example is `Tests/Proprietary/notepad.exe` (236 functions). `detect` names the v141 toolset from the Rich header build id, `/GL` + `/LTCG` from the debug directory, and the public PDB that holds that file's answer key.
+- Since MS-4 the build report is much more specific, and its facts are worth reading before
+  choosing a variant: the toolset is read from link.exe's own Rich record **and** the optional
+  header (and it says whether they agree); the per-front-end compiland counts say how many C, C++
+  and asm compilands the link had and how many went through `/GL`; the language is claimed from a
+  decorated name and the CRT family from the imports (`/MD` vs `/MT`); `/std:` is stated as what
+  that toolset bounds, never as a fact; and for a PE the `-O` shape sample walks `.pdata` units.
+  If `detect` answers `/O1|/O2`, treat that as a class: try the other level before believing a
+  bad score is the candidate's fault.
 - `try` works on a PE target: the candidate is compiled to a `.obj` and read back with COFF
   semantics (extents derived from the object, relocations with no addend). `decomp types` claims
   nothing for a PE, because that RTTI format is `MS-5` - a named, phased gap, not something to
@@ -35,6 +43,22 @@ reason rather than chasing it.
   The instruction stream and the symbol tokens are the score.
 - Two argument rules: put `/link` last (everything after it goes to the linker), and put only the top source directory on the include path (a project `math.h` in an `-I` directory shadows the CRT's `<math.h>` for `cl`).
 - `decomp check` identifies each tool by banner and refuses impostors (`/usr/bin/link` is GNU coreutils; `clang-cl` is clang). Read its `msvc *` rows before believing any MSVC variant is usable.
+
+## What a report about an MSVC target can and cannot say (MS-4)
+
+- `/Od` against the optimising levels is knowable from the code (`cl /Od` keeps every local at
+  `N(%rsp)` and writes every argument to its home slot; `/O1|/O2` do not). `/O1` against `/O2`
+  is **not**: the only feature that separates them is whether `/O2` found a loop to vectorise.
+  A `try` run at the wrong one of those two is not a broken candidate.
+- `/GL` is said twice - the debug directory (POGO/LCTG) and the linker's own compiland records -
+  and both mean the byte gate is off for that target: no single-file compile reproduces a
+  link-time-regenerated image.
+- `/GS` is reported from the shape (the cookie xor-ed with `%rsp`, or its check), because no
+  header records it.
+- At `/O2` the image's `.pdata` can name a **block** of a function rather than the function
+  (hot/cold splitting, one COMDAT each), so a unit may be reported as a handful of bytes while
+  the candidate holds the whole function. That is a known open gap in the tool, not a candidate
+  bug - it is the 8 units `msvc-o2` does not pass.
 
 ## The function table (`.pdata`)
 

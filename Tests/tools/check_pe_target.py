@@ -113,7 +113,11 @@ def check_note() -> list[str]:
 		"static": (note.get("static"), False),
 		"ltcg (/GL + /LTCG)": (note.get("ltcg"), True),
 		"pogo": (note.get("pogo"), "LCTG"),
-		"language (not claimed from a C runtime)": (note.get("language"), None),
+		# MS-0 left `language` unset on purpose: an msvcrt.dll import is what a plain C program
+		# imports too, and there was nothing else to read. MS-4 has something else to read: this
+		# file's import table names `?terminate@@YAXXZ`, a decorated C++ runtime function - a
+		# C++ name, not a C runtime. The claim is made now, and `language_proof` says on what.
+		"language (from a decorated name, not from a C runtime)": (note.get("language"), "c++"),
 	}
 	for name, (got, want) in facts.items():
 		if got != want:
@@ -125,6 +129,19 @@ def check_note() -> list[str]:
 		bad.append("toolset: %r, expected the v141 family that link.exe 14.12 names" % toolset)
 	if TOOL_BUILD not in toolchain.rich_builds(note):
 		bad.append("rich: tool build %d not recorded (%r)" % (TOOL_BUILD, note.get("rich")))
+	# MS-4: the toolset is read from the linker's own Rich record as well as from the optional
+	# header, and the two readings are *compared* rather than merged. On this file they agree,
+	# which is a fact about the file and can be asserted.
+	identity = toolset.get("rich") or {}
+	if (identity.get("linker") or {}).get("build") != TOOL_BUILD:
+		bad.append("rich linker record: %r, expected the linker record at build %d"
+			% (identity.get("linker"), TOOL_BUILD))
+	if identity.get("linker_version") != "14.12":
+		bad.append("rich build -> toolset: %r, expected build %d to read as 14.12"
+			% (identity.get("linker_version"), TOOL_BUILD))
+	if toolset.get("agree") is not True:
+		bad.append("toolset cross-check: %r, on this file the two readings agree"
+			% toolset.get("agree"))
 	if not any(item["count"] for item in note.get("rich", [])):
 		bad.append("rich: every count read as 0 (LIEF 1.0 says `count`, not `number`)")
 	pdb = note.get("pdb") or {}

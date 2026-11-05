@@ -103,7 +103,7 @@ What Phase 3 learned, for whoever extends it:
   build (`-fcf-protection`, `-fstack-protector-strong` vs `-all`, `-fno-omit-frame-pointer`);
   they came free with the shape profile.
 
-**MS-0..MS-5: MSVC / PE targets, a separate track** - MS-0 through MS-3 implemented, MS-4/MS-5 not
+**MS-0..MS-5: MSVC / PE targets, a separate track** - MS-0 through MS-4 implemented, MS-5 not
 Measured against a real MSVC binary (`Tests/Proprietary/notepad.exe`) in
 [Docs/MSVC-Plan.md](MSVC-Plan.md), which is authoritative for that track: what a PE target already
 gives the tool (its build note, and `.pdata` - the compiler's own table of 186 function ranges,
@@ -113,7 +113,14 @@ onto a Linux machine, and why the byte gate cannot be promised for a `/GL`+`/LTC
 and MS-1 change nothing in the ELF path; MS-3 (COFF candidates) was the phase that makes `try`
 work on PE at all, and it does: the untouched source through `decomp try` at `cl /Od` is
 **100.00 % mean, 88 of 89 units past the gate**, with the COFF extent the tool derives matching
-the compiler's for all 89 (`python Tests/tools/check_coff_candidate.py`).
+the compiler's for all 89 (`python Tests/tools/check_coff_candidate.py`). MS-4 is the report
+side: the toolset read twice (the Rich header's own linker record, whose build number is the
+linker's version, cross-checked against the optional header) with the tool-id meanings and the
+per-front-end compiland counts, C++ and CRT/`/MT`-vs-`/MD` from the names a stripped PE still
+carries, `/std:` bounded by the toolset rather than invented, the full MSVC flag set in
+`build_flags` (`/Od|/O1|/O2`, `/MT`, `/GS-`, `/GL` with `/LTCG`), and an MSVC set of shape
+features so `detect` separates `/Od` from `/O1|/O2` on a PE - reporting the latter two as a
+class, because no shape tells them apart. `python Tests/tools/check_msvc_detect.py` is its gate.
 
 **Phase 4: C++ structure recovery** - done, 2026-11-04
 1. Identify vtables, constructors, and destructors from Ghidra data and RTTI where present.

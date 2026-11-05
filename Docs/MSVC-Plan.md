@@ -309,7 +309,8 @@ Four things §7 did not predict:
 
 Still open after MS-1, deliberately: `detect --range` still samples `.text` cut at every `ret`
 (`toolchain.target_shape`), so it does not use the unit table yet; MS-4's shape profiles should
-sample real units.
+sample real units. *(Closed by MS-4: `target_shape` samples `.pdata` records through
+`extract.pdata_records`.)*
 
 **MS-2: put a compiler on the machine.** *Done 2026-11-04 - v141 14.12 plus a usable Windows
 SDK; `Tests/tools/check_msvc_toolchain.py` exits 0.* The Windows SDK was the blocker earlier and
@@ -503,7 +504,9 @@ finding mirrored: at `-O2` in ELF the file's table is right about a *partition* 
 ranges hold the other part, so `original_function` joins them; here the file's table describes
 blocks and the candidate holds the function. What would close it belongs with MS-4: block groups
 of one function (`.text$mn`, `.text$mn$00`, `.text$x` - the same grouping MS-2's map parsing
-already had to see through) joined into one unit, exactly as a `.cold` partition is joined today.
+already had to see through) joined into one unit, exactly as a `.cold` partition is joined today
+*(asked of MS-4, and still open there: it needs a reader for the chained `UNWIND_INFO` that
+names the next block - see MS-4's closing note)*.
 Until then the variant is measured, reported, and not held to a number.
 
 A second `/O2` finding, and a warning for anyone who scores at `/O2`: **the negative controls stop
@@ -515,14 +518,90 @@ what a byte gate at `/O2` can promise, and it is why the wrong candidates are he
 categories for `/Od` only.
 
 
-**MS-4: say what an MSVC build is.** A Rich `build` → toolset table (cross-checked against the
-optional-header linker version, which independently said 14.12 here) and the tool-id meanings;
-MSVC members of `shape_profile`/`PROBE_SOURCE` (x64 `cl` uses `rsp`-relative locals and shadow
-space, never a frame pointer, no `endbr`, and a `/GS` guard call rather than a canary) so
-`detect` can answer `/Od` vs `/O1|/O2` and report `/GL`; C++/`-std` evidence from decorated
-names and the CRT import family instead of `.dynstr`/`_STD_MARKERS` (`toolchain.py:268,275`,
-both Itanium-only); `/std:c++…`, `/MT` vs `/MD`, `/GS-` and friends in `build_flags`
-(`toolchain.py:46`, which collapses everything to `/Od`|`/O2`).
+**MS-4: say what an MSVC build is.** *Done 2026-11-05.* `Tests/tools/check_msvc_detect.py` is
+the gate (six groups; exit 2 when there is no `cl` to probe with, 0 here). What it asked for and
+what it got:
+
+* **Rich `build` → toolset, with the tool-id meanings.** The product ids are Microsoft-internal;
+  the table `decomp.toolchain` now carries is the one RichHeaderResearch publishes
+  (`spoof_check.py`), and the parts the tool relies on are *measured on this machine*: **id 258
+  ("Linker1400") is link.exe's own record and its build number is the fourth component of that
+  linker's version** - `link.exe 14.12.25835.7` writes build 25835, and the gate asserts that
+  pair, so the table is anchored on a measurement and not on a lookup. `rich_identity` reads the
+  toolset from that record and `toolset_identity` **compares it** with the optional header's
+  linker version: on `notepad.exe` build 25711 reads as 14.12 and the header says 14.12, so the
+  report says the two readings agree; a disagreement is reported as "one of these headers was
+  rewritten after the link", which is the only useful thing to say about it.
+  *The reason the identity comes from id 258 and not from the largest build number*: id 147
+  ("Implib900", the import-library stubs) carries **build 30729 in the Windows OS binary of 2018
+  and in a file this machine linked today with 14.12.25835** - that number identifies nothing.
+  Id 1 ("Import0", always build 0) is recorded as a count. Both are excluded from the identity.
+* **The compiland counts, which are a second reading of `/GL` and of the language mix.** The
+  front-end records are per compiland: `notepad.exe` reports 23 C, 5 C++, 3 asm and **25
+  Utc1900_LTCG_C**, so `/GL` is confirmed from the object side, independent of the POGO
+  directory, and it survives stripping. Caveat, measured: a hello-world built here at `/MT`
+  reports *179* C++ records, because the CRT objects the link pulled in are counted too - so the
+  count says C++ is in the image, not how much of the program is.
+* **Language from decorated names, runtime from the import family.** `?terminate@@YAXXZ` in an
+  import table is a C++ name, so `language = c++` is claimed now, with `language_proof` naming
+  the evidence (MS-0 left it unset because an `msvcrt.dll` import proves nothing; a *decoration*
+  does). A PE's import *and export* names are read into the same carrier as an ELF's `.dynstr`,
+  because that is the only place a stripped PE keeps names. `msvc_runtime` classifies the CRT: the
+  UCRT (`api-ms-win-crt-*`, `ucrtbase`), the v14x `vcruntime`/`msvcp` pair, the per-version
+  `msvcrNN` (which toolset), and the downlevel `msvcrt.dll`; **no CRT DLL imported = the CRT is
+  in the file = `/MT`** - measured against a `/MD` and a `/MT` build of the same source, which
+  differ exactly that way. With a static CRT there is no decorated import to read, and the
+  front-end records become the (coarser, labelled as such) C++ evidence.
+* **`/std:` honesty.** MSVC decoration encodes no standard level, so `msvc_std_evidence` names
+  what the toolset does bound: the level it defaults to (c++14 for any v14x) and the levels it
+  has a switch for (c++17 from 14.16, c++20 from 14.2x) - labelled "proved by the toolset, not
+  by a name" in the report and in the config it writes.
+* **`build_flags` can say the flags instead of collapsing them**: `/Od`|`/O1`|`/O2` (three, not
+  two), `crt` → `/MT`|`/MD`, `guard: false` → `/GS-`, `ltcg` → `/GL` **with `/LTCG` added to
+  the link**, `comdat` → `/Gy` (opt-in, never implied, because it changes where a candidate's
+  extents come from - MS-3), `inline`, `fp`, `/std:`. `Tests/project.toml`'s existing MSVC
+  variants produce byte-identical flag lists, so MS-3's numbers still stand. `detect --write`
+  on a PE now also writes the toolset with both readings, the era to install (`--major 15
+  --msvc-version 15.5`), `ltcg = true`, and `crt = "md"|"mt"` from what the file imports.
+* **MSVC shape profiles.** `FEATURES_MSVC` replaces the Itanium set for an MSVC target/probe -
+  frame pointers, `endbr` and the `%fs:` canary are all identically zero on both sides of a PE,
+  so they carry no signal. What does, measured with this v141 `cl` over `PROBE_SOURCE` (shares
+  of bodies, or of instructions):
+
+  | level | locals off `%rsp` | args to home slots | `/GS` guard | calls/ins | xmm |
+  |---|---|---|---|---|---|
+  | `/Od` | 0.537 | **1.00** | 0.111 | 0.011 | 0.047 |
+  | `/O1` | 0.083 | 0.11 | 0.111 | 0.010 | 0.042 |
+  | `/O2` | 0.075 | 0.00 | 0.111 | 0.003 | **0.308** |
+  | `notepad.exe` | 0.118 | 0.037 | 0.156 | 0.087 | 0.002 |
+
+  `/Od` against the optimising levels is a fourfold gap and is what `detect` claims; `/O1`
+  against `/O2` is reported as a **class** (`level_class = /O1|/O2`), because the feature that
+  separates them here is `xmm` - whether `/O2` vectorises depends on whether the program has a
+  loop it can vectorise, which is a property of the code and not of the flags. On `notepad.exe`
+  (an `/O2` `/GL` build) the ranking is `/O1` 0.268, `/O2` 0.514, `/Od` 1.548 and the answer is
+  printed as "optimised cl code, `/O1` or `/O2`" - which is the honest ceiling for a GUI binary
+  with no float loops in it, and the tool says so rather than picking one. `/GS` on is reported
+  from the shape (16 % of this file's bodies check the guard).
+  Two bugs this found: `probe_signatures` keyed a COFF object's sections **by name**, and with
+  `/Gy` every function is its own `.text$mn`, so the probe had been measuring *one* body per
+  level (9 now); and the sample itself, see the next item.
+* **Sampling real units, which MS-1 had left open.** `target_shape` samples the file's own
+  function table when it has one: for an x64 PE that is `.pdata` (`extract.pdata_records`, the
+  same reader `try` uses), so `detect --range` and the shape score measure *units*, not a
+  disassembly cut at every `ret`. On `notepad.exe`: 135 of the 186 units are in the sample band
+  (mean 36.7 instructions), and inside `0x140012000-0x140018000`, 52 of the 75 records there -
+  never more bodies than the file names. **The ELF path did not move**: it still samples the
+  ret-cut stream and still scores the Itanium features, and group 6 of the gate asserts both
+  (as does `check_phase3_discovery.py`, unchanged).
+
+Not done, and it is not a `detect` problem: the `/O2` hot/cold **block-group join** MS-3 left
+here (joining `.text$mn`, `.text$mn$00`, `.text$x` into one unit, the mirror of Phase 5's
+`.cold` join). Both readings now exist - the image's `.pdata` names the blocks and the candidate's
+COMDATs name the function - but joining them needs the unwind chain (a chained `UNWIND_INFO`
+carries the target block's RVA), which is a reader of its own. `msvc-o2` therefore stays
+measured-and-not-gated at 91.40 % / 74 of 89 with its reason named.
+
 
 **MS-5 (after Design-Plan Phase 4): MSVC C++ structure.** vtables in PE are `.rdata` absolute
 RVAs - readable straight from the file, no relocation addends, unlike a PIE's `.data.rel.ro` -

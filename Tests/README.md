@@ -194,6 +194,31 @@ Exit 2 when there is no `cl`, no build, or no analysis of it.
 `decomp check` prints the same facts about the installed toolchain (versions, the toolset family,
 the Windows SDK state).
 
+## What an MSVC build is (MS-4)
+
+```sh
+PATH=$PWD/toolchains/msvc/bin/x64:$PATH WINEPREFIX=$PWD/.wine \
+  .venv/bin/python Tests/tools/check_msvc_detect.py
+```
+
+Six groups, and only two of them need a compiler. **(1) The toolset, read twice**: the Rich
+header's linker record (id 258) gives build 25711 on `notepad.exe`, which reads as the 14.12 its
+optional header states, so `agree` must be true; the records that name no toolset (id 1 at build
+0, id 147 at build 30729) must stay out of the identity — the same 30729 appears in a 2018 OS
+binary and in a file this machine links today, which is what the assertion is built on. The
+anchor group then builds a PE with the installed toolchain and requires its Rich build to equal
+the build `link.exe` prints in its own banner: the toolset table is anchored on a measured pair.
+**(2) Language and runtime**: C++ claimed from a decorated import and labelled with its proof, the
+CRT family named from the imports (UCRT / vcruntime / msvcrt / none = `/MT`), all of it checked
+against a `/MD` and a `/MT` build of the same source. **(3) `/std:`**: named as what the toolset
+bounds, with the levels a 14.12 compiler does not have. **(4) Flags**: `/Od|/O1|/O2` as three
+flags, `/MT`/`/MD`, `/GS-`, `/GL` with `/LTCG` on the link, and the `project.toml` `detect`
+writes for a PE parsed back and compiled. **(5) The shape profile**: `cl` probed at `/Od|/O1|/O2`,
+requiring `/Od` to be far from the optimising levels on the MSVC features and `detect` on the
+shipped `/O2 /GL` target to answer an optimising level while reporting `/O1|/O2` as a class, and
+reporting `/GS` from the code. **(6)** the ELF path — still the ret-cut sample, still the Itanium
+features. Exit 2 when there is no `cl` (groups 1-4 still run and are reported).
+
 ## The binary
 
 `main.cpp` only parses the mode and hands a `CSelfTest` to the three test classes:

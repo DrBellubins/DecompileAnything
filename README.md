@@ -20,7 +20,8 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
 | MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **done** - toolset v141 14.12 + Windows SDK 10.0.19041: `cl`/`link` build and run a PE under Wine, and the benchmark itself builds with `cl` at `/Od` and `/O2` with an 89/89 answer key (`python Tests/tools/check_msvc_toolchain.py`, exit 0) |
 | MS-3 | COFF candidates: `try` on a PE target, candidate extents from the object | **implemented** - the untouched source through `decomp try` at `cl /Od` is **100.00 % mean, 88 of 89 past the gate** (54 byte-identical: a `.o` keeps placeholder displacements, so bytes are reported, not required), and the extent the tool derives from the `.obj` equals the compiler's for **all 89 units**. Acceptance is `python Tests/tools/check_coff_candidate.py`; the one unit that does not pass is MSVC RTTI (MS-5) |
-| MS-4, MS-5 | what an MSVC build *is* (`/Od` vs `/O1|/O2`, `/GL`, `/std`, `/MT`), MSVC C++ structure (`.?AV…` RTTI) | not implemented |
+| MS-4 | what an MSVC build *is*: toolset (Rich + linker version, read twice and compared), `/Od` vs `/O1|/O2`, `/GL`, `/std:`, `/MT`, C++/CRT from names | **implemented** - the Rich product ids are named and the toolset is read from link.exe's own record (whose build number *is* its version: measured against the installed toolchain) and cross-checked against the optional header; the per-front-end compiland counts confirm `/GL` and the C/C++/asm mix; language comes from decorated names and the CRT family from the imports (`/MT` = no CRT DLL); `build_flags` carries `/Od|/O1|/O2`, `/MT|/MD`, `/GS-`, `/GL`+`/LTCG`, `/std:`; an MSVC set of shape features separates `/Od` from `/O1|/O2` (reported as a class - no shape tells those two apart) and the shape sample now walks `.pdata` units. Acceptance is `python Tests/tools/check_msvc_detect.py` |
+| MS-5 | MSVC C++ structure (`.?AV…` RTTI, `RTTICompleteObjectLocator`) | not implemented - it is the reason one unit of `check_coff_candidate.py` does not pass |
 
 ## Use it
 
@@ -126,6 +127,7 @@ prove (`basic_string_view` needs C++17). Measured on the benchmark, whose flags 
 | gcc-o0 | correct | `gcc-o0` | **-O0**, distance 0.94 vs 3.32 next |
 | gcc-o2 | correct | `gcc-o2` | **-O2** (0.31); "optimised code" is the strong part, the level is not |
 | gcc-o0-x86 | correct (32-bit, static, non-PIE) | `gcc-o0-x86` with `-m32 -no-pie -static` | **-O0**, 0.26 vs 3.08 next |
+| `Tests/Proprietary/notepad.exe` (MSVC, `/O2 /GL`) | correct, and the toolset read twice: link.exe 14.12 from the optional header **and** Rich build 25711, which read as 14.12, so the report says they agree | `msvc-o1` with `ltcg = true`, `crt = "md"`, `std = "c++14"` | **"optimised cl code, `/O1` or `/O2`"** - `/O1` 0.268, `/O2` 0.514, `/Od` 1.548: the class is the answer, the level is not (`check_msvc_detect.py`) |
 
 The `-O` answer is a *measurement*, not a claim: the reference snippets in
 `toolchain.PROBE_SOURCE` are compiled with the compilers installed here at `-O0..-O3`, and
@@ -135,7 +137,12 @@ loops). That is toolchain-specific on purpose - a candidate is going to be built
 toolchain. Two honest limits, both printed by the tool:
 
 * `-O1`/`-O2`/`-O3` shade into the same shape; what is firmly established is *"this is not
-  -O0"* (no frame pointer, no argument spilling). The report says which, with the margin.
+  -O0"* (no frame pointer, no argument spilling). The report says which, with the margin. On
+  `cl` the same limit has a name: `/O1` and `/O2` trade size against speed, and the only feature
+  that separates them here is whether `/O2` found a loop to vectorise - a property of the
+  program, not of the flags - so `detect` answers `/O1|/O2` **as a class** (`level_class`) and
+  says what it did establish (`/Od` against the rest is a fourfold gap in the MSVC features:
+  locals addressed off `%rsp`, arguments stored to their home slots).
 * A **statically linked** image is mostly somebody else's library code, and it outvotes the
   program. `detect` says so and asks for `--range <file addresses>` (or `--sample <name>`,
   which samples the cached analysis instead). Narrowed, the -m32 build reads as -O0 with a
@@ -143,10 +150,22 @@ toolchain. Two honest limits, both printed by the tool:
 
 For PE, the Rich header, the linker version and the debug directory are read: a real MSVC
 binary (`Tests/Proprietary/notepad.exe`) reports `compiler = msvc`, link.exe 14.12 = the v141
-(VS2017) toolset, every tool at Rich build id 25711, `/GL`+`/LTCG` from its POGO record, and
-the PDB's GUID with the address Microsoft serves that PDB from. `find`, `show`, `detect` and
-`detect --range` work on it (`python Tests/tools/check_pe_target.py`), and the report says
-plainly that a `/GL` image cannot be reproduced byte-for-byte by a single-file compile.
+(VS2017) toolset, `/GL`+`/LTCG` from its POGO record, and the PDB's GUID with the address
+Microsoft serves that PDB from. `find`, `show`, `detect` and `detect --range` work on it
+(`python Tests/tools/check_pe_target.py`), and the report says plainly that a `/GL` image cannot
+be reproduced byte-for-byte by a single-file compile.
+
+Since MS-4 the toolset is read **twice and compared**, because a PE that has been patched or
+re-stamped has headers that disagree. The Rich header's product ids have names (the table
+RichHeaderResearch publishes), and id 258 - "Linker1400" - is link.exe's own record: its build
+number is the fourth component of that linker's version, measured here against the installed
+toolchain (`link.exe 14.12.25835.7` writes 25835). `notepad.exe` says 25711 and its optional
+header says 14.12, so the report states that the two readings agree; a disagreement is reported
+as a rewritten header rather than resolved silently. The records whose numbers identify no toolset
+(id 1 always at build 0; id 147 at 30729, the same in a 2018 OS binary and in a file linked
+here today) are kept out of the answer. The front-end records are per compiland, so the report
+also says what the link was: 23 C, 5 C++, 3 asm, **25 through `/GL` codegen** - a second,
+independent confirmation of the POGO directory, and one that survives stripping.
 
 An x64 ELF carries one too, and since Phase 5 the tool reads it the same way: the `.eh_frame`
 FDE records name every unit that needs unwinding with its exact extent (on the `-O2` build, 138
@@ -166,10 +185,14 @@ overrides it), `show` prints the unit or the gap an invented function sits in, a
 what the table does not know. What is still missing on a PE is a candidate side at all -
 [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) §5-§7.
 
-`.dynstr` and `DT_NEEDED` say which C++ ABI and standard library a *stripped* ELF uses; on a
-PE the imports say which CRT it links (`msvcrt.dll` = the downlevel C runtime), which is a
-runtime, not a language - an MSVC binary's language comes from its decorated names, and that is
-MSVC-Plan MS-4.
+`.dynstr` and `DT_NEEDED` say which C++ ABI and standard library a *stripped* ELF uses. On a PE
+the same question is answered from the import and export names, which is all a stripped PE keeps:
+a **decorated** name (`?terminate@@YAXXZ`) is C++ and names the entity, while `msvcrt.dll` is a
+runtime and is reported as one (the downlevel CRT, not UCRT, not a `vcruntime`); the CRT family
+also says `/MD` versus `/MT` - no CRT DLL imported means the runtime is in the file - and which
+generation. MSVC decoration encodes no standard level, so what `detect` states for `/std:` is
+what the toolset bounds: the level it defaults to and the levels it has a switch for, labelled
+"proved by the toolset, not by a name".
 
 ## The group a request asks about (`decomp find`)
 
@@ -340,7 +363,9 @@ is MS-5.
 91.40 % mean, 74 of 89 past the gate. `cl /O2` implies `/Gy` (every function its own COMDAT, so
 an exact extent) *and* splits a function into hot and cold blocks, each its own COMDAT, so for 8
 units the image's `.pdata` names a **block** rather than the function. Joining those block groups
-is the MS-4/Phase-5 crossover item; [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) MS-3 has the numbers.
+is the MS-4/Phase-5 crossover item, and MS-4 left it open on purpose: both readings now exist
+(the image names the blocks, the candidate's COMDAT names the function), but joining them needs a
+reader for the chained `UNWIND_INFO` that names a function's next block. [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) MS-3 and MS-4 have the numbers and what it needs.
 
 Only the -O0 row gated this table before Phase 5; now all three are measured the same way and
 the -O2 row is in the same order of magnitude as the -O0 one. At -O0 the untouched source is
@@ -378,7 +403,8 @@ all three scripts print OK on this machine).
   Phase 5 evidence for that.
 * The `-O` inference samples the file's `.text` cut at every `ret` when there is no analysis
   to take real boundaries from; with a cached analysis and `--sample <name>` it uses the real
-  ones. For a statically linked target the answer needs `--range` (see above).
+  ones, and for an x64 PE it uses the file's own `.pdata` units even without an analysis
+  (MS-4). For a statically linked target the answer needs `--range` (see above).
 * A PE/MSVC target: `analyze` works on one (236 functions out of `Tests/Proprietary/notepad.exe`,
   ~140 s), and since MS-0 so do the build note, `find`, `show` and `detect` (its report names
   the v141 toolset, `/GL`+`/LTCG`, and the public PDB that carries the answer key); since MS-1
@@ -389,7 +415,9 @@ all three scripts print OK on this machine).
   `extract.CandidateObject` with each function in its own `.text$mn`, and `cl` **links**: the
   benchmark's own test binary builds with `cl` and runs under Wine (`Tests/eval.py build
   --variant msvc-o0`, 89 units of its own answer key, `selfcheck` 89 cases 0 failures), and
-  `detect --probe` measures `cl /Od|/O1|/O2` shapes. And since MS-3 **`try` works on a PE
+  `detect --probe` measures `cl /Od|/O1|/O2` shapes and `detect` separates `/Od` from
+  `/O1|/O2` on a real MSVC target, reporting the latter as a class, reading `/GS` off the shape
+  and `/GL` off both the debug directory and the linker's own compiland records (MS-4). And since MS-3 **`try` works on a PE
   target**: the candidate side reads a COFF object - extents from the COMDAT section or from the
   next function symbol in the section minus `cl`'s inter-function padding, relocations with no
   addend field (the bytes carry the implied one), references resolved through the symbol *table
@@ -418,8 +446,10 @@ all three scripts print OK on this machine).
   nothing to pair on: the original side can only call it the address Ghidra drew, the candidate
   side calls it the object that covers that offset. That is the one unit below the gate at -O2
   (STRUCT-24, 96.36 %), named in `Tests/tools/check_phase5_o2.py`.
-* `detect --range` still samples a PE's `.text` cut at every `ret` rather than over the unit
-  table it now has. MS-4's shape profiles should sample the units.
+* `detect --range` samples a PE over the units its own `.pdata` names (since MS-4), and an ELF
+  over the ret-cut stream (since Phase 3): the two are different sample sources on purpose, and
+  `check_msvc_detect.py` group 6 asserts neither one changes. An ELF `detect` could be moved onto
+  the `.eh_frame` units it already reads; nothing measured here says it needs to.
 * `.pdata` is the compiler's function table **only for functions that need unwinding**: measured on
   a `cl /Od` build of this benchmark, 12 of 89 units have no unwind record, and they are exactly
   the functions with no prologue and no epilogue (shadow space only, no `rsp` change, no call,

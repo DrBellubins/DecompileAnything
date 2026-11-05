@@ -588,7 +588,8 @@ def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=
 		profile, _note, problems = toolchain.target_shape(target, rng=rng, note=note)
 		out["problems"].extend(problems)
 		out["sample"] = {"source": "%s, bodies of %d-%d instructions%s" % (
-			"the executable sections of the file (cut at every ret)", *toolchain.BAND,
+			profile.get("sample_source")
+			or "the executable sections of the file (cut at every ret)", *toolchain.BAND,
 			" in --range" if rng else "")}
 		out["sample"]["range"] = [hex(rng[0]), hex(rng[1])] if rng else None
 	out["profile"] = profile
@@ -686,7 +687,8 @@ def detect(
 	echo()
 	echo("code shape (%s):" % outcome["sample"].get("source", "the target"))
 	if profile:
-		for line in toolchain.profile_lines(profile):
+		for line in toolchain.profile_lines(profile,
+				features=toolchain.feature_family((note.get("compiler") or ""))):
 				echo(line)
 	else:
 		for problem in outcome["problems"]:
@@ -694,6 +696,9 @@ def detect(
 	warning = outcome.get("sample_warning") or ""
 	if warning:
 		echo("  caution: %s" % warning)
+	if toolchain.msvc(note.get("compiler")):
+		for line in toolchain.msvc_shape_flags(profile):
+			echo("  %s" % line)
 
 	if probe and ranked:
 		echo()
@@ -703,6 +708,9 @@ def detect(
 				item["distance"], item.get("runner_up", item["distance"])))
 		echo()
 		echo("optimize = %s  (%s)" % (guess["optimize"], guess.get("confidence")))
+		if guess.get("level_class"):
+			echo("  as a flag this is %s: the config picks the nearer one, %s" % (
+				guess["level_class"], toolchain._MSVC_OPTIMIZE.get(int(guess["optimize"]), "?")))
 		echo("  why: %s" % guess.get("why"))
 		if warning:
 			echo("  caution: the sample warning above applies to this answer")

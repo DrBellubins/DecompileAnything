@@ -266,6 +266,26 @@ def file_address_base(binary) -> int:
 	return 0
 
 
+def pdata_records(binary) -> list[tuple[int, int, int]]:
+	"""(begin, end, unwind) for every `.pdata` record, in the **file's own** addresses.
+
+	Only the bytes the file initialises are walked: a PE section's `size` is its virtual size,
+	which pads past the end of the table, and reading that padding as records would invent
+	zero-length units (Docs/MSVC-Plan.md MS-1). The records are RVAs: bias them by
+	`file_address_base` to meet the addresses the analysis and this tool use.
+	"""
+	section = next((item for item in binary.sections if str(item.name) == ".pdata"), None)
+	if section is None or not section.size:
+		return []
+	data = bytes(section.content)
+	records = []
+	for position in range(0, len(data) - len(data) % _PDATA_RECORD.size, _PDATA_RECORD.size):
+		begin, end, unwind = _PDATA_RECORD.unpack_from(data, position)
+		if end > begin:
+			records.append((int(begin), int(end), int(unwind)))
+	return records
+
+
 class TargetImage:
 	"""Byte access into the analysed file, by the address the *analysis* uses."""
 
@@ -370,29 +390,22 @@ class TargetImage:
 	def _read_pdata(self, binary) -> None:
 		"""`.pdata`, the (begin, end, unwind) table an x64 PE carries.
 
-		Only the bytes the file initialises are walked: a PE section's `size` is its virtual
-		size, which pads past the table, and reading that padding as records would invent
-		zero-length units.
+		The walk itself is `pdata_records` below, so that a caller which wants the file's units
+		without a byte index - `toolchain.target_shape`, which samples them - reads exactly the
+		table `try` compares against.
 		"""
-		section = next((item for item in binary.sections if str(item.name) == ".pdata"), None)
-		if section is None or not section.size:
+		records = pdata_records(binary)
+		if not records:
 			self.unit_note = "no .pdata section: this PE carries no function table"
 			return
-		data = bytes(section.content)
 		bias = file_address_base(binary)
-		count = skipped = 0
-		for position in range(0, len(data) - len(data) % _PDATA_RECORD.size, _PDATA_RECORD.size):
-			begin, end, unwind = _PDATA_RECORD.unpack_from(data, position)
-			if end <= begin:
-				skipped += 1
-				continue
+		count = 0
+		for begin, end, unwind in records:
 			count += self._add_unit(".pdata", int(begin) + bias, int(end) + bias,
 				int(unwind) + bias)
 		self.unit_source = ".pdata"
 		if not count:
 			self.unit_note = ".pdata holds no readable function record"
-		elif skipped:
-			self.unit_note = "%d .pdata record(s) skipped: end <= begin" % skipped
 
 	def _read_eh_frame(self, binary) -> int:
 		"""Every FDE in `.eh_frame`: (initial pc, address range) for one partition of a function.
