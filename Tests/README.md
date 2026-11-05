@@ -164,6 +164,33 @@ the count from each source and falls back to symbol spacing for the extents it c
 * **`/link` comes last.** `/Fe:` and the objects precede it; an object after `/link` is
   `cl : Command line error D8003 : missing source filename`.
 
+## Scoring a COFF candidate against a PE target (MS-3)
+
+With the benchmark built (`msvc-o0`) and analysed once, the whole loop runs on a PE:
+
+```sh
+.venv/bin/decomp analyze Tests/build/msvc-o0/da_tests.stripped --variant msvc-o0
+.venv/bin/python Tests/tools/check_coff_candidate.py            # puts the repo's own
+                                                                # toolchains/msvc/bin/x64 on PATH
+```
+
+Three groups, in the order the risk falls. **(1) Extents** - a COFF symbol has no size and no
+function flag, so this is the part that can silently compare the wrong bytes: for every unit, what
+`extract.CandidateObject` derives must equal what the original side reads (the image's `.pdata`
+where it names the function, the analysis' body where it does not). All 89 agree; the script prints
+how many came from a COMDAT section and how many from the next symbol in the section. **(2) The
+loop** - the untouched source through `decomp try` for every unit, the same call
+(`cli.score_candidate`), the same threshold and the same KNOWN_GAPS discipline as
+`check_phase2_try.py`: **100.00 % mean, 88 of 89 past the gate**, the one exception being MSVC
+RTTI (MS-5), named in the script with its reason. **(3) The wrong candidates** of
+`Tests/examples/candidate_math_bad.cpp`, built by `cl`, still reported as the kind of wrong they
+are. `msvc-o2` runs the same script over the `/O2` build and is **measured but not gated** (no
+`KNOWN_GAPS` entry = report, don't fail): 91.40 % mean, 74 of 89 past the gate, because `cl /O2`
+splits a function into hot and cold COMDAT blocks and the image's `.pdata` then names a block.
+Group 3 is held to its categories for `/Od` only: at `/O2` the optimiser can make a deliberately
+wrong candidate score 100 %, which is a fact about the gate, not a bug in the report.
+Exit 2 when there is no `cl`, no build, or no analysis of it.
+
 `decomp check` prints the same facts about the installed toolchain (versions, the toolset family,
 the Windows SDK state).
 

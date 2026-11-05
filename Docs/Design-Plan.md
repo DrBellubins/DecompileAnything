@@ -103,15 +103,17 @@ What Phase 3 learned, for whoever extends it:
   build (`-fcf-protection`, `-fstack-protector-strong` vs `-all`, `-fno-omit-frame-pointer`);
   they came free with the shape profile.
 
-**MS-0..MS-5: MSVC / PE targets, a separate track** - MS-0 and MS-1 implemented, the rest not
+**MS-0..MS-5: MSVC / PE targets, a separate track** - MS-0 through MS-3 implemented, MS-4/MS-5 not
 Measured against a real MSVC binary (`Tests/Proprietary/notepad.exe`) in
 [Docs/MSVC-Plan.md](MSVC-Plan.md), which is authoritative for that track: what a PE target already
 gives the tool (its build note, and `.pdata` - the compiler's own table of 186 function ranges,
 which MS-1 now caches, prefers for a unit's extent, and reports its disagreement with the
 analysis over), what broke before MS-0 (`find`, `show`, `try`, `detect --range`), how to get `cl`
 onto a Linux machine, and why the byte gate cannot be promised for a `/GL`+`/LTCG` target. MS-0
-and MS-1 change nothing in the ELF path; MS-3 (COFF candidates) is the phase that makes `try`
-work on PE at all.
+and MS-1 change nothing in the ELF path; MS-3 (COFF candidates) was the phase that makes `try`
+work on PE at all, and it does: the untouched source through `decomp try` at `cl /Od` is
+**100.00 % mean, 88 of 89 units past the gate**, with the COFF extent the tool derives matching
+the compiler's for all 89 (`python Tests/tools/check_coff_candidate.py`).
 
 **Phase 4: C++ structure recovery** - done, 2026-11-04
 1. Identify vtables, constructors, and destructors from Ghidra data and RTTI where present.

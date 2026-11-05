@@ -76,7 +76,7 @@ def format_instruction(mnemonic: str, operands: str) -> str:
 # so they can never be compared by name - they become positional tokens instead.
 _SYNTHETIC = (
 	re.compile(r"^(FUN|DAT|LAB|s|u|x|ptr)_[0-9a-fA-F]{4,}$"),           # Ghidra, no symbol
-	re.compile(r"^(PTR_|s_|u_).*_[0-9a-fA-F]{4,8}$"),                   # Ghidra, named data
+	re.compile(r"^(PTR_|s_|u_).*_[0-9a-fA-F]{4,16}$"),                  # Ghidra, named data
 	re.compile(r"^(switch|casegroup|block|switchcasegroup|thin|noextend)[_.]"),
 	re.compile(r"^\.(L|LC|LFB|LFE|BB)"),                                # assembler locals
 	re.compile(r"^\.text\.|^\.data\.|^\.bss\."),                        # section names as names

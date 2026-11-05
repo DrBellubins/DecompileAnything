@@ -69,7 +69,14 @@ def driver_form(compiler: str, flags: list[str], sources: list[Path], object_pat
 	"""The command line for one build, in the form this driver accepts (`-c -o` vs `/c /Fo`)."""
 	command = [compiler, *flags]
 	msvc_driver = msvc(compiler)
-	for include in [*(includes or []), *(Path(source).parent for source in sources)]:
+	# Every source's own directory goes on the include path, so a candidate beside a generated
+	# `types.h` builds with no extra flags (Design-Plan Phase 4) - but not for `cl`, which
+	# searches the includer's directory for *quoted* includes already and would put this
+	# project's `math.h` on the angle-bracket path, where the C runtime's own `<math.h>` is
+	# what `<cmath>` asks for. Measured (Docs/MSVC-Plan.md MS-3): `#include <a.h>` in a file
+	# next to `a.h` is "Cannot open include file" from `cl` with no /I for that directory.
+	source_dirs = () if msvc_driver else (Path(source).parent for source in sources)
+	for include in [*(includes or []), *source_dirs]:
 		command += [("/I" if msvc_driver else "-I"), str(Path(include))]
 	command += ["/c"] if msvc_driver else ["-c"]
 	if msvc_driver:

@@ -19,7 +19,8 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
 | MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **done** - toolset v141 14.12 + Windows SDK 10.0.19041: `cl`/`link` build and run a PE under Wine, and the benchmark itself builds with `cl` at `/Od` and `/O2` with an 89/89 answer key (`python Tests/tools/check_msvc_toolchain.py`, exit 0) |
-| MS-3..MS-5 | COFF candidates for `try`, MSVC flags, MSVC C++ | not implemented |
+| MS-3 | COFF candidates: `try` on a PE target, candidate extents from the object | **implemented** - the untouched source through `decomp try` at `cl /Od` is **100.00 % mean, 88 of 89 past the gate** (54 byte-identical: a `.o` keeps placeholder displacements, so bytes are reported, not required), and the extent the tool derives from the `.obj` equals the compiler's for **all 89 units**. Acceptance is `python Tests/tools/check_coff_candidate.py`; the one unit that does not pass is MSVC RTTI (MS-5) |
+| MS-4, MS-5 | what an MSVC build *is* (`/Od` vs `/O1|/O2`, `/GL`, `/std`, `/MT`), MSVC C++ structure (`.?AV…` RTTI) | not implemented |
 
 ## Use it
 
@@ -325,6 +326,21 @@ binutils only):
 | gcc-o0 (x86-64) | 89 / 89 | **100.00 %** | 54 | **89 / 89** | 99.53 %, 83 / 89 |
 | gcc-o0-x86 (-m32, static) | 89 / 89 | 99.38 % | 58 | 81 / 89 | 87.19 %, 11 / 89 |
 | gcc-o2 (x86-64) | 89 / 89 | **99.91 %** | 55 | **88 / 89** | 98.27 %, 72 / 89 |
+| msvc-o0 (`cl /Od`, x86-64 PE) | 89 / 89 | **100.00 %** | 54 | **88 / 89** | - (the answer key is `.pdata` + `link /MAP`) |
+
+The last row is the same loop against a **PE target with a COFF candidate** (`cl` under Wine, the
+toolchain of [Docs/Setup.md](Docs/Setup.md) §6) and is gated by its own script,
+`python Tests/tools/check_coff_candidate.py`, which also requires that the extent the tool reads
+out of the `.obj` is the compiler's for all 89 units. Its one gap is MSVC RTTI: the `.obj` names
+each type descriptor by symbol (`??_R0?AVCVehicleEntity@`) while the target side can only repeat
+the data type Ghidra applied to all three (`RTTI_Type_Descriptor`), so nothing pairs them - that
+is MS-5.
+
+`msvc-o2` (the same script, `--variant msvc-o2`) is **measured but not gated**: 89/89 scored,
+91.40 % mean, 74 of 89 past the gate. `cl /O2` implies `/Gy` (every function its own COMDAT, so
+an exact extent) *and* splits a function into hot and cold blocks, each its own COMDAT, so for 8
+units the image's `.pdata` names a **block** rather than the function. Joining those block groups
+is the MS-4/Phase-5 crossover item; [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) MS-3 has the numbers.
 
 Only the -O0 row gated this table before Phase 5; now all three are measured the same way and
 the -O2 row is in the same order of magnitude as the -O0 one. At -O0 the untouched source is
@@ -373,8 +389,12 @@ all three scripts print OK on this machine).
   `extract.CandidateObject` with each function in its own `.text$mn`, and `cl` **links**: the
   benchmark's own test binary builds with `cl` and runs under Wine (`Tests/eval.py build
   --variant msvc-o0`, 89 units of its own answer key, `selfcheck` 89 cases 0 failures), and
-  `detect --probe` measures `cl /Od|/O1|/O2` shapes. Still missing: `try` on a COFF candidate
-  (MS-3 - the section-as-extent and no-addend relocation rules).
+  `detect --probe` measures `cl /Od|/O1|/O2` shapes. And since MS-3 **`try` works on a PE
+  target**: the candidate side reads a COFF object - extents from the COMDAT section or from the
+  next function symbol in the section minus `cl`'s inter-function padding, relocations with no
+  addend field (the bytes carry the implied one), references resolved through the symbol *table
+  index* LIEF's own list does not index. That is the row in the table above and
+  `python Tests/tools/check_coff_candidate.py`.
   [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) measures all of it and phases the work.
 * Ghidra's function boundaries at `-O2` differ from the compiler's, and a `-O2` body can be split
   across `.text` and `.text.unlikely`. `extract` now takes the unit's extent from the file's own
@@ -407,6 +427,21 @@ all three scripts print OK on this machine).
   PE the unit table under-counts and the extents of those functions come from the next named
   boundary instead - `Tests/eval.py` prints the two counts; MS-1's `original_function` falls back
   to the analysis' body for such an entry, which is the honest answer but not the compiler's.
+* A COFF **object** is not a PE: it may name several sections the same thing (`.text$mn` five
+  times in one object), it has no symbol sizes and no function flag, its relocations have no
+  addend, and its symbols are typed rather than sized. Two rules follow from that and are worth
+  knowing before extending it: a section is keyed by file position, never by name; and a function's
+  extent is its COMDAT when it has one, otherwise the next function symbol in the section **minus
+  the trailing `int 3`/`nop` run** - cut by decoding, since a real instruction may end in `0xcc`.
+  An object's own `.pdata` is not an extent source (its fields are section-relative offsets and
+  its relocations name the section, not the function).
+* `cl` does not search the includer's directory for `<angle-bracket>` includes, and it *does*
+  search every `/I` directory for them. So a project header named `math.h` must never be on the
+  include path of an MSVC build: the C runtime's own `<math.h>` resolves to it and the CRT headers
+  do not compile. `driver_form` therefore adds the source's own directory only for non-MSVC
+  drivers, and `Tests/project.toml` lists one include directory.
+* A PE/MSVC target's invented names are only recognised as invented if the pattern covers a 64-bit
+  address: `s_<literal>_140023260` is Ghidra's, not a name the candidate could ever agree with.
 * Structure recovery names classes, bases, vtable slots and member **offsets**; it does not
   recover member **names** or **types** (the generated header writes `f0x8` and an inferred
   `int`, and says so), it assumes single inheritance, and it reads Itanium RTTI only - an MSVC

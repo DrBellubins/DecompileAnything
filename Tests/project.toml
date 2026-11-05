@@ -8,8 +8,16 @@ linkflags = []
 
 # Where a candidate may find the headers of the program being decompiled. `decomp try` adds
 # these as -I when it builds a candidate (Docs/Design-Plan.md, Phase 2). A relative path is
-# relative to this file.
-include_dirs = ["TestBinary", "TestBinary/TestFunctions"]
+# relative to this file. `decomp.compile.driver_form` also adds the directory of every source,
+# so a header beside the file that includes it never needs an entry here.
+#
+# Only the top source directory is listed, and that is deliberate: `TestBinary/TestFunctions`
+# on the include path puts this project's `math.h` where `cl` searches angle-bracket includes,
+# so the C runtime's `<math.h>` - which `<cmath>` includes - resolves to it and the candidate
+# does not build. GCC's `<cmath>` escapes the same trap with `#include_next`; `cl` has no such
+# thing (Docs/MSVC-Plan.md MS-2). Every include in the benchmark is relative, so nothing needs
+# that directory.
+include_dirs = ["TestBinary"]
 
 # The analysis side, read by the `decomp` CLI (Docs/Setup.md §3). eval.py ignores this
 # table; both tools read the same file on purpose. cache_dir is relative to this file, so

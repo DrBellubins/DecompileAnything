@@ -53,7 +53,7 @@ request ──► 1 Set up ──► 2 Scope ──► 3 Recover ──► 4 Rea
 
 `decomp` reports facts and scores; it never edits source. You write the source, it tells you how far the compiled result is from the original. Everything except `analyze` reads a cache and runs in ~0.1 s, so iterate freely. Run it as `decomp` (it lives in the repo's `.venv/bin`; activate the venv or add that to PATH).
 
-**Scoring support today:** `try` (the compile-and-diff step) works for x86, 32 and 64-bit, built by GCC or Clang-style toolchains. For PE/MSVC targets `try` does not work yet, and for other architectures there is no scoring. See *When matching is not possible* before promising a match.
+**Scoring support today:** `try` (the compile-and-diff step) works for x86, 32 and 64-bit, built by GCC/Clang-style toolchains **or by MSVC** (an ELF target with an ELF candidate, a PE target with a COFF candidate built by `cl`). For other architectures there is no scoring. See *When matching is not possible* before promising a match.
 
 ## Step 1: Set up the project and fix the threshold
 
@@ -183,7 +183,7 @@ End with a `MATCH_REPORT.md` and a short summary in your reply. Be plain about s
 
 ## When matching is not possible
 
-- **PE / MSVC targets.** `detect`, `analyze`, `find` and `show` work; `try` does not yet (no COFF candidate support). That is a known gap, so do not debug it mid-task. Still do Steps 1 to 2 and write readable source from `show`, but label every function **unscored** in the report and never describe it as matched. Read `references/msvc.md` for the toolchain, Wine setup and `.pdata` behaviour.
+- **PE / MSVC targets.** `detect`, `analyze`, `find`, `show` and `try` all work - a candidate is compiled to a `.obj` and scored against the PE. What is missing is `decomp types` (MSVC RTTI is a different format, `MS-5`), so a unit that reaches a type descriptor or a vtable can report a relocation difference the candidate did not cause: name that reason in the report instead of chasing it. Read `references/msvc.md` for the toolchain, Wine setup, `.pdata` behaviour and the COFF candidate rules.
 - **Other architectures (ARM, etc.).** `analyze`, `find` and `show` may work, but there is no scoring. Same rule: deliver readable, **unscored** reconstructions, labelled as such.
 - **Non-native targets** (JS, .NET, Java/Android, Python bytecode). Byte-matching does not apply. Use Understand mode and the router tools to recover source, and say that the result is a decompilation, not a byte-match.
 - **Working on `decomp` itself or its benchmark** (not decompiling a user's target): read `references/decomp-dev.md`.
@@ -264,5 +264,5 @@ Go: `go version -m T` alone usually answers the question.
 
 ## Reference files
 
-- `references/msvc.md`: PE/MSVC targets: what works, the MSVC toolchain under Wine, `.pdata` function table. Read when the target is a PE built by MSVC.
+- `references/msvc.md`: PE/MSVC targets: what works, the MSVC toolchain under Wine, the `.pdata` function table, the COFF candidate rules. Read when the target is a PE built by MSVC.
 - `references/decomp-dev.md`: building and checking `decomp` and its benchmark. Read only when editing the tool, the test binary or the benchmark, never when decompiling a user's target.

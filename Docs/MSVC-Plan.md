@@ -412,19 +412,108 @@ Measured now, with the real thing (all of it in `check_msvc_toolchain.py`, group
 Deliberately not here: reading COFF *candidate* symbols, which is MS-3 (the probe objects above
 are the evidence for it).
 
-**MS-3: the COFF candidate side - this is where `try` starts working on PE.**
-`extract.CandidateObject` (`extract.py:334`) needs a COFF branch: sections and relocations come
-from `section.relocations`, **COFF symbols carry no size and no function flag** - the extent of
-a function is its COMDAT section (`.text$<name>`, MSVC's default `/Gy`, which gives *exact*
-sizes, better than ELF's symbol sizes) or the object's own `.pdata` entry. COFF relocations
-have **no addend**: `AMD64_REL32`/`ADDR32NB` take the value already in the bytes as an implied
-addend, which replaces the ELF ".o relocates a section, the addend is the offset" rule in
-`extract.py`. `normalize.py`'s tokeniser needs no change (x86-64 is already supported, and the
-relocated field sits at the same offset capstone reports). `compile.py:60` currently refuses a
-non-standard candidate suffix for MSVC drivers - use `/Tp` instead of refusing.
-*Check:* a PE port of `check_phase2_try.py`: the untouched source through `decomp try` for every
-benchmark unit at `msvc /Od` (expected: byte-identical for the free functions) and the
-deliberately wrong candidates still classified correctly.
+**MS-3: the COFF candidate side - this is where `try` starts working on PE.** *Done
+2026-11-05.* `extract.CandidateObject` has a COFF branch: sections keyed by file position, a
+symbol table read for names and types only, extents derived (COMDAT section, or next function
+symbol in the section minus `cl`'s inter-function padding), and relocations read per section with
+the value in the bytes as the implied addend. `Tests/tools/check_coff_candidate.py` is the gate:
+**89/89 units scored, mean 100.00 %, 88 of 89 past the gate, 54 byte-identical**, and the one
+that is not is STRUCT-24, whose reason is MS-5 (below). Group 1 of that script is MS-3's actual
+claim, measured before any candidate is judged: for **all 89 units** of the benchmark, the extent
+the tool reads out of the `.obj` equals the extent the *original* side compares (`.pdata` where
+the image has a record for the function, the analysis' body where it does not). Group 3 re-runs
+the wrong candidates of `Tests/examples/candidate_math_bad.cpp` built by `cl` - all three are
+still reported as the kind of wrong they are, with the same judgement as the ELF gate; only the
+category sets differ, because `cl` at `/Od` aligns the two streams differently than GCC.
+
+What the format actually is, measured on the benchmark's own `Tests/build/msvc-o0/*.obj`:
+
+* **A COFF object may give several sections the same name.** `link` takes one COMDAT per
+  `.text$mn` and there are five in `math.obj` (14 695, 60, 29, 37, 14 bytes), plus repeated
+  `.pdata`/`.xdata`. A name cannot be the key for anything: `CandidateObject` now keeps sections
+  in file order (`_section_order`, `_section_of_index`) and only disambiguates a *duplicated*
+  name (`.text$mn#1`), so an ELF key stays exactly the section name it always was.
+* **`lief`'s `relocation.symbol_idx` is the raw COFF record index, auxiliaries included; its
+  `binary.symbols` has folded the auxiliary entries away.** Indexing the list with it gives every
+  call in the object the wrong callee: the `AMD64_REL32` of the self-recursive call in
+  `FibonacciRecursive` names index 251, which is that function in the file and
+  `?SolveQuadraticRoot@…` ten symbols into LIEF's list (`dumpbin /disasm` says `?FibonacciRecursive`,
+  and it is right). The index has to be rebuilt by walking the table and adding each entry's own
+  `auxiliary_symbols` count - `_coff_symbol_table`. This one bug was worth 12 units.
+* **A COFF symbol names no size and no function.** LIEF reads the type bits as `is_function`
+  (`DT_FUNCTION`), and the extent comes from the section: for a `/Gy` COMDAT the section *is* the
+  function (exact, better than ELF's `st_size`), and otherwise the next function symbol in the
+  section, **minus the trailing `int 3`/`nop` run** - `cl` aligns functions to 16 bytes, so
+  `AbsDiff` is 49 bytes and its next symbol is 64 along. Cutting that run by counting filler bytes
+  is wrong: 12 units have a last real instruction whose encoding ends in `0xcc`/`0x90` (measured),
+  so `_code_extent` decodes and cuts at the last instruction that is not padding. That is exact for
+  all 89. The object's own `.pdata` is *not* a usable extent source here: its record fields hold
+  the section-relative offsets (a COMDAT's reads `0x0, 0x3c, 0`) and its relocations name the
+  section and `$LN` labels, so nothing there identified a unit exactly; the image's `.pdata`
+  (MS-1) remains the one that does.
+* **A COFF relocation has no addend field**, only "fix the field at this offset against this
+  symbol", so the number already in the bytes is the implied addend (that is why a `.pdata` record
+  reads as it does). Widths come from the relocation type (`_COFF_FIELD_WIDTH`) when LIEF does not
+  fill `size`.
+* **A COFF relocation that names a symbol never means "the object at this offset in the
+  section".** The ELF rule (a relocation against a section symbol carries the offset inside it as
+  the addend) misapplied to `strncpy`, a CRT import, and paired the call with whatever symbol sat
+  at offset 0 of `.text$mn`. In COFF only a *nameless* relocation is a section-relative
+  reference; a named one resolves through the symbol - which is also why the section of the named
+  symbol is taken from the table index rather than from the name.
+* **An object types its undefined externals, and that says whether a reference reaches a
+  function or data.** `/GS` code reaches `__security_cookie` through a rip-relative slot; as an
+  "external" it became a symbol token that could not pair with the data object the image has
+  there, and it cost the string/struct units. `Ref.kind` now follows the COFF type.
+* `cl` **does not search the including file's directory for `<angle>` includes** - measured:
+  `#include <a.h>` in a file next to `a.h` is "Cannot open include file". So
+  `driver_form` must not add each source's own directory as `/I` for an MSVC driver: that puts
+  this project's `math.h` where the C runtime's `<math.h>` is looked for and the CRT headers fail
+  to build (the same trap MS-2 found for `eval.py`; `Tests/project.toml`'s `include_dirs` now
+  lists only the top source directory and says why). Quoted includes still resolve - `cl` searches
+  the includer's directory for those.
+* Ghidra's invented names are only synthetic if you recognise them: `s_<literal>_<address>` with a
+  9-digit PE address slipped past the `{4,8}`-hex-digit pattern, so a PE's string literals counted
+  as *named* objects and every reference to one was reported as a relocation difference. The
+  pattern now covers an address of any realistic width.
+* `--fn` accepts the identifier part of a decorated name (`?AbsDiff@CMathTests@@SAHHH@Z` is found
+  by `AbsDiff`), which is what a model reading a source file knows. The decorated form stays the
+  comparison key: `c++filt` cannot read MSVC names (§8).
+* **Byte-identity is still 54 of 89, and that is the honest number.** A `.o` keeps a
+  `00 00 00 00` displacement where the link writes the final one, so a unit that reaches anything
+  outside itself cannot be byte-equal to the linked image - at any `-O`, for either format. The
+  instruction stream and the symbol tokens are what is compared; `bytes_equal` is reported, not
+  required.
+
+STRUCT-24 is the one unit the untouched source does not pass, and it is MS-5's job: the `.obj`
+names all three type descriptors by symbol (`??_R0?AVCVehicleEntity@`, `??_R0?AVCEntityBase@`,
+`??_R0?AVCCharacterEntity@`), while the target side can only repeat the *data type* Ghidra
+applied to all three (`RTTI_Type_Descriptor`) - nothing on the target side says which descriptor
+is which, so no token pairs. MS-5's model of `RTTICompleteObjectLocator`/`.?AV…` is what would
+name them. **Measured and not gated: `msvc-o2`** (`--variant msvc-o2`, 89/89 scored, **91.40 % mean, 74 of
+89 past the gate**, extents agreeing for 81 of 89). Two things happen at `/O2` and neither is a
+COFF-reading problem. `/O2` implies `/Gy`, so *every* function is its own COMDAT - all 223
+candidate functions in this benchmark's three objects are COMDATs, which is the exact-extent path,
+and it is the /Od build that is the awkward one. And `/O2` also splits a function into hot and
+cold blocks, each its own COMDAT, and `link` emits a `.pdata` record **per block**: for 8 units the
+record the analysis' address lands on is a block of the function, not the function (Crc32OfBuffer's
+unit is 5 bytes, Base64Encode's 4, TextToIntList's 20, EntityHealthTotal's 28) while the
+candidate's entry COMDAT is the whole hot block (291, 463, 187, 105 bytes). That is Phase 5's
+finding mirrored: at `-O2` in ELF the file's table is right about a *partition* and the analysis'
+ranges hold the other part, so `original_function` joins them; here the file's table describes
+blocks and the candidate holds the function. What would close it belongs with MS-4: block groups
+of one function (`.text$mn`, `.text$mn$00`, `.text$x` - the same grouping MS-2's map parsing
+already had to see through) joined into one unit, exactly as a `.cold` partition is joined today.
+Until then the variant is measured, reported, and not held to a number.
+
+A second `/O2` finding, and a warning for anyone who scores at `/O2`: **the negative controls stop
+meaning what they do at `/Od`**. `LengthOfProbe` - a counted loop where the original has a sentinel
+test - scores **100 %** at `/O2`, and the other two probes report categories unrelated to what is
+wrong with them. The optimiser erases the difference between two source shapes, so a *wrong*
+candidate can be indistinguishable from the right one. That is not a defect in the report; it is
+what a byte gate at `/O2` can promise, and it is why the wrong candidates are held to their
+categories for `/Od` only.
+
 
 **MS-4: say what an MSVC build is.** A Rich `build` → toolset table (cross-checked against the
 optional-header linker version, which independently said 14.12 here) and the tool-id meanings;

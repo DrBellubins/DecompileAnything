@@ -31,6 +31,24 @@ _SHF_WRITE, _SHF_ALLOC, _SHF_EXECINSTR = 0x1, 0x2, 0x4
 # PE and COFF share one flag word (IMAGE_SCN_*).
 _SCN_CNT_UNINITIALIZED, _SCN_CNT_CODE = 0x00000080, 0x00000020
 _SCN_MEM_DISCARDABLE, _SCN_MEM_WRITE, _SCN_MEM_EXECUTE = 0x00008000, 0x80000000, 0x20000000
+_SCN_LNK_COMDAT = 0x00001000
+
+# COFF storage classes (winnt.h). Only C_EXT matters here: an undefined entry with that class
+# is an import, and its type says whether the import is a function or a piece of data.
+_IMAGE_SYM_CLASS_EXTERNAL = 2
+
+# How wide the field a COFF relocation fixes is, for the types that matter here (IMAGE_REL_*).
+# A COFF relocation has no addend field, so the width is what says how many bytes of the object
+# to read as the implied one (MS-3).
+_COFF_FIELD_WIDTH = {
+	"ABSOLUTE": 0, "ADDR32": 4, "ADDR32NB": 4, "HIGH": 2, "HIGHADJ": 2, "INSTANCE_OFFSET": 4,
+	"SECTION_OFFSET": 2, "REL32": 4, "DIR64": 8, "REL64": 8, "IMM16": 2, "SEGOFST": 2,
+	"SREL32": 4, "PAIR": 0, "FRACTL": 0, "SECREL": 4,
+}
+
+# What `cl` fills the space between functions with, and what a linker pads an aligned section
+# with. Decoding to these and no further is how a COFF candidate's extent is found (MS-3).
+_PADDING_MNEMONICS = {"nop", "int3", "pause", "hlt", "lea" if False else "nop"}
 
 
 def _section_flags(section) -> tuple[object, str]:
@@ -886,10 +904,19 @@ class CandidateObject:
 		self._writable: set[str] = set()
 		self._by_section_address: dict[tuple[str, int], CandidateSymbol] = {}
 		self._all_symbols: dict[str, tuple[str, int, int, bool]] = {}
-		self._relocs: dict[str, list[tuple[int, str, str, int]]] = {}
+		self._relocs: dict[str, list[tuple[int, str, str, int, str]]] = {}
 		# the (section, address, length) of the last function handed back by `function()`, which
 		# is what its relocations have to be looked up in (a -O2 candidate spans two sections)
 		self._extent_sections: list[tuple[str, int, int]] = []
+		# COFF: sections keyed in file order (a COFF object may name two sections the same -
+		# `link` puts one COMDAT per `.text$mn` and they all carry that name), and a
+		# relocation names a symbol *table index*, so the section it lives in is known exactly.
+		self._section_order: list[str] = []
+		self._comdat: set[str] = set()
+		# an undefined COFF external -> whether its own type says it is a function
+		self._undefined: dict[str, bool] = {}
+		self._coff = False
+		self._handle = None
 		try:
 			import lief
 		except ImportError as exc:  # pragma: no cover
@@ -907,19 +934,138 @@ class CandidateObject:
 			header = binary.header
 			self.machine = _machine_name(header)
 			self.bits = _bits_of(header, self.machine)
+			self._coff = isinstance(binary, getattr(getattr(lief, "COFF", None), "Binary", ()) or ())
+			seen: dict[str, int] = {}
 			for section in binary.sections:
 				if not section.size:
+					self._section_order.append("")
 					continue
 				name = str(section.name)
+				key = name
+				if self._coff and name in seen:
+					# `.text$mn`, `.pdata`, `.xdata`: MSVC really does emit several sections with
+					# one name, so a name cannot be the key. Disambiguate only where it is needed,
+					# so an ELF key stays exactly the section name it always was.
+					seen[name] += 1
+					key = "%s#%d" % (name, seen[name])
+				seen.setdefault(name, 0)
+				self._section_order.append(key)
 				if section_capabilities(getattr(binary, "format", None), section)[1]:
-					self._writable.add(name)
-				self._sections[name] = bytes(section.content)
+					self._writable.add(key)
+				if self._coff and int(_section_flags(section)[0] or 0) & _SCN_LNK_COMDAT:
+					self._comdat.add(key)
+				self._sections[key] = bytes(section.content)
+			if self._coff:
+				self._handle = normalize.capstone_for("x86:LE:%d:default" % (self.bits or 64))
 			self._read_symbols(binary)
 			self._read_relocations(binary)
 		except Exception as exc:  # noqa: BLE001
 			self.error = "while reading %s: %s" % (self.path.name, exc)
 
+	def _section_of_index(self, index: int) -> str:
+		"""A COFF section number (1-based, as the symbol table writes it) -> this object's key."""
+		if 1 <= index <= len(self._section_order):
+			return self._section_order[index - 1]
+		return ""
+
+	def _code_extent(self, chunk: bytes) -> int:
+		"""Where a COFF function's code ends inside its section.
+
+		A COFF symbol has no size, so the only boundary the object gives is the next function
+		symbol in the same section - and `cl` aligns functions to 16 bytes and fills between them
+		with `int 3`/`nop` (measured on `Tests/build/msvc-o0/math.o`: `AbsDiff` is 49 bytes and
+		the next symbol is 64 along). Those bytes are not part of the unit - the linked image's
+		own `.pdata` stops at the `ret`, and that is the extent the original side is read over -
+		so the run is cut by *decoding*, not by counting filler bytes: a greedy byte run also ate
+		12 units whose last real instruction happens to end in 0xcc or 0x90 (measured).
+		"""
+		if self._handle is None or not chunk:
+			return len(chunk)
+		end = 0
+		try:
+			for instruction in self._handle.disasm(chunk, 0):
+				if instruction.mnemonic not in _PADDING_MNEMONICS:
+					end = instruction.address + instruction.size
+		except Exception:  # noqa: BLE001 - capstone stops at an undecodable byte
+				return len(chunk)
+		return end or len(chunk)
+
+	def _read_symbols_coff(self, binary) -> None:
+		"""The symbol table of a COFF object: names and addresses, no sizes, no function flag.
+
+		Two things an ELF `.o` does not have to do (Docs/MSVC-Plan.md MS-3): a symbol says *what*
+		it is through its type bits, which LIEF reads as `is_function`, and it says nothing about
+		how long the thing is - the extent is the section, when the function is its own COMDAT
+		(`/Gy`, and then it is exact, better than ELF's `st_size`), or the next function symbol in
+		the section with `cl`'s inter-function padding cut off it.
+		"""
+		raw: list[tuple[str, str, int, bool]] = []
+		for symbol in binary.symbols:
+			try:
+				name = str(symbol.name)
+				index = int(symbol.section_idx)
+			except Exception:  # noqa: BLE001
+				continue
+			# a COFF section number of 0 means "not in a section" (undefined, absolute, a file
+			# record or a `.drectve` directive): it has no bytes to mean anything about. An
+			# undefined *external* still carries a type, and that is worth keeping: it is how the
+			# object says whether a reference reaches a function or a piece of data.
+			if not name:
+				continue
+			if index < 1:
+				if int(getattr(symbol, "storage_class", 0) or 0) == _IMAGE_SYM_CLASS_EXTERNAL:
+					try:
+						self._undefined[name] = bool(symbol.is_function)
+					except Exception:  # noqa: BLE001
+						pass
+				continue
+			key = self._section_of_index(index)
+			if not key:
+				continue
+			try:
+				is_function = bool(symbol.is_function)
+			except Exception:  # noqa: BLE001 - a symbol table LIEF cannot fully type
+				is_function = False
+			raw.append((name, key, int(symbol.value), is_function))
+		table = demangle([item[0] for item in raw if item[0]])
+		by_section: dict[str, list[tuple[int, str]]] = {}
+		for name, key, value, is_function in raw:
+			self._all_symbols.setdefault(name, (key, value, 0, is_function))
+			if not is_function:
+				# `$LN3` and `.str$…` labels: no extent, but they are what a relocation against
+				# this section names, so they are indexed like an ELF local label is.
+				self._by_section_address.setdefault((key, value), CandidateSymbol(
+					mangled=name, name=name, simple=name, value=value, size=0, section=key))
+				continue
+			by_section.setdefault(key, []).append((value, name))
+		for key, items in by_section.items():
+			items.sort()
+			data = self._sections.get(key, b"")
+			for position, (value, name) in enumerate(items):
+				if self._all_symbols.get(name, ("", 0, 0, False))[0] != key:
+					continue  # a second symbol of this name in another section: first one names it
+				bound = items[position + 1][0] if position + 1 < len(items) else len(data)
+				if self._is_comdat(key):
+					# one COMDAT per function (`/Gy`): the section *is* the function, and the
+					# compiler's own extent - no guessing at a boundary
+					bound = max(bound, len(data)) if value == 0 else bound
+				size = self._code_extent(data[value:bound])
+				if not size:
+					continue
+				demangled = table.get(name, name)
+				symbol = CandidateSymbol(mangled=name, name=demangled,
+						simple=normalize.simple_name(demangled), value=value, size=size, section=key)
+				self.functions.append(symbol)
+				self._by_section_address[(key, value)] = symbol
+		self.functions.sort(key=lambda item: (item.section, item.value))
+
+	def _is_comdat(self, key: str) -> bool:
+		return key in self._comdat
+
 	def _read_symbols(self, binary) -> None:
+		if self._coff:
+			self._read_symbols_coff(binary)
+			return
 		raw = []
 		for symbol in binary.symbols:
 			try:
@@ -950,6 +1096,9 @@ class CandidateObject:
 		self.functions.sort(key=lambda item: (item.section, item.value))
 
 	def _read_relocations(self, binary) -> None:
+		if self._coff:
+			self._read_relocations_coff(binary)
+			return
 		# (offset in the section, relocation type, symbol named, addend). The addend is the
 		# offset inside a section when the relocation names the section itself.
 		for source in ("object_relocations", "dynamic_relocations"):
@@ -974,6 +1123,79 @@ class CandidateObject:
 				except Exception:  # noqa: BLE001
 					continue
 
+	def _coff_symbol_table(self, binary) -> dict[int, tuple[str, str, int]]:
+		"""COFF symbol-table index -> (name, this object's section key, value).
+
+		A COFF symbol record is 18 bytes and the ones with auxiliaries (a section definition, an
+		external name, a `.file`) occupy more than one record; a relocation names the index of a
+		record in that raw table. LIEF's `symbols` *folds the auxiliary entries into their primary
+		one*, so its list position is not that index - measured on `Tests/cache/.../math.obj`: the
+		`AMD64_REL32` of the self-recursive call in `FibonacciRecursive` names index 251, which is
+		that function in the file and a symbol ten further on in LIEF's list. Reading the index
+		directly gives every call in the object the wrong callee. Rebuild the index by walking the
+		table and adding each entry's own auxiliary count.
+		"""
+		table: dict[int, tuple[str, str, int]] = {}
+		position = 0
+		for symbol in binary.symbols:
+			try:
+				auxiliaries = len(list(symbol.auxiliary_symbols))
+			except Exception:  # noqa: BLE001 - an entry LIEF cannot enumerate auxiliaries for
+				auxiliaries = 0
+			try:
+				name = str(symbol.name)
+				section = self._section_of_index(int(symbol.section_idx))
+				value = int(symbol.value)
+			except Exception:  # noqa: BLE001
+				name, section, value = "", "", 0
+			table[position] = (name, section, value)
+			position += 1 + max(auxiliaries, 0)
+		return table
+
+	def _read_relocations_coff(self, binary) -> None:
+		"""A COFF object's relocations: one list per section, and **no addend field**.
+
+		An ELF `.o` relocation carries its own addend (`R_X86_64_PC32 sym-4`); a COFF one only
+		says "fix the field at this offset against this symbol", so the number already sitting in
+		the bytes *is* the implied addend - which is why this object's `.pdata` record reads as
+		(0, 0x3c, 0) with an ADDR32NB on each field. The symbol is named by *table index*, so the
+		section it lives in is known exactly - the thing a name cannot promise in a COFF object,
+		where several sections really do share one name.
+		"""
+		try:
+			symbols = self._coff_symbol_table(binary)
+		except Exception:  # noqa: BLE001
+			return
+		for position, section in enumerate(binary.sections):
+			key = self._section_of_index(position + 1)
+			if not key:
+				continue
+			data = self._sections.get(key, b"")
+			try:
+				items = list(section.relocations)
+			except Exception:  # noqa: BLE001 - a section with no relocation table
+				continue
+			for item in items:
+				try:
+					offset = int(item.address)
+					index = int(item.symbol_idx)
+				except Exception:  # noqa: BLE001
+					continue
+				name = ""
+				symbol_section = ""
+				entry = symbols.get(index)
+				if entry is not None:
+					name, symbol_section, _value = entry
+				width = int(getattr(item, "size", 0) or 0)
+				if width not in (1, 2, 4, 8):
+					# LIEF does not always fill it; the type says how wide the field is.
+					width = _COFF_FIELD_WIDTH.get(str(item.type).rsplit(".", 1)[-1], 0)
+				addend = 0
+				if width and offset + width <= len(data):
+					addend = int.from_bytes(data[offset:offset + width], "little", signed=True)
+				self._relocs.setdefault(key, []).append(
+					(offset, str(item.type), name, addend, symbol_section or key))
+
 	def is_partition(self, symbol: CandidateSymbol) -> bool:
 		"""Is this symbol a -O2 partition of another one (`<name>.cold`)?
 
@@ -991,7 +1213,11 @@ class CandidateObject:
 				return [symbol for symbol in self.functions if symbol.mangled == text]
 			own = [symbol for symbol in self.functions if not self.is_partition(symbol)]
 			for key in (lambda s: s.name == text, lambda s: s.simple == text,
-				lambda s: s.simple.rsplit("::", 1)[-1] == text or s.simple.rsplit(".", 1)[-1] == text):
+				lambda s: s.simple.rsplit("::", 1)[-1] == text or s.simple.rsplit(".", 1)[-1] == text,
+				# an MSVC decorated name puts the identifier first (`?AbsDiff@CMathTests@@SAHHH@Z`),
+				# so a caller who knows the source name and not the decoration still finds it. The
+				# decorated form stays the comparison key: `c++filt` cannot read it (MSVC-Plan §8).
+				lambda s: s.mangled.startswith("?") and s.mangled[1:].split("@")[0] == text):
 				found = [symbol for symbol in own if key(symbol)]
 				if found:
 					return found
@@ -1158,8 +1384,20 @@ class CandidateObject:
 		name, while the geometry stays the offset itself.
 		"""
 		found = self._all_symbols.get(symbol_name)
+		if found is not None and self._coff and symbol_section in self._sections and (
+				found[0] != symbol_section):
+			# A COFF relocation names a symbol *table index*, so the section that symbol lives in
+			# is known exactly - which its name is not, since several sections of one object may
+			# carry the same name (`.text$mn`, `.pdata`). Trust the index.
+			found = (symbol_section, found[1], found[2], found[3])
 		section_named = symbol_name if symbol_name.startswith(".") else symbol_section
-		if found is None and section_named and not symbol_name.startswith("_"):
+		if found is None and section_named and not symbol_name.startswith("_") and not (
+				self._coff and symbol_name):
+			# (An ELF `.o` relocates against a section with the offset inside it as the addend, so
+			# a name that is not a symbol of this object still says where to look.) A COFF
+			# relocation always names a symbol by table index - `strncpy` in `strings.obj` is the
+			# CRT's, not an offset in `.text$mn` - so when it names one, the object at that offset
+			# is not what the instruction reaches.
 			display = self._nearest_in(section_named, addend)
 			# the object defined at that offset is what the instruction reads, so it is the name
 			# to compare - `.data.rel.ro+0x18` is a section, and the other side has no such thing
@@ -1172,8 +1410,12 @@ class CandidateObject:
 		if found is None:
 			# not defined here: an import (libc, or a function of another translation unit).
 			# Its name is the only thing the two sides share - which is also what makes it
-			# comparable, because a compiler reproduces that name on both sides.
-			return {"kind": "external", "address": None, "section": "", "size": None,
+			# comparable, because a compiler reproduces that name on both sides. A COFF object
+			# types its undefined externals, so when it says the import is data (`__security_cookie`,
+			# which `/GS` reaches through a rip-relative slot) this is a data reference and must be
+			# compared as one: the linked image has the object itself, not an import.
+			kind = "external" if self._undefined.get(symbol_name, True) else "data"
+			return {"kind": kind, "address": None, "section": "", "size": None,
 				"content": None, "display": symbol_name}
 		section, value, size, is_function = found
 		if is_function:
@@ -1200,7 +1442,10 @@ class CandidateObject:
 		identity, and `normalize.Vocabulary` keys the token by that instead.
 		"""
 		return bool(symbol_name) and (section == symbol_name or
-			section.endswith("." + symbol_name))
+			section.endswith("." + symbol_name) or
+			# a COFF COMDAT is named `<section>$<selector>` (`.rdata$.str1`, `.text$?Foo@…`), so
+			# the section is named after its one object just the same - with `$`, not `.`
+			(self._coff and "$" in section and section.split("$", 1)[1] == symbol_name))
 
 	def _nearest_in(self, section: str, offset: int) -> str:
 		"""The name of the symbol defined at (or just below) an offset inside a section."""
