@@ -1,155 +1,102 @@
 ---
 name: decompileanything
-description: Iteratively decompile functions out of a compiled binary into source that recompiles to the same bytes. Use when recovering a function from a stripped binary, when a decompiled candidate must be made binary-accurate, or when working in this repo (Tests/eval.py benchmark).
+description: Iteratively decompile functions out of a compiled binary into source that recompiles to the same bytes, using the `decomp` CLI (Ghidra analysis plus compile-and-diff scoring). Use whenever the user wants to recover, decompile or reverse a function, class or subsystem from a binary (ELF or PE, stripped or not), make a decompiled candidate binary-accurate, or match original bytes, even if they never mention `decomp`.
 ---
 
-# Loop
+# Decompile with `decomp`
 
-Build once, then iterate per function. The tool never edits source - it reports facts and
-scores; you write the source.
+`decomp` reports facts and scores; it never edits source. You write the source, it tells you
+how far the compiled result is from the original bytes. Everything except `analyze` reads a
+cache and runs in ~0.1 s, so iterate freely.
+
+Run it as `decomp` (it lives in the repo's `.venv/bin`; activate the venv or add that to PATH).
+
+## Setup, once per target
 
 ```sh
-cd Tests
-python3 eval.py build --variants gcc-o0,gcc-o2,gcc-o0-x86   # once per session
-python3 eval.py units                                       # what is in the binary
-
-../.venv/bin/decomp detect build/gcc-o0/da_tests.stripped   # compiler/-O, and project.toml (--write)
-../.venv/bin/decomp analyze build/gcc-o0/da_tests.stripped --variant gcc-o0   # once per binary
-../.venv/bin/decomp find strncmp                            # name, 0xaddr, string, global, vtable
-../.venv/bin/decomp find coin --family 2                    # the group of functions a request means
-../.venv/bin/decomp show 0x2834 --bin build/gcc-o0/da_tests.stripped          # reads the cache
-../.venv/bin/decomp try 0x2834 cand/math.cpp --fn AbsDiff                     # build, diff, score
-../.venv/bin/decomp types                                                   # the classes this binary has
-../.venv/bin/decomp types --write TestBinary/TestFunctions                   # and the header to use
+decomp check                                      # first stop whenever anything fails: names the fix
+decomp detect <bin> --write project.toml          # compiler, flags, starting config
+decomp analyze <bin> --variant <name> -C project.toml   # runs Ghidra once (~10 s), fills the cache
 ```
 
-Per unit: `decomp show` (pseudo-code + the original instruction stream + resolved
-references + callers/callees) → write the function with its real signature and real field
-offsets → `decomp try` → read the diff → change the thing the diff names. Stop when
-`match >= threshold` **and** `opcode: 0` **and** `relocation: 0`. Never stop on the
-percentage alone.
+- Trust the facts `detect` prints (compiler, PIE, static/dynamic, `-std`). The `-O` level is a
+  ranked guess from comparing code shape against this machine's compilers, so read its
+  `confidence` and margin before accepting it.
+- For a **statically linked** target, narrow the sample with `--range 0xLO-0xHI` over the
+  program's own code, otherwise the answer is mostly libc's flags (the tool warns when this
+  happens).
+- Re-running `analyze` on the same bytes is a no-op; `--force` rebuilds. Rebuild an older cache
+  to get new tables.
+- With several targets cached, pass `--bin <file>` or `--key <key>` (see `decomp status`).
 
-`try` builds the candidate with the target's own variant flags (same compiler, `-O`, `-std`,
-`-m32`), so never compare -O0 asm to -O2 asm; it prints the object path, so `objdump -dr`
-on the candidate is one command away. `--fn` names the symbol in the candidate to compare
-(without it, the object must define exactly one function). `--include` adds `-I` for a header
-the candidate needs; `[include_dirs]` in the target's `project.toml` does it permanently.
+## The loop
 
-The extent it compares is the one the **file** gives: `.eh_frame`'s FDE records for ELF (`.pdata`
-for PE), so at `-O2` a body the disassembler drew in several ranges is still one unit, and a
-`jumps past the end of the range you gave it` warning means the extent is wrong, not the code.
-`--size` overrides it; `decomp analyze` prints where the file's table and the analysis disagree.
+1. **Pick the unit.** `decomp find <name | 0xaddr | string | global | vtable>`. In a stripped
+   binary there are no names: start from a string or an address, then grow with
+   `decomp find <x> --family 2` to get the connected group a request like "the coin system"
+   means. `--table` lists what a vtable points at; `--members` shows the class a function
+   belongs to.
+2. **Read it.** `decomp show <fn>` gives pseudo-code, the original instruction stream, resolved
+   references, callers/callees and its place in its class. It accepts the addresses `nm` and
+   objdump print as well as Ghidra's.
+3. **Write the function** with its real signature and real field offsets (see *Writing the
+   candidate*). `decomp types` shows the classes the binary proves, and
+   `decomp types --write <dir>` produces a `types.h` to include.
+4. **Score it.** `decomp try <fn> cand.cpp --fn <Symbol>`. It builds with the target's own
+   variant flags (same compiler, `-O`, `-std`, arch), so the comparison is like for like. Use
+   `--include` for headers; put permanent ones in `[include_dirs]`. The printed object path
+   lets you run `objdump -dr` on the candidate.
+5. **Read the diff and change the thing it names**, then go back to 4.
 
-# Driving `decomp`
+**Done** when `match >= threshold` **and** `opcode: 0` **and** `relocation: 0`. A high percentage
+alone is not done: one wrong callee or table can hide inside it.
 
-* Start a new target with `decomp detect <bin> --write project.toml`: it reads the compiler and
-  version from `.comment` (Rich header on PE), PIE vs `-no-pie`, static vs dynamic, the C++ ABI
-  and the lowest `-std` the imports prove, and infers `-O` by comparing the *shape* of the
-  target's code against what this machine's compilers produce at each `-O`. Trust the facts;
-  read the `-O` line's `confidence`/margin. For a **statically linked** target, narrow the
-  sample: `--range 0xLO-0xHI` over the program's own code (an answer over the whole image is
-  mostly glibc's flags, and the tool says so).
-* `decomp find` answers three kinds of question: what a name/address/string/**global/vtable**
-  is, what reaches it (`--xref`, with the instruction at each site) and what it points at
-  (`--table` gives a vtable's method list; `--members` gives the class the function belongs
-  to), and `--family <hops>` gives the connected group with the reason for each entry.
-  In a stripped binary there are no names to search: start from a string or an address, then
-  grow with `--family`.
-* A **PE/MSVC target**: `decomp analyze`, `find`, `show` and `detect` work on one
-  (`Tests/Proprietary/notepad.exe`: 236 functions; `detect` names the v141 toolset from the
-  Rich build id, `/GL`+`/LTCG` from its debug directory, and the public PDB that holds that
-  file's answer key). `try` does not yet: nothing implements COFF *candidate* semantics (MS-3).
-  Both are a named gap phased in `Docs/MSVC-Plan.md`, not something to debug mid-task.
-  Since MS-2 there is an MSVC toolchain here — `cl`/`link`/`lib`/`dumpbin` **14.12.25835.7**
-  (v141, the era `detect` names for that target) at `toolchains/msvc/bin/x64`, needing
-  `PATH=…:$PATH WINEPREFIX=$PWD/.wine`. It **compiles, links and runs** PE programs under Wine
-  (`Tests/eval.py build --variant msvc-o0|msvc-o2` builds the benchmark's own test binary: 89/89
-  answer-key units, `selfcheck` 89 cases 0 failures), and `detect --probe` measures its
-  `/Od|/O1|/O2` shapes. Its `.obj` files show one `.text$<name>` COMDAT per function, which is
-  where a COFF function's exact extent comes from. Two argument rules: `/link` last (everything
-  after it goes to the linker), and only the top source directory on the include path (a
-  project `math.h` in an `-I` directory shadows the CRT's `<math.h>` for `cl`). `decomp check`
-  identifies all of it by banner and refuses impostors (`/usr/bin/link` is GNU coreutils;
-  `clang-cl` is clang) — read its `msvc *` rows before believing any MSVC variant is usable.
-  An x64 PE carries the compiler's own function table in `.pdata` (186 units on that file) and
-  the tool reads it: `analyze` caches it and prints the reconciliation with the analysis (154
-  agree, 32 the analysis reports shorter, 35 entries the file names no unit for), a unit's extent
-  is what a diff compares (`--size` still overrides it), `show` prints the unit or names the gap
-  an analysis-only function sits in, and `find` marks those entries `<- not in .pdata`. Trust
-  the unit boundary over the analysis' size; trust the analysis for instruction boundaries.
-  A cached analysis made before this has no unit table - `analyze --force` gives it one.
-* Only `analyze` starts Ghidra (~10 s per binary, once). `detect`/`show`/`find`/`status` read
-  `cache/ghproj/<sha256-16>/analysis.db` or the file itself in ~0.1 s. Re-running `analyze` on
-  the same bytes says "already analysed"; `--force` rebuilds.
-* `decomp show` accepts the addresses `nm`/objdump print **and** Ghidra's: a PIE is loaded at
-  `0x100000`, and `meta.address_offset` records the gap, so `decomp show 0x2834` works.
-* Several targets can be cached; then pass `--bin <file>` or `--key <key>` (both printed by
-  `decomp status`).
-* Exit codes: 0 ok, 1 failed check/work, 2 usage or config, 3 nothing found or a later phase.
-* `decomp check` before debugging a failure - it names the Ghidra/JDK/Python/cache/compiler
-  problem and the fix.
+**Stuck** (three tries with no change in the match or the categories): re-read the `show`
+assembly around the first differing instruction and change your hypothesis, not the syntax. If
+only `register:` differences remain, stop: they are not fixable from source. Otherwise report
+the best candidate with its remaining diff categories instead of looping.
 
-# Reading a score
+## Reading a score
 
-| signal | what it means | do |
+| signal | meaning | do |
 |---|---|---|
 | `opcode: n` | wrong operation: cmov vs branch, imul vs shifts, signed vs unsigned load | fix the operation; `movzbl` vs `movsbl` and `idiv` vs `shrd` are the usual ones |
-| `operand: n` | right operation, wrong offset/constant/type | field offsets, struct layout, the type of an array element, a truncated buffer bound |
-| `relocation: n` | same shape of code, reaching for something else: a different callee, a different table, different bytes in it | the report's `symbols` line names both sides - fix the callee or reproduce the data (tables and string literals are part of the answer). Bytes are only compared when both sides know what object they are: an anonymous `.rodata` pool is laid out per build |
-| `register: n` | register allocation only | not yours to fix; `--register-abstract` maps each side's registers to the order they first appear, so the same choice in different registers matches. Measured on this benchmark it changes no score - the untouched source has 0 register differences at every `-O` - so treat it as a reading aid, not a way to pass |
-| `missing`/`extra` | control flow or size differs | loop form (counted vs conditional), hoisted invariant, inlined vs called helper, early return vs branch |
-| `size_delta` large with high % | something is inlined or vectorised that should not be (or the reverse) | compare at the variant's own `-O`; never compare -O0 asm to -O2 asm |
+| `operand: n` | right operation, wrong offset, constant or type | field offsets, struct layout, array element type, truncated buffer bound |
+| `relocation: n` | same code shape reaching for something else: another callee, table, or different bytes in it | the `symbols` line names both sides; fix the callee or reproduce the data. Bytes are only compared when both sides know what object they are |
+| `register: n` | register allocation only | not yours to fix. `--register-abstract` is reported separately today and does not change the score yet |
+| `missing` / `extra` | control flow or size differs | loop form (counted vs conditional), hoisted invariant, inlined vs called helper, early return vs branch |
+| `size_delta` large, % high | something is inlined or vectorised that should not be, or the reverse | confirm you are comparing at the variant's own `-O` |
 
-Before blaming the model, run `python3 eval.py self` - it recompiles the untouched
-original and scores it. That is the ceiling (99.5% at gcc-o0, 98.3% at gcc-o2 on this
-machine): a unit scoring far below the ceiling *for everyone* is a harness or fixture
-problem.
+At `-O2` the analysis' range for a function can be shorter than the compiler's (thunk-like
+bodies, tail jumps). If the sizes disagree, pass `--size <symbol size>`; a PE's `.pdata` unit is
+used automatically.
 
-# Facts about this benchmark
+## Writing the candidate
 
-* `Tests/TestBinary/TestFunctions/*.cpp` holds the units; each definition carries
-  `// DA-UNIT <ID> level:... tags:...` and a matching `DA_CASE(st, "ID")` block in that
-  class's `RunSelfChecks`. Units are `DA_NOINLINE` (one body, one address, any `-O`);
-  helpers are not, so helpers vanish into units at -O2 on purpose.
-* After any edit to `TestBinary`: `eval.py build` then `eval.py selfcheck` must print
-  `0 failures`, and `eval.py crosscheck` must show no same-arch differences. The 89
-  hand-checked expectations are the ground truth - if a `Want*` disagrees with the code,
-  work out which one is wrong instead of editing the expectation to match the run.
-* `decomp types` recovers the C++ structure the file carries: classes named from their RTTI,
-  their bases, their vtables (slot by slot, nulls reported as null), their constructors and
-  destructors, and the member **offsets** and widths its own code touches. `--write <dir>`
-  turns that into a `types.h` a candidate can include (the header says which types are guesses;
-  field names are placeholders like `f0x8`). `decomp show` adds one `structure:` line for a
-  function it can place. Nothing is claimed for an MSVC/PE target: that RTTI format is MS-5.
-* `decomp try` compares **symbolically**: branches inside the function are function-relative
-  labels, and calls/data references become positional tokens (`SYM0`, `DAT0`) matched by order,
-  then checked by what they reach (a real name both sides know, the bytes there, the size). So
-  the score does not depend on the link address, and a table with the wrong bytes is still a
-  failure. `decomp try --json` gives the whole report if you need to parse it.
-* Float results are only comparable as **bit patterns** (`goldens.jsonl` stores both
-  `f` and `bits`). x87 (-m32 default) and SSE (-m32 `-msse2`, x86-64) legitimately
-  disagree: `SineApprox`, `SquareRootNewton` and `(float)mass * 0.001f` all differ in the
-  last ulp. That is why goldens are per-variant.
-* Unions lie: writing through one view changes the other (`RectFromCorners` fills the
-  width/height view, so `m_right`/`m_bottom` become 8/8 - `RectArea` then returns 49, not
-  64). Struct padding is observable too (`ChecksumDescriptorBytes` hashes it). A diff in a
-  field offset is a struct-layout oracle - use it to fix the header, then re-score.
-* `-m32` builds use `-no-pie -fno-pic`: a PIE link on i386 relaxes the pc-thunk/GOT
+- **Keep the real signature.** By-value vs by-reference struct arguments, a hidden return
+  pointer and `this` are all visible in the first six instructions.
+- **Reproduce the data.** Tables (lookup tables, CRC tables, alphabets), bounds and buffer
+  capacities are part of the answer. The score matches data references by order and by what
+  they reach, so wrong table bytes still show up as `relocation`, but values in `.rodata` are
+  only confirmed by strings and your own checks.
+- **Match the shape, not the compiler.** A counted loop and a conditional loop with the same
+  body are different code, and `while (a > 180.0f) a -= 360.0f;` is not `fmodf`. Prefer what
+  the branches and comparisons prove, and let the diff categories say which one the binary has.
+- **Offsets are an oracle.** An `operand` diff at a field offset is telling you the struct
+  layout; fix the header, then re-score. Unions share storage and padding is observable, so
+  check both before trusting a layout.
+- **Floats** are only comparable as bit patterns. x87 (`-m32` default) and SSE can differ in the
+  last ulp for the same source, so do not "fix" a last-bit difference between variants.
+- **Name globals by role** only when the code proves the role. Otherwise keep a neutral name
+  and note the offset.
+
+## Notes
+
+- Exit codes: 0 ok, 1 a check or the work failed, 2 bad usage or config, 3 nothing found (or a
+  command of a later phase). `try` exits 0 only when the candidate passes.
+- `try --json` gives the whole report if you need to parse it.
+- `-m32` targets build with `-no-pie -fno-pic`; a PIE link on i386 turns the pc-thunk/GOT
   sequence into `%gs` addressing, so object code and linked code stop matching.
-* At `-O0` every function starts with a frame, so tiny units are 30+ bytes there; the
-  sub-32-byte bucket only appears at -O2. Judge sizes per variant.
-
-# Writing the candidate
-
-* Keep the real signature: by-value vs by-reference struct args, hidden return pointer,
-  and `this` are visible in the first six instructions.
-* Reproduce the *data*: tables (`k_chokeThresholds`, the CRC table, the base64 alphabet),
-  bounds, and buffer capacities. Values in `.rodata` are part of the answer - and the
-  normaliser only compares data references by order, so the values are verified by the
-  goldens/strings, not by the score.
-* Match the shape, not the compiler: a counted loop and a conditional loop with the same
-  body are different code. `while (angle > 180.0f) angle -= 360.0f;` is not
-  `fmodf`. Prefer what the branches and comparisons prove, and let the categories tell you
-  which one the binary has.
-* If the binary reads a global you cannot name yet, name it by role only when the code
-  proves the role; otherwise keep a neutral name and record the offset.
+- **PE / MSVC targets:** `detect`, `analyze`, `find` and `show` work; `try` does not yet (no COFF
+  candidate support). That is a known, planned gap, so do not debug it mid-task. Read
+  `references/msvc.md` for the toolchain, Wine setup and `.pdata` behaviour.
