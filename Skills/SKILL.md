@@ -208,7 +208,101 @@ used automatically.
   `references/msvc.md` for the toolchain, Wine setup and `.pdata` behaviour.
 - Working on `decomp` itself or its benchmark: `references/decomp-dev.md`.
 
-## Install (only on request)
+## Request Install (only if needed, but not present)
 
 `brew install jadx apktool radare2 binwalk wabt wireshark ghidra` · `npm i -g @electron/asar` ·
 `dotnet tool install -g ilspycmd` · `cargo install cargo-audit`.
+
+# PE / MSVC targets in `decomp`
+
+Consider this only when the target is a PE built by MSVC. Counts and versions below are a snapshot from when this was written; re-check with `decomp check` and `decomp status`.
+
+## What works
+
+- `decomp analyze`, `find`, `show` and `detect` work on a PE. The reference example is
+  `Tests/Proprietary/notepad.exe` (236 functions). `detect` names the v141 toolset from the Rich
+  header build id, `/GL` + `/LTCG` from the debug directory, and the public PDB that holds that
+  file's answer key.
+- `try` does **not** work on a PE yet: nothing implements COFF *candidate* semantics (`MS-3` in
+  `Docs/MSVC-Plan.md`). `decomp types` also claims nothing for a PE, because that RTTI format is
+  `MS-5`. Both are named, phased gaps, not something to debug mid-task.
+
+## The MSVC toolchain (since MS-2)
+
+- `cl` / `link` / `lib` / `dumpbin` **14.12.25835.7** (v141, the era `detect` names for the
+  reference target) at `toolchains/msvc/bin/x64`. It needs
+  `PATH=<that dir>:$PATH WINEPREFIX=$PWD/.wine`.
+- It compiles, links and runs PE programs under Wine. `Tests/eval.py build --variant msvc-o0|msvc-o2`
+  builds the benchmark's own test binary: 89/89 answer-key units, `selfcheck` 89 cases, 0
+  failures.
+- `detect --probe` measures its `/Od`, `/O1`, `/O2` code shapes.
+- Its `.obj` files hold one `.text$<name>` COMDAT per function, which is where a COFF function's
+  exact extent comes from.
+- Two argument rules: put `/link` last (everything after it goes to the linker), and put only
+  the top source directory on the include path (a project `math.h` in an `-I` directory shadows
+  the CRT's `<math.h>` for `cl`).
+- `decomp check` identifies each tool by banner and refuses impostors (`/usr/bin/link` is GNU
+  coreutils; `clang-cl` is clang). Read its `msvc *` rows before believing any MSVC variant is
+  usable.
+
+## The function table (`.pdata`)
+
+An x64 PE carries the compiler's own function table in `.pdata` (186 units on the reference
+file) and the tool reads it:
+
+- `analyze` caches it and prints the reconciliation with the analysis (on the reference file:
+  154 agree, 32 the analysis reports shorter, 35 entries the file names no unit for).
+- A unit's extent is what a diff compares; `--size` still overrides it.
+- `show` prints the unit, or names the gap an analysis-only function sits in.
+- `find` marks analysis-only entries `<- not in .pdata`.
+- Trust the unit boundary over the analysis' size; trust the analysis for instruction boundaries.
+- A cache made before this feature has no unit table: `analyze --force` gives it one.
+
+# Working on `decomp` and its benchmark
+
+Consider this only when editing the tool, the test binary or the benchmark, not when decompiling a user's target. Run commands from `Tests/`; the CLI is `../.venv/bin/decomp`.
+
+## Building and checking
+
+```sh
+python3 eval.py build --variants gcc-o0,gcc-o2,gcc-o0-x86   # once per session
+python3 eval.py units                                       # what is in the binary
+python3 eval.py self                                        # recompile the untouched original and score it
+python3 eval.py selfcheck                                   # must print "0 failures"
+python3 eval.py crosscheck                                  # must show no same-arch differences
+```
+
+- After any edit to `TestBinary`: `eval.py build`, then `selfcheck` (0 failures), then
+  `crosscheck` (no same-arch differences).
+- The 89 hand-checked expectations are the ground truth. If a `Want*` disagrees with the code,
+  work out which one is wrong; do not edit the expectation to match the run.
+- Before blaming a candidate or the tool, run `eval.py self`. It is the ceiling: 99.5% at
+  gcc-o0 and 98.3% at gcc-o2 on the reference machine. A unit scoring far below the ceiling for
+  every candidate is a harness or fixture problem.
+
+## Benchmark layout
+
+- `Tests/TestBinary/TestFunctions/*.cpp` holds the units. Each definition carries
+  `// DA-UNIT <ID> level:... tags:...` and a matching `DA_CASE(st, "ID")` block in that class's
+  `RunSelfChecks`.
+- Units are `DA_NOINLINE` (one body, one address, any `-O`); helpers are not, so helpers vanish
+  into units at `-O2` on purpose.
+- Example run: `decomp detect build/gcc-o0/da_tests.stripped`,
+  `decomp analyze build/gcc-o0/da_tests.stripped --variant gcc-o0`,
+  `decomp show 0x2834 --bin build/gcc-o0/da_tests.stripped`,
+  `decomp try 0x2834 cand/math.cpp --fn AbsDiff`,
+  `decomp types --write TestBinary/TestFunctions`.
+
+## Fixture facts worth knowing
+
+- Float results are compared as bit patterns (`goldens.jsonl` stores both `f` and `bits`). x87
+  (`-m32` default) and SSE (`-m32 -msse2`, x86-64) legitimately disagree: `SineApprox`,
+  `SquareRootNewton` and `(float)mass * 0.001f` differ in the last ulp, which is why goldens are
+  per-variant.
+- Unions lie: writing through one view changes the other. `RectFromCorners` fills the
+  width/height view, so `m_right`/`m_bottom` become 8/8 and `RectArea` returns 49, not 64.
+- Struct padding is observable: `ChecksumDescriptorBytes` hashes it. A diff in a field offset is
+  a struct-layout oracle; use it to fix the header, then re-score.
+- `-m32` builds use `-no-pie -fno-pic`.
+- Tiny units are 30+ bytes at `-O0` (every function has a frame); the sub-32-byte bucket only
+  appears at `-O2`.
