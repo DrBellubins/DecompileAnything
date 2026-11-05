@@ -431,3 +431,7 @@ all three scripts print OK on this machine).
   only (`x86:LE:32/64`); `try` says so rather than guessing.
 * `[ghidra] language` in `project.toml` is validated but not wired into the importer;
   Ghidra's auto-selection is used and the chosen language is recorded.
+
+  ## Credits
+- [REA](https://github.com/morluto/rea) By morluto - First agentic reverse engineering suite
+- [LeanREA](https://github.com/aicodeking/leanrea) By aicodeking - Initial skill base
