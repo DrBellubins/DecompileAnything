@@ -113,6 +113,99 @@ def simple_name(demangled: str) -> str:
 	return text.strip()
 
 
+# --------------------------------------------------------------------------------------
+# MSVC names: decorations, and the RTTI objects a decoration identifies
+#
+# A PE has no symbol table, so the only names an MSVC target carries for its vtables and type
+# descriptors are the decorated symbols a *candidate's* `.obj` relocates against
+# (`??_R0?AVCVehicleEntity@@@8`, `??_7CVehicleEntity@@6B@`). Those decorations say exactly what
+# the object is, and MSVC's RTTI in the target says the same thing from the data side
+# (`.?AVCVehicleEntity@@`, an RTTICompleteObjectLocator). Reading both into the words c++filt
+# already gives for Itanium names - "typeinfo for X", "vtable for X" - is what lets one object
+# be named on both sides (Docs/MSVC-Plan.md MS-5).
+
+# A type name as MSVC's RTTI writes it: `.?AVCEntityBase@@`, `.?AUSimpleMapping@hkaBone@@`,
+# `.?AV?$hkSingleton@VhkReferencedObject@@`. V = class, U = struct (a unique tag), E = enum.
+_MSVC_TYPE = re.compile(r"^\.?\?A([VUE])(.{1,300}?)@@$")
+# The same encoding inside a decorated symbol name.
+_MSVC_TYPE_ANYWHERE = re.compile(r"\?A([VUE])(.{1,300}?)@@")
+_MSVC_RTTI_SYMBOL = re.compile(r"^\?\?_R([0-4])")
+# `??_7X@@6B@` is a vftable, `??_8` a vbtable, `??_9` a vftable closure.
+_MSVC_TABLE_SYMBOL = re.compile(r"^\?\?_([789])([A-Za-z0-9_$?@.]+)@@")
+
+_MSVC_RTTI_WORDS = {
+	"0": "typeinfo",                    # ??_R0 = RTTITypeDescriptor
+	"1": "complete object locator",     # ??_R1 = RTTICompleteObjectLocator
+	"2": "base class array",            # ??_R2 = RTTIBaseClassArray
+	"3": "class hierarchy descriptor",  # ??_R3 = RTTIClassHierarchyDescriptor
+	"4": "base class descriptor",       # ??_R4 = RTTIBaseClassDescriptor
+}
+_MSVC_TABLE_WORDS = {"7": "vtable", "8": "vbtable", "9": "vftable closure"}
+
+
+def msvc_type_name(text: str) -> tuple[str, str]:
+	"""`.?AUSimpleMapping@hkaSkeletonMapper@@` -> ('struct', 'hkaSkeletonMapper::SimpleMapping').
+
+	MSVC writes a nested name innermost-first with `@` between the components, so the components
+	are reversed. A template argument list (`?$hkSingleton@V…`) is not a scope chain, and there
+	it is shown as written rather than invented into one.
+	"""
+	match = _MSVC_TYPE.match((text or "").strip())
+	if not match:
+		return "", ""
+	kind = {"V": "class", "U": "struct", "E": "enum"}.get(match.group(1), "")
+	encoded = match.group(2)
+	if not encoded:
+		return kind, ""
+	parts = encoded.split("@")
+	if any(not part or part.startswith(("$", "?")) for part in parts):
+		return kind, encoded
+	return kind, "::".join(reversed(parts))
+
+
+def msvc_object_name(text: str) -> str:
+	"""An MSVC RTTI or vftable symbol -> "typeinfo for X" / "vtable for X" ('' for anything
+	else, including an ordinary decorated function name, which stays the decorated name)."""
+	text = (text or "").strip()
+	match = _MSVC_RTTI_SYMBOL.match(text)
+	if match:
+		words = _MSVC_RTTI_WORDS.get(match.group(1), "")
+		name = ""
+		if match.group(1) in ("1", "2"):
+			# the locator and partial-locator symbols put four fixed numbers between the record
+			# kind and the class name: `??_R1A@?0A@EA@CVehicleEntity@@8`
+			fields = re.match(r"^\?\?_R[12][A-Z][A-Z0-9?@-]*@([A-Za-z_?][^@]*)@@\d*$", text)
+			name = fields.group(1) if fields else ""
+		else:
+			inner = _MSVC_TYPE_ANYWHERE.search(text)
+			if inner is not None:
+				_name, name = msvc_type_name("." + inner.group(0))
+		return "%s for %s" % (words, name) if words and name else ""
+	table = _MSVC_TABLE_SYMBOL.match(text)
+	if table:
+		words = _MSVC_TABLE_WORDS.get(table.group(1), "")
+		_kind, name = msvc_type_name(".?AV%s@@" % table.group(2))
+		return "%s for %s" % (words, name) if words and name else ""
+	return ""
+
+
+def msvc_type_symbol(role: str, encoded: str) -> str:
+	"""The reverse: the decorated name of one of those objects, as the `.obj` would write it.
+
+	`encoded` is the name exactly as the type descriptor's own string carries it
+	(`.?AVCVehicleEntity@@`), which is what the symbol embeds after the `??_R<kind>` prefix.
+	"""
+	body = (encoded or "").lstrip(".")
+	if not body:
+		return ""
+	if role == "typeinfo":
+		return "??_R0%s@8" % body
+	if role == "vtable":
+		_kind, name = msvc_type_name(encoded)
+		return "??_7%s@@6B@" % name.replace("::", "@") if name else ""
+	return ""
+
+
 _clean_cache: dict[str, str] = {}
 
 
@@ -123,6 +216,13 @@ def clean_symbol(text: str) -> str:
 		return ""
 	if text in _clean_cache:
 		return _clean_cache[text]
+	if text.startswith("??_"):
+		# before any of the addend/`@` trimming: an MSVC RTTI name ends in `@@8`, which that
+		# trimming would eat, and the decoration itself is what says what the object is
+		object_name = msvc_object_name(text)
+		if object_name:
+			_clean_cache[text] = object_name
+			return object_name
 	name = _AT.sub("", _ADDEND.sub("", text))
 	name = name.replace("@plt", "").replace("@PLT", "")
 	if name.startswith("_Z"):

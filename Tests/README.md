@@ -181,11 +181,12 @@ where it names the function, the analysis' body where it does not). All 89 agree
 how many came from a COMDAT section and how many from the next symbol in the section. **(2) The
 loop** - the untouched source through `decomp try` for every unit, the same call
 (`cli.score_candidate`), the same threshold and the same KNOWN_GAPS discipline as
-`check_phase2_try.py`: **100.00 % mean, 88 of 89 past the gate**, the one exception being MSVC
-RTTI (MS-5), named in the script with its reason. **(3) The wrong candidates** of
+`check_phase2_try.py`: **100.00 % mean, 89 of 89 past the gate** since MS-5 named the type
+descriptors on the target side (it used to be 88 of 89, with STRUCT-24's reason recorded here and
+in the script's history). **(3) The wrong candidates** of
 `Tests/examples/candidate_math_bad.cpp`, built by `cl`, still reported as the kind of wrong they
 are. `msvc-o2` runs the same script over the `/O2` build and is **measured but not gated** (no
-`KNOWN_GAPS` entry = report, don't fail): 91.40 % mean, 74 of 89 past the gate, because `cl /O2`
+`KNOWN_GAPS` entry = report, don't fail): 91.40 % mean, 75 of 89 past the gate, because `cl /O2`
 splits a function into hot and cold COMDAT blocks and the image's `.pdata` then names a block.
 Group 3 is held to its categories for `/Od` only: at `/O2` the optimiser can make a deliberately
 wrong candidate score 100 %, which is a fact about the gate, not a bug in the report.
@@ -193,6 +194,35 @@ Exit 2 when there is no `cl`, no build, or no analysis of it.
 
 `decomp check` prints the same facts about the installed toolchain (versions, the toolset family,
 the Windows SDK state).
+
+## The C++ structure of a PE (MS-5)
+
+```sh
+.venv/bin/python Tests/tools/check_msvc_structures.py         # groups 1, 2, 5 need an analysed
+                                                              # msvc-o0; 3 needs `cl`
+```
+
+Six groups, and every expectation comes from the answer key, from `structs.h`, or from what the
+file itself carries. **(1) The records**: the model chosen for a `cl` binary is the MSVC one, every
+class names a type descriptor, every vftable is claimed by an RTTICompleteObjectLocator, and the
+class-hierarchy walk came from the base-class descriptors, not from a symbol. **(2) The
+structure**: the three benchmark classes with their bases, **3 vftable slots each** (MSVC has no
+offset-to-top and one destructor slot; the Itanium form of the same source has 4), every slot
+pointing at the answer key's real method, no constructor or destructor claimed that the compiler
+did not build for that class, the real ones identified where the file proves them, the member
+offsets of `structs.h` in the Microsoft x64 layout (`+0x8`/`+0xc`, `+0x10`/`+0x14`), nothing
+outside the object, and a pure slot either claimed or named as a limit. **(3) One object, one
+name**: `object_at` on the target's descriptor and `normalize.clean_symbol` on the object's
+`??_R0?AVCVehicleEntity@@@8` must produce the same words, and STRUCT-24 must pass `try`. **(4) A
+shipped 32-bit binary**: `Tests/Proprietary/deadrising2.exe` - 770 type descriptors, 769 classes,
+hierarchy, nested names, absolute-address records reported as such, and its 27,796-line `types.h`
+compiling. **(5) Notepad**: no `.?AV` string, so no classes, and the reason in the notes. **(6) A
+MinGW PE is not an MSVC target**: `Tests/build/mingw-o0` must be read by the Itanium model.
+Exit 2 for a group whose target or compiler is absent.
+
+The `cl`-needed group is the one MS-3 left open, so if you are changing RTTI naming, run both
+this and `check_coff_candidate.py`: the second is the one that turns a naming failure into a
+failing unit.
 
 ## What an MSVC build is (MS-4)
 

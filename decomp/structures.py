@@ -59,6 +59,24 @@ _TYPE_INFO_VTABLE = re.compile(r"__cxxabiv1::(_*(?:class|si_class|vmi_class|fund
 # A slot that cannot be a method: the start of the next vtable/type_info object.
 _NOT_A_METHOD = re.compile(r"^(vtable|typeinfo) for ")
 
+# MSVC's RTTI (Docs/MSVC-Plan.md MS-5). The type name in the file is `.?AVX@@`; every other
+# MSVC RTTI object hangs off it as a chain of 4-byte references, and the widths differ by
+# architecture in the way that plan's §8 says to expect:
+#
+#   type descriptor            = [its vftable pointer, zero, ".?AVX…@@"]  (a 2*ptr header)
+#   RTTICompleteObjectLocator  = [signature(0|1), vftable offset, cdOffset,
+#                                 type descriptor, class hierarchy descriptor(, itself)]
+#   class hierarchy descriptor = [signature, attributes, base count, base class array]
+#   base class descriptor      = [type descriptor, contained bases, disp, vftable offset,
+#                                  vbase offset, attributes, class hierarchy descriptor]
+#   vftable                    = [<the locator>, method*, …]  (an object's vptr = slot 0)
+#
+# On x64 those 4-byte fields are RVAs (from the image base) and a vftable slot is a full
+# pointer; on x86 every one of them is an absolute address. Both measured, both handled.
+_MSVC_TYPE_STRING = re.compile(rb"\.?\?A[VUE][\x20-\x7e]{1,300}?@@")
+# The CRT's pure-virtual thunk: importable by name (/MD), unnamed once it is linked in.
+_MSVC_PURECALL = re.compile(r"^_?_?purecall$", re.IGNORECASE)
+
 # How wide one access is, from the mnemonic where the size is written in it.
 _SUFFIX_WIDTH = {"b": 1, "w": 2, "l": 4, "q": 8}
 # Mnemonics whose memory operand is the destination (AT&T writes them first, capstone lists
@@ -256,6 +274,16 @@ class Recovery:
 		self.bits = 32 if ":32:" in language else (64 if ":64:" in language else 0)
 		self.ptr = self.bits // 8
 		self.image = image or TargetImage(Path(str(meta.get("target_path") or "")), self.offset)
+		self.image_base = int(str(meta.get("image_base") or 0) or 0) or (
+			self.image.file_address_base() if not self.image.error else 0)
+		# Two RTTI models, chosen by what the target says it is (MSVC-Plan §1: a PE built by GCC
+		# is not an MSVC target, and its RTTI is the Itanium one).
+		self.abi = self._choose_abi()
+		# What to call the two objects, in the model that was chosen for this file. They are the
+		# same idea to a reader and different structures to the compiler, and the words matter:
+		# "vtable" and "type_info" are Itanium, "vftable" and "type descriptor" are MSVC's.
+		self.words = {"table": "vftable" if self.abi == "msvc" else "vtable",
+			"type": "type descriptor" if self.abi == "msvc" else "type_info"}
 		self.classes: dict[str, Klass] = {}
 		self.vtables: dict[int, dict] = {}
 		self.typeinfos: dict[int, dict] = {}
@@ -265,6 +293,27 @@ class Recovery:
 		self._data: list[tuple[int, int, bytes]] = []
 		self._probing: set[int] = set()
 		self._built = False
+
+	def _choose_abi(self) -> str:
+		"""Which RTTI this target's file carries: the Itanium one or MSVC's.
+
+		The build note answers it when the analysis recorded one: `compiler_hint` comes from the
+		file's own `.comment`/Rich header, which is evidence about the *target*. The variant the
+		analysis was configured with is only a guess about the target (a proprietary binary is
+		often analysed under a stand-in variant), so it comes second, and a PE with neither is
+		tried as MSVC first because that is what a PE without a build note usually is - and
+		`_msvc_read` says so out loud when the file turns out to carry no type descriptors.
+		"""
+		hint = str(self.meta.get("compiler_hint") or "").lower()
+		driver = str(self.meta.get("variant_compiler") or "").lower()
+		for name in (hint, driver):
+			if name in ("msvc", "cl", "cl.exe") or name.endswith("-cl"):
+				return "msvc"
+			if name in ("gcc", "g++", "clang", "clang++") or "mingw" in name:
+				return "itanium"
+		if str(self.meta.get("target_format") or "").upper() == "PE":
+			return "msvc"
+		return "itanium"
 
 	def build(self) -> "Recovery":
 		if self._built:
@@ -276,6 +325,25 @@ class Recovery:
 				% (self.meta.get("language_id") or "an unknown language"))
 			return self._finish(started)
 		self._load_data()
+		if self.abi == "msvc":
+			self._msvc_read()
+			if not self.typeinfos:
+				# Nothing in the file is MSVC's RTTI. A PE with no build note is usually one, but
+				# a GCC-built PE (Docs/MSVC-Plan.md §1) is not, and the Itanium model is the one
+				# that can read it - so ask the file, and say which answer it gave.
+				self.notes.append("no MSVC type descriptor in this file either: its RTTI is not "
+					"MSVC's, so the Itanium model was tried in its place")
+				self.abi = "itanium"
+				self._itanium_probe()
+		else:
+			self._itanium_probe()
+		self._link_classes()
+		self._classify_members()
+		self._recover_fields()
+		return self._finish(started)
+
+	def _itanium_probe(self) -> None:
+		"""The Itanium pass: probe every address that could be a vtable or a type_info."""
 		queue = list(dict.fromkeys(self._seeds()))
 		rounds = 0
 		while queue and rounds < 8:
@@ -288,10 +356,6 @@ class Recovery:
 			queue = [item for item in dict.fromkeys(next_round) if item and item not in
 				self.typeinfos and item not in self.vtables]
 		self._find_unreferenced_vtables()
-		self._link_classes()
-		self._classify_members()
-		self._recover_fields()
-		return self._finish(started)
 
 	def _finish(self, started: float) -> "Recovery":
 		self.seconds = round(time.time() - started, 3)
@@ -317,9 +381,11 @@ class Recovery:
 		if not self._data:
 			self.notes.append("no readable %s section in %s" % ("/".join(_HOLDING),
 				self.image.path))
-		elif str(self.meta.get("format") or "").upper() == "PE":
-			self.notes.append("this is a PE: MSVC's RTTI (RTTICompleteObjectLocator) is a different "
-				"form and is not read here - Docs/MSVC-Plan.md MS-5")
+		elif self.abi == "msvc":
+			# Measured: cl puts the type descriptors and the locators in `.data` (a /MT build of
+			# this benchmark) and the vftables in `.rdata`; a DLL-CRT build puts them in `.rdata`.
+			# Both are in the list above, and MSVC never uses a `.data.rel.ro`.
+			pass
 
 	def _bytes_at(self, address: int, length: int) -> bytes | None:
 		for start, size, chunk in self._data:
@@ -551,6 +617,218 @@ class Recovery:
 		self.vtables[start] = record
 		return record
 
+	# -- the MSVC model (Docs/MSVC-Plan.md MS-5) ---------------------------------------
+	#
+	# A parallel implementation of the pass above, not a generalisation of it: MSVC's type
+	# system is a graph of small records that reference each other by 4-byte fields (RVAs on
+	# x64, absolute addresses on x86), and its vftable has no header at all - an object's vptr
+	# is slot 0, and the one slot *before* the table points at the class's
+	# RTTICompleteObjectLocator. So the anchor here is the `.?AV<name>@@` type-name string, and
+	# everything else is reached from it.
+
+	def _msvc_word(self, address: int, width: int) -> int | None:
+		raw = self._bytes_at(address, width)
+		if raw is None or len(raw) < width:
+			return None
+		return int.from_bytes(raw, "little")
+
+	def _msvc_field(self, address: int, width: int) -> tuple[int | None, str]:
+		"""One reference stored in an RTTI record: (the address it names, how it is encoded).
+
+		A field the width of a pointer holds an address; a 4-byte field holds an RVA on x64 and
+		an address on x86. Measured: the type descriptors of a `/MT` build of this benchmark are
+		in `.data`, each with a full vftable pointer and a zero pad, and its locators reference
+		them by RVA; `deadrising2.exe`, a 32-bit MSVC binary, references everything absolutely.
+		"""
+		value = self._msvc_word(address, width)
+		if not value:
+			return None, ""
+		if width == self.ptr or self.ptr == 4:
+			return value + self.offset, "address" if width == self.ptr else "absolute"
+		return value + self.image_base + self.offset, "rva"
+
+	def _msvc_mapped(self, address: int | None, width: int = 1) -> bool:
+		return bool(address) and self._bytes_at(address, width) is not None
+
+	def _msvc_typeinfo_at(self, string_address: int, text: str) -> dict | None:
+		"""The type descriptor whose name string is at `string_address`.
+
+		The header is two fields of one width, and only one width puts the string where the name
+		belongs and lands the pointer in front of it on a real section: that is what decides the
+		form, so a target built by another toolset era is read the same way.
+		"""
+		address = string_address - 2 * self.ptr
+		if address in self.typeinfos:
+			return self.typeinfos[address]
+		_kind, pretty = normalize.msvc_type_name(text)
+		if not pretty:
+			return None
+		for width in dict.fromkeys([self.ptr, 4]):
+			header = 2 * width
+			at = string_address - header
+			vptr, form = self._msvc_field(at, width)
+			pad = self._msvc_word(at + width, width)
+			if pad or not self._msvc_mapped(vptr, self.ptr):
+				continue
+			record = {"address": at, "mangled": text, "name": pretty, "kind":
+				"MSVC type descriptor (%s)" % text, "bases": [], "vptr": vptr, "form": form,
+				"name_address": string_address, "symbol": self._symbol_at(at),
+				"length": header + len(text) + 1, "col": None, "chd": None, "claims": [],
+				"msvc": True}
+			self.typeinfos[at] = record
+			return record
+		return None
+
+	def _msvc_chd(self, chd: int | None) -> tuple[int, list[tuple[int, int, int]]] | None:
+		"""One RTTIClassHierarchyDescriptor -> (the count it states, its base-class descriptors).
+
+		A descriptor is [signature, attributes, base count, array of base-class descriptors] and
+		each of those is [type descriptor, contained bases, displacement, vftable offset, vbase
+		offset, attributes, class hierarchy descriptor]. The displacement is the field that
+		matters here: it is where the base subobject sits inside the derived class, which is what
+		a multiple-inheritance thunk adjusts `this` by.
+		"""
+		if not self._msvc_mapped(chd, 16):
+			return None
+		if (self._msvc_word(chd, 4) or 0) > 1:
+			return None
+		count = self._msvc_word(chd + 8, 4) or 0
+		array, _form = self._msvc_field(chd + 12, 4)
+		if not 1 <= count <= MAX_SLOTS or not self._msvc_mapped(array, 4 * count):
+			return None
+		descriptors: list[tuple[int, int, int]] = []
+		for step in range(count):
+			bcd, _form = self._msvc_field(array + 4 * step, 4)
+			if not self._msvc_mapped(bcd, 0x1c):
+				continue
+			typeinfo, _form = self._msvc_field(bcd, 4)
+			descriptors.append((typeinfo or 0, _signed(self._msvc_word(bcd + 8, 4)),
+				_signed(self._msvc_word(bcd + 0xc, 4))))
+		return count, descriptors
+
+	def _msvc_class_of(self, locator: int) -> tuple[int, dict] | None:
+		"""An RTTICompleteObjectLocator -> (its type descriptor, what the locator states).
+
+		Accepted only when the class hierarchy it names carries a descriptor for this very type:
+		the first entry of a class's own base-class array describes the class itself, and that is
+		what separates a locator from the base-class descriptor that references the same type
+		descriptor at its own offset 0.
+		"""
+		typeinfo, _form = self._msvc_field(locator + 0xc, 4)
+		if typeinfo not in self.typeinfos:
+			return None
+		signature = self._msvc_word(locator, 4)
+		if signature not in (0, 1):
+			return None
+		parsed = self._msvc_chd(self._msvc_field(locator + 0x10, 4)[0])
+		if not parsed or all(item[0] != typeinfo for item in parsed[1]):
+			return None
+		count, descriptors = parsed
+		self_reference = self._msvc_word(locator + 0x14, 4)
+		if signature == 1 and self_reference not in (
+				locator - self.image_base - self.offset, locator - self.offset):
+			self.notes.append("the locator at %#x states signature 1 but carries no self-reference "
+				"at +0x14" % locator)
+		return typeinfo, {"locator": locator, "signature": signature,
+			"offset": _signed(self._msvc_word(locator + 4, 4)),
+			"cd_offset": _signed(self._msvc_word(locator + 8, 4)),
+			"chd": self._msvc_field(locator + 0x10, 4)[0], "count": count,
+			"bases": [item for item in descriptors if item[0] != typeinfo],
+			"self": [item for item in descriptors if item[0] == typeinfo]}
+
+	def _msvc_vftable(self, slot: int, locator: int, typeinfo: int) -> dict | None:
+		"""The vftable that starts one slot after a pointer to its locator. The slots run until
+		something that is not a function of this image, which is where the next object starts.
+		"""
+		if slot in self.vtables:
+			return self.vtables[slot]
+		slots: list[dict] = []
+		position = slot
+		bound = min(slot + MAX_OBJECT_BYTES, slot + MAX_SLOTS * self.ptr)
+		while position + self.ptr <= bound:
+			value, _form = self._msvc_field(position, self.ptr)
+			if not value or value == locator:
+				break
+			if not (cache.function_at(self.conn, value) or cache.inside_function(self.conn,
+					value)):
+				break
+			slots.append({"offset": position - slot, "kind": "function", "address": value,
+				"name": "", "pure": False})
+			position += self.ptr
+		if not slots:
+			return None
+		record = {"address": slot, "typeinfo": typeinfo, "slots": slots, "vptr": slot,
+			"length": position - slot, "offset_to_top": None, "col": locator,
+			"symbol": self._symbol_at(slot)}
+		self.vtables[slot] = record
+		return record
+
+	def _msvc_read(self) -> None:
+		"""Type descriptors first, then the locators that name them, then the vftables that name
+		those. Three passes over the file's initialised data; nothing is guessed between them.
+		"""
+		if self.image.error:
+			return
+		strings: list[tuple[int, str]] = []
+		for start, size, chunk in self._data:
+			for match in _MSVC_TYPE_STRING.finditer(chunk):
+				text = match.group(0).decode("ascii", "replace")
+				strings.append((start + match.start(),
+					text if text.startswith(".") else "." + text))
+		if not strings:
+			self.notes.append("no `.?AV…` type-name string in this file, so it carries no MSVC "
+				"RTTI and no class can be recovered from it (C code, or built with /GR-)")
+			return
+		for string_address, text in strings:
+			self.probed += 1
+			self._msvc_typeinfo_at(string_address, text)
+		# every 4-byte field in the data that names a type descriptor: a locator (at -0xc) or a
+		# base-class descriptor (at -0). `_msvc_class_of` tells those apart by structure.
+		wanted = set()
+		for address in self.typeinfos:
+			wanted.add(address - self.offset)                    # absolute
+			wanted.add(address - self.image_base - self.offset)  # RVA
+		locators: dict[int, dict] = {}
+		for start, size, chunk in self._data:
+			for offset in range(0, max(0, size - 0x18), 4):
+				value = int.from_bytes(chunk[offset:offset + 4], "little")
+				if value not in wanted:
+					continue
+				parsed = self._msvc_class_of(start + offset - 0xc)
+				if parsed is None:
+					continue
+				typeinfo, claims = parsed
+				locators[claims["locator"]] = dict(claims, typeinfo=typeinfo)
+				info = self.typeinfos[typeinfo]
+				info["col"] = claims["locator"]
+				info["chd"] = claims["chd"]
+				info["bases"] = [item[0] for item in claims["bases"]
+					if item[0] in self.typeinfos]
+				info.setdefault("claims", []).append(claims)
+		# the vftable is the object whose first slot follows a pointer to its locator
+		wanted = {locator - self.offset for locator in locators}
+		found = 0
+		for start, size, chunk in self._data:
+			for offset in range(0, max(0, size - self.ptr), self.ptr):
+				value = int.from_bytes(chunk[offset:offset + self.ptr], "little")
+				if value not in wanted:
+					continue
+				claims = locators.get(value + self.offset)
+				if claims is None:
+					continue
+				# the vftable starts where the pointer to its locator ends - at the *slot*, not at
+				# the address the slot holds
+				if self._msvc_vftable(start + offset + self.ptr, value + self.offset,
+						claims["typeinfo"]):
+					found += 1
+		if not locators:
+			self.notes.append("%d type descriptor(s) and no RTTICompleteObjectLocator naming any "
+				"of them: nothing in this file takes the address of a vtable for those types, so "
+				"their vftables and method slots are unknown" % len(self.typeinfos))
+		self.notes.append("MSVC RTTI read from the file: %d type descriptor(s), %d locator(s), "
+			"%d vftable(s); the records reference each other by %s" % (len(self.typeinfos),
+				len(locators), found, "absolute 4-byte addresses" if self.ptr == 4 else "4-byte RVAs"))
+
 	def _find_unreferenced_vtables(self) -> None:
 		"""Look for the vtable of any type_info no vtable has been found for.
 
@@ -582,9 +860,37 @@ class Recovery:
 			if klass is None:
 				klass = self.classes[info["name"]] = Klass(name=info["name"],
 					mangled=info["mangled"], typeinfo=address)
-			klass.evidence.append("type_info at %s: name string %s is %r, its own vptr is %s, "
-				"so it is a %s" % (_hex(address), _hex(info["name_address"]), info["mangled"],
-					_hex(info["vptr"]) if info["vptr"] else "unresolved", info["kind"]))
+			if info.get("msvc"):
+				klass.evidence.append(
+					"MSVC type descriptor at %s: the name string at %s is %r, which is the "
+					"decoration for a %s named %s; its own vftable pointer is %s (%s-encoded)"
+					% (_hex(address), _hex(info["name_address"]), info["mangled"],
+						"class" if info["mangled"].startswith(".?AV") else
+						"struct" if info["mangled"].startswith(".?AU") else "type",
+						info["name"], _hex(info["vptr"]) if info["vptr"] else "unresolved",
+						info.get("form", "")))
+				for claims in info.get("claims", []):
+					klass.evidence.append(
+						"RTTICompleteObjectLocator at %s (signature %d, vftable offset %d, cdOffset "
+						"%d) names it, and its RTTIClassHierarchyDescriptor at %s carries %d base "
+						"class descriptor(s)"
+						% (_hex(claims["locator"]), claims["signature"], claims["offset"],
+							claims["cd_offset"], _hex(claims["chd"]) if claims["chd"] else "unresolved",
+							len(claims["bases"])))
+					for typeinfo, where, vftable_offset in claims["bases"]:
+						base = self.typeinfos.get(typeinfo)
+						if base is None:
+							continue
+						klass.evidence.append(
+							"the base-class descriptor for %s states displacement %d and vftable "
+								"offset %d: that is where the %s subobject sits inside a %s, and what a "
+							"thunk adjusts `this` by when one of its methods is reached through it"
+							% (base["name"], where, vftable_offset, base["name"], klass.name))
+			else:
+				klass.evidence.append(
+					"type_info at %s: name string %s is %r, its own vptr is %s, so it is a %s"
+					% (_hex(address), _hex(info["name_address"]), info["mangled"],
+						_hex(info["vptr"]) if info["vptr"] else "unresolved", info["kind"]))
 			for base in info["bases"]:
 				target = self.typeinfos.get(base)
 				if target and target["name"] not in klass.bases:
@@ -596,11 +902,22 @@ class Recovery:
 			klass = self.classes.get(info["name"])
 			if klass is None:
 				continue
+			if klass.vtable is not None and not self._primary_table(table):
+				continue      # a second vftable of one class: reported, but not the object's vptr
 			klass.vtable = start
-			klass.evidence.append("vtable at %s, %d slot%s, vptr = +%#x, offset-to-top %s%s"
-				% (_hex(start), len(table["slots"]), "" if len(table["slots"]) == 1 else "s",
-					2 * self.ptr, table["offset_to_top"],
-					"; the file names it " + table["symbol"] if table["symbol"] else ""))
+			if self.abi == "msvc":
+				klass.evidence.append(
+					"vftable at %s, %d slot%s: an object's vptr is its first slot (+0x%x) and the "
+					"locator for this class sits in the slot before it at %s%s"
+					% (_hex(start), len(table["slots"]), "" if len(table["slots"]) == 1 else "s",
+						0, _hex(table.get("col")) if table.get("col") else "nowhere",
+						"; the file names it " + table["symbol"] if table["symbol"] else ""))
+			else:
+				klass.evidence.append(
+					"vtable at %s, %d slot%s, vptr = +%#x, offset-to-top %s%s"
+					% (_hex(start), len(table["slots"]), "" if len(table["slots"]) == 1 else "s",
+						2 * self.ptr, table["offset_to_top"],
+						"; the file names it " + table["symbol"] if table["symbol"] else ""))
 			for index, slot in enumerate(table["slots"]):
 				method = Method(index=index, offset=slot["offset"],
 					kind="pure" if slot["pure"] else slot["kind"], address=slot["address"],
@@ -609,6 +926,8 @@ class Recovery:
 				if slot["kind"] == "null":
 					klass.notes.append("vtable slot +%#x is null in this file: no relocation and"
 						" zero bytes there" % slot["offset"])
+			if self.abi == "msvc":
+				self._msvc_pure_slots(klass, table)
 		for klass in self.classes.values():
 			if klass.vtable is None:
 				klass.notes.append("no vtable pointing at this type_info was found in the file: the "
@@ -619,6 +938,47 @@ class Recovery:
 				if parent and parent.vtable and klass.vtable and klass.vtable > parent.vtable:
 					klass.evidence.append("its vtable sits after %s's in the file, which is what "
 						"a derived class's does" % base)
+
+	def _primary_table(self, table: dict) -> bool:
+		"""Is this the vftable an object's vptr points at? A class with multiple inheritance has
+		one per base subobject, and only the one its locator places at offset 0 is the primary.
+		"""
+		info = self.typeinfos.get(table["typeinfo"], {})
+		for claims in info.get("claims", []):
+			if claims.get("locator") == table.get("col"):
+				return claims.get("offset") == 0
+		return True
+
+	def _msvc_pure_slots(self, klass: "Klass", table: dict) -> None:
+		"""Which MSVC vftable slots are pure virtuals, and on what evidence.
+
+		MSVC puts the CRT's `_purecall` in the slot of a pure virtual function. That name is only
+		in a PE when the CRT is a DLL (a `/MD` build imports it); once the CRT is linked in (`/MT`)
+		the image gives the function no name at all, and then a pure slot and an inherited one, or
+		one the linker folded into another class's, look the same from the data: the same address,
+		in more than one vftable, unreached by any call. Nothing distinguishes them, so only the
+		name is claimed and the rest is said as a limit.
+		"""
+		unnamed = False
+		for slot in table["slots"]:
+			target = slot["address"]
+			if not target:
+				continue
+			name = (self._method_name(target) or "").replace(".", "_")
+			if _MSVC_PURECALL.match(name):
+				slot["pure"] = True
+				klass.evidence.append("vtable slot %d points at %s, the CRT's pure-virtual thunk"
+					% (slot["offset"] // max(self.ptr, 1), name))
+				continue
+			calls = self.conn.execute("SELECT COUNT(*) FROM refs WHERE to_address = ? AND ref_type"
+				" LIKE '%CALL'", (target,)).fetchone()[0]
+			if not calls:
+				unnamed = True
+		if unnamed:
+			klass.notes.append("one or more slots point at a function no call in this image "
+				"reaches; a pure virtual's `_purecall` slot has exactly that shape, and with the "
+				"CRT linked in this file names no function, so those slots are reported as slots "
+				"and not claimed pure")
 
 	def _method_name(self, address: int | None) -> str:
 		"""The name of the function a slot points at, if one exists to be had."""
@@ -649,6 +1009,10 @@ class Recovery:
 		  the base constructor and a derived destructor calls the base destructor, and both write
 		  the base's vptr, so without a name the two are not separable - and it says "constructor
 		  or destructor" rather than picking one.
+
+		On a PE nothing has a name, so the last rule would leave every constructor and destructor
+		unseparated. MSVC's vtable shape settles it: the destructor slot holds the deleting form,
+		which calls the function that writes the vptr (see `_classify_members`'s `msvc_pairs`).
 		"""
 		in_vtables: dict[int, tuple[int, int]] = {}
 		for start, table in self.vtables.items():
@@ -679,6 +1043,51 @@ class Recovery:
 				continue
 			if any(int(caller["entry"]) in frees for caller in cache.callers(self.conn, row["id"])):
 				called_by_deleting.add(entry)
+			# On a PE nothing of this is named, so the same relation is read the other way: an
+			# MSVC vftable's destructor slot holds the *deleting* destructor, which does not store
+			# the vptr itself - it calls the one that does, then frees the storage. So a slot of a
+			# class's own vftable that reaches a destructor of that class or of one of its bases is
+			# the deleting destructor, and the function it calls directly is the destructor.
+		msvc_pairs: dict[int, tuple[int, int, int]] = {}
+		msvc_shared: dict[int, list[str]] = {}
+		if self.abi == "msvc":
+			writers_of: dict[int, set[int]] = {}
+			for entry, targets in writers.items():
+				for start, _slot in targets:
+					writers_of.setdefault(start, set()).add(entry)
+			for name, klass in sorted(self.classes.items()):
+				tables = [klass.vtable] if klass.vtable else []
+				seen_bases: list[str] = []
+				queue = list(klass.bases)
+				while queue:
+					base = queue.pop(0)
+					if base in seen_bases:
+						continue
+					seen_bases.append(base)
+					parent = self.classes.get(base)
+					if parent is None:
+						continue
+					if parent.vtable:
+						tables.append(parent.vtable)
+					queue += parent.bases
+				reaching = set().union(*[writers_of.get(table, set()) for table in tables]) \
+					if tables else set()
+				for table in [klass.vtable] if klass.vtable else []:
+					for index, slot in enumerate(self.vtables[table]["slots"]):
+						entry = slot["address"]
+						if not entry or entry in writers_of.get(table, set()):
+							continue      # it stores this class's vptr: the slot rule covers it
+						callee = self._msvc_reaches(entry, reaching)
+						if not callee:
+							continue
+						owners = sorted({other.name for other in self.classes.values()
+							if other.vtable and any(item["address"] == entry
+								for item in self.vtables[other.vtable]["slots"])})
+						if len(owners) > 1:
+							msvc_shared.setdefault(entry, owners)
+							continue
+						msvc_pairs[entry] = (table, index, callee)
+						called_by_deleting.add(callee)
 		for entry, targets in sorted(writers.items()):
 			for start, slot in targets:
 				info = self.typeinfos.get(self.vtables[start]["typeinfo"])
@@ -698,7 +1107,8 @@ class Recovery:
 				else:
 					role = "constructor or destructor"
 					why = ("it stores this class's vptr (%s = vtable +%#x) and is not in any vtable"
-						% (_hex(self.vtables[start]["vptr"]), 2 * self.ptr))
+						% (_hex(self.vtables[start]["vptr"]),
+							0 if self.abi == "msvc" else 2 * self.ptr))
 				klass.roles[entry] = role
 				claim = "%s at %s: %s" % (role, _hex(entry), why)
 				if role in ("deleting destructor", "destructor"):
@@ -708,15 +1118,46 @@ class Recovery:
 					klass.constructors.append(entry)
 				if claim not in klass.evidence:
 					klass.evidence.append(claim)   # the same vptr is written twice in a real body
+		for entry, (start, index, callee) in sorted(msvc_pairs.items()):
+			info = self.typeinfos.get(self.vtables[start]["typeinfo"])
+			klass = self.classes.get(info["name"]) if info else None
+			if klass is None:
+				continue
+			klass.roles[entry] = "deleting destructor"
+			if entry not in klass.destructors:
+				klass.destructors.append(entry)
+			for method in klass.methods:
+				if method.address == entry:
+					method.deleting = True
+			klass.evidence.append("deleting destructor at %s: it is vtable slot %d and it calls %s, "
+				"which reaches a destructor of this class or of one of its bases - the destructor "
+				"form that frees the storage" % (_hex(entry), index, _hex(callee)))
+			if klass.roles.get(callee) in (None, "", "constructor or destructor"):
+				if callee in klass.constructors:
+					klass.constructors.remove(callee)
+				klass.roles[callee] = "destructor"
+				if callee not in klass.destructors:
+					klass.destructors.append(callee)
+				klass.evidence.append("destructor at %s: the deleting destructor in this class's "
+					"vftable calls it directly" % _hex(callee))
+		for entry, owners in sorted(msvc_shared.items()):
+			for name in owners:
+				klass = self.classes.get(name)
+				if klass is not None:
+					klass.notes.append("its vftable's destructor slot (%s) is shared with %s: the "
+						"linker folded the two identical deleting destructors into one, so this file "
+						"cannot say which destructor it runs for this class"
+						% (_hex(entry), ", ".join(sorted(set(owners) - {name}))))
 		for klass in self.classes.values():
 			for method in klass.methods:
 				if method.address in deleting:
 					method.deleting = True
-				# the ABI puts the destructor pair in the first two slots, so when one of them is
-				# identified and its neighbour is not, the neighbour is the other half - stated as a
-				# reading of the ABI next to the fact, never as a claim of its own
-				if method.index > 1 or method.kind != "function" or not method.address or \
-						klass.roles.get(method.address):
+				# the Itanium ABI puts the destructor pair in the first two slots, so when one of
+				# them is identified and its neighbour is not, the neighbour is the other half -
+				# stated as a reading of the ABI next to the fact, never as a claim of its own. MSVC
+				# has one destructor slot, so its neighbour is just the next virtual function.
+				if self.abi == "msvc" or method.index > 1 or method.kind != "function" or \
+						not method.address or klass.roles.get(method.address):
 					continue
 				if any(other.index == method.index - 1 and other.address and
 						klass.roles.get(other.address, "") in ("destructor", "deleting destructor")
@@ -726,6 +1167,36 @@ class Recovery:
 						klass.destructors.append(method.address)
 					klass.evidence.append("destructor at %s: vtable slot %d, directly after the slot "
 						"this class's destructor is in" % (_hex(method.address), method.index))
+
+	def _msvc_reaches(self, entry: int, reaching: set[int], depth: int = 3) -> int:
+		"""The first function `entry` calls on a chain that reaches one of `reaching`.
+
+		A derived class with nothing of its own to clean up has a destructor that stores no vptr:
+		at `/Od` it is a stub whose only call is the base class's destructor. So "the vftable's
+		destructor slot calls the thing that stores this class's vptr" has to be followed through
+		the call or two in between, and the function at the other end of that first hop is the
+		class's own destructor.
+		"""
+		frontier, parents = [(entry, 0)], {entry: 0}
+		while frontier:
+			here, steps = frontier.pop(0)
+			if steps >= depth:
+				continue
+			row = cache.function_at(self.conn, here)
+			if row is None:
+				continue
+			for item in cache.targets_of(self.conn, row["id"]):
+				target = int(item["address"] or 0)
+				if not target or target in parents:
+					continue
+				parents[target] = here
+				if target in reaching:
+					node = target
+					while parents[node] != entry:
+						node = parents[node]
+					return node
+				frontier.append((target, steps + 1))
+		return 0
 
 	def _calls_operator_delete(self, entry: int) -> bool:
 		"""Does this function free storage through `operator delete`? Only the deleting form of
@@ -779,11 +1250,16 @@ class Recovery:
 		handle = normalize.capstone_for(str(self.meta.get("language_id") or ""), detail=True)
 		from capstone import CS_OP_MEM, CS_OP_REG
 		from capstone.x86 import (X86_REG_EBP, X86_REG_ECX, X86_REG_ESP, X86_REG_RBP,
-			X86_REG_RDI, X86_REG_RSP)
-		this_register = {64: X86_REG_RDI, 32: X86_REG_ECX}.get(self.bits)
+			X86_REG_RCX, X86_REG_RDI, X86_REG_RSP)
+		# Where `this` starts: %rdi in the 64-bit SysV ABI, %rcx in the Microsoft x64 one. On
+		# 32-bit x86 the Microsoft thiscall puts it in %ecx, and GCC passes it on the stack (the
+		# frame-slot seeding below covers that).
+		this_register = {64: X86_REG_RCX if self.abi == "msvc" else X86_REG_RDI,
+			32: X86_REG_ECX}.get(self.bits)
 		# -O0 spills `this` to the frame and reloads it: follow it there, or almost every
 		# field offset in an -O0 build stays invisible. The frame register differs by width.
 		frame = {X86_REG_EBP, X86_REG_ESP} if self.bits == 32 else {X86_REG_RBP, X86_REG_RSP}
+		stack_register = {32: X86_REG_ESP, 64: X86_REG_RSP}.get(self.bits)
 		for klass in self.classes.values():
 			if handle is None or not this_register:
 				klass.notes.append("no decoder for this target, so the field offsets could not "
@@ -795,16 +1271,31 @@ class Recovery:
 					"layout is unknown")
 				continue
 			for entry, blob, name in bodies:
-				# Where `this` starts: %rdi in the 64-bit SysV ABI. On 32-bit x86 GCC passes it on
-				# the stack, so the value to follow is the one at 8(%ebp) - the first argument -
-				# and %ecx as well, which is where the Microsoft 32-bit ABI and `thiscall` put it.
-				tainted, slots = {this_register}, ({8} if self.bits == 32 else set())
+				# Where `this` starts: %rdi in the 64-bit SysV ABI, %rcx in the Microsoft x64 one.
+				# On 32-bit x86 GCC passes it on the stack, so the value to follow is the one at
+				# 8(%ebp) - the first argument - and %ecx as well, which is where the Microsoft
+				# 32-bit thiscall puts it.
+				tainted = {this_register}
+				# Frame slots are keyed by the register they are offsets *from*: a `-m32` build
+				# reaches `this` through `8(%ebp)`, and an MSVC x64 `/Od` body spills it to
+				# `8(%rsp)` and then moves %rsp. Mixing the two domains, or shifting a %rbp-relative
+				# slot because %rsp moved, loses the trail.
+				frame_register = X86_REG_EBP if self.bits == 32 else X86_REG_RBP
+				slots: dict[int, set[int]] = ({frame_register: {8}} if self.bits == 32
+					else {})
 				for instruction in handle.disasm(blob, entry):
 					operands = list(instruction.operands)
 					memory = [item for item in operands if item.type == CS_OP_MEM]
 					last_is_memory = bool(operands) and operands[-1].type == CS_OP_MEM
 					stores = instruction.mnemonic.startswith(_STORE_PREFIXES) and last_is_memory
 					reads = bool(memory) and not stores
+					shift = _stack_adjustment(instruction, operands, stack_register)
+					if shift and stack_register in slots:
+						# `cl` at /Od keeps no frame pointer: it spills `this` to `8(%rsp)`, then
+						# `sub $0x28,%rsp` and reaches it as `0x30(%rsp)`. A slot is an offset from
+						# one *stack pointer value*, so moving the pointer moves every slot recorded
+						# against it - without this, the spill and the reload never meet.
+						slots[stack_register] = {item + shift for item in slots[stack_register]}
 					for item in memory:
 						if item.mem.base not in tainted or item.mem.index or item.mem.disp < 0:
 							continue
@@ -817,11 +1308,12 @@ class Recovery:
 						tainted.add(operands[1].reg)      # `mov %rdi, %rbx`: the trail follows
 					for item in memory:
 						if item.mem.base in frame and len(operands) == 2:
+							known = slots.get(item.mem.base, set())
 							if stores and operands[0].type == CS_OP_REG and \
 									operands[0].reg in tainted:
-								slots.add(item.mem.disp)  # `this` spilled to the frame
+								slots.setdefault(item.mem.base, set()).add(item.mem.disp)
 							elif not stores and operands[-1].type == CS_OP_REG and \
-									item.mem.disp in slots:
+									item.mem.disp in known:
 								tainted.add(operands[-1].reg)
 					for reg, _size in _written_regs(instruction, handle):
 						if operands and operands[-1].type == CS_OP_REG and \
@@ -850,8 +1342,10 @@ class Recovery:
 		"""What a data address is, when it is a vtable or a type_info object.
 
 		This is what lets the two sides of a diff name the same object: the `.o` relocates
-		against `_ZTI14CVehicleEntity`, and RTTI in the stripped image says the very same thing
-		about the pointer slot the linked code reads. `address` may be any byte in the object.
+		against `_ZTI14CVehicleEntity` (on an MSVC target, `??_R0?AVCVehicleEntity@@@8`), and RTTI
+		in the stripped image says the very same thing about the pointer slot the linked code
+		reads - in the target's own RTTI format, on either ABI. `address` may be any byte in the
+		object.
 		"""
 		self.build()
 		for start, table in self.vtables.items():
@@ -860,14 +1354,26 @@ class Recovery:
 				name = info.get("name", "")
 				return {"role": "vtable", "class": name,
 					"name": ("vtable for %s" % name) if name else "",
-					"mangled": table["symbol"] or ("_ZTV" + info["mangled"] if info.get("mangled")
-						else ""),
+					"mangled": table["symbol"] or (
+						normalize.msvc_type_symbol("vtable", info["mangled"]) if info.get("msvc")
+						else ("_ZTV" + info["mangled"] if info.get("mangled") else "")),
 					"address": start, "size": table["length"]}
 		for start, info in self.typeinfos.items():
 			if start <= address < start + info["length"]:
 				return {"role": "typeinfo", "class": info["name"],
-					"name": "typeinfo for %s" % info["name"], "mangled": "_ZTI" + info["mangled"],
+					"name": "typeinfo for %s" % info["name"],
+					"mangled": normalize.msvc_type_symbol("typeinfo", info["mangled"])
+						if info.get("msvc") else "_ZTI" + info["mangled"],
 					"address": start, "size": info["length"]}
+			# an MSVC `dynamic_cast` can reach the locator or the class hierarchy record instead of
+			# the type descriptor; every one of them names one class, so every one is nameable
+			for claims in info.get("claims", []):
+				for record, words, size in ((claims.get("locator"), "complete object locator", 0x18),
+						(claims.get("chd"), "class hierarchy descriptor", 16)):
+					if record and record <= address < record + size:
+						return {"role": words, "class": info["name"],
+							"name": "%s for %s" % (words, info["name"]), "mangled": "",
+							"address": record, "size": size}
 		return None
 
 	def show_lines(self, entry: int) -> list[str]:
@@ -878,8 +1384,8 @@ class Recovery:
 			klass = self.classes.get(role["class"])
 			if klass is None:
 				continue
-			lines.append("%s of %s (vtable %s, type_info %s)" % (role["role"], role["class"],
-				_hex(klass.vtable), _hex(klass.typeinfo)))
+			lines.append("%s of %s (%s %s, %s %s)" % (role["role"], role["class"],
+				self.words["table"], _hex(klass.vtable), self.words["type"], _hex(klass.typeinfo)))
 			for field in klass.fields.values():
 				if any(site.endswith("@ %s" % _hex(entry)) for site in field.sites):
 					lines.append("touches %s +%#x (%d bytes)" % (role["class"], field.offset,
@@ -906,8 +1412,9 @@ class Recovery:
 	def summary(self) -> dict:
 		self.build()
 		return {"target": self.meta.get("target_path"), "target_key": self.meta.get("target_key"),
-			"bits": self.bits, "classes": len(self.classes), "vtables": len(self.vtables),
-			"typeinfos": len(self.typeinfos), "probed": self.probed, "seconds": self.seconds,
+			"abi": self.abi, "bits": self.bits, "classes": len(self.classes),
+			"vtables": len(self.vtables), "typeinfos": len(self.typeinfos),
+			"probed": self.probed, "seconds": self.seconds,
 			"notes": self.notes,
 			"names": sorted(self.classes)}
 
@@ -953,8 +1460,9 @@ class Recovery:
 		lines = ["// types.h - the C++ structure `decomp types` recovered from this target.",
 			"// target: %s (key %s)" % (self.meta.get("target_path"),
 				self.meta.get("target_key")),
-			"// vtables/type_info: %d/%d, classes: %d. Regenerate with: decomp types --write THIS"
-				% (len(self.vtables), len(self.typeinfos), len(self.classes)),
+			"// %s: %d/%d, classes: %d. Regenerate with: decomp types --write THIS"
+				% ("vftables/type descriptors" if self.abi == "msvc" else "vtables/type_info",
+					len(self.vtables), len(self.typeinfos), len(self.classes)),
 			"//",
 			"// Every offset below is a fact about the file and says which code proves it. The",
 			"// field names are placeholders - the real ones are what the decompilation is for.",
@@ -966,23 +1474,37 @@ class Recovery:
 			"#define %s" % include_guard,
 			""]
 		for name in sorted(self.classes):
-			lines.append("class %s;" % name)
+			if _identifiable(name):
+				lines.append("class %s;" % name)
 		lines.append("")
 		for name, klass in self.ordered_classes():
+			if not _identifiable(name):
+				lines.append("// %s - this file says what the type is, but its name is nested or"
+					% name)
+				lines.append("// carries template arguments, so it is not one identifier and cannot "
+					"be declared here.")
+				lines.append("//   %s" % (klass.evidence[0] if klass.evidence else "from its RTTI"))
+				continue
 			lines.extend(self._class_header(klass, pointer_width))
 			lines.append("")
 		lines.append("#endif // %s" % include_guard)
 		return "\n".join(lines) + "\n"
 
 	def _class_header(self, klass: Klass, pointer_width: int) -> list[str]:
+		# A name that is not one identifier (`.?AUX@Y@@` nests, `?$T@U@@` carries template
+		# arguments) cannot appear in a base list either, so those bases stay in the comment.
+		declared = [base for base in klass.bases if base in self.classes
+			and _identifiable(base)]
+		skipped = [base for base in klass.bases if not _identifiable(base)]
 		base_clause = ""
-		known = [base for base in klass.bases if base in self.classes]
-		if known:
-			base_clause = " : public %s" % ", public ".join(known)
+		if declared:
+			base_clause = " : public %s" % ", public ".join(declared)
 		lines = ["// %s - %s" % (name_or(klass.name), klass.evidence[0] if klass.evidence else
 			"recovered from its RTTI")]
 		for extra in klass.evidence[1:] + klass.notes:
 			lines.append("//   %s" % extra)
+		for base in skipped:
+			lines.append("//   base: %s - named by this file, but not declarable here" % base)
 		lines.append("#ifndef DECOMP_CLASS_%s" % _macro(klass.name))
 		lines.append("class %s%s" % (klass.name, base_clause))
 		lines.append("{")
@@ -999,8 +1521,9 @@ class Recovery:
 					kind, target, "  [calls operator delete: the deleting form]"
 						if method.deleting else ""))
 		if klass.pure_count:
-			lines.append("\t// %d of %d slots are __cxa_pure_virtual, so this class is abstract."
-				% (klass.pure_count, len(klass.methods)))
+			lines.append("\t// %d of %d slots are the CRT's pure-call thunk (%s), so this class is "
+				"abstract." % (klass.pure_count, len(klass.methods),
+					"_purecall" if self.abi == "msvc" else "__cxa_pure_virtual"))
 		if klass.constructors:
 			lines.append("\t// constructed at: %s" % ", ".join(_hex(item)
 				for item in klass.constructors))
@@ -1025,15 +1548,28 @@ class Recovery:
 			if offset > next_offset:
 				lines.append("\tunsigned char pad_%#x_[%d];%s// +%#x..%#x, never addressed"
 					% (next_offset, offset - next_offset, "\t", next_offset, offset - 1))
+			type_, field = _c_type(item), _macro_field(item)
+			if "[" in type_:
+				# moved as one 16-byte block (an SSE store), so it is a member of that size and
+				# no scalar type fits it - declared as bytes, which is what the file shows
+				field, type_ = "%s[%d]" % (field, item.size), "unsigned char"
 			lines.append("\t%s %s;%s// +%#x  %s%s%s" % (
-				_c_type(item), _macro_field(item), "\t" if len(_c_type(item)) < 12 else "",
+				type_, field, "\t" if len(type_) < 12 else "",
 				offset, _width_text(item), _kind_text(item), _sites_text(item.sites)))
 			next_offset = offset + max(item.size, 1)
 		lines.append("};")
 		lines.append("#endif // DECOMP_CLASS_%s" % _macro(klass.name))
-		lines.append("static_assert(sizeof(%s) >= %d, \"the code reaches %s\");" % (klass.name,
-			max(klass.lower_bound, next_offset), "offset %#x" % (klass.lower_bound - 1)
-				if klass.lower_bound else "no field"))
+		# The size the class above lays out is a fact about this file; a claim that the code
+		# reaches further than that is a fact about an object that is not this class - a base
+		# subobject inside a derived one, or an array element - so it is said, not asserted.
+		if klass.lower_bound and klass.lower_bound > next_offset:
+			lines.append("// the code reaches offset %#x through this class's `this`, which the"
+				% (klass.lower_bound - 1))
+			lines.append("// members above do not account for: it is a base subobject inside a")
+			lines.append("// derived object, or an element past the last member. No size is claimed.")
+		elif next_offset:
+			lines.append("static_assert(sizeof(%s) >= %d, \"the code reaches %s\");" % (klass.name,
+				next_offset, "offset %#x" % (next_offset - 1)))
 		return lines
 
 
@@ -1054,26 +1590,41 @@ def _macro(name: str) -> str:
 	return re.sub(r"[^A-Za-z0-9]", "_", name)
 
 
+def _identifiable(name: str) -> bool:
+	"""Can this name be written in a header at all? A nested C++ name (`Outer::Inner`) or an
+	MSVC template argument list (`?$hkSingleton@V…`) is not one identifier, and declaring such a
+	"class" would make the header fail to build instead of telling anyone anything.
+	"""
+	return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""))
+
+
+def _signed(value) -> int:
+	"""A 32-bit field as the number it means: MSVC writes a `-1` vftable offset as 0xffffffff."""
+	if not value:
+		return 0
+	return value - 0x100000000 if value >= 0x80000000 else value
+
+
 def _macro_field(item: Field) -> str:
 	return "f%#x" % item.offset
 
 
 def _c_type(item: Field) -> str:
+	# The type has to be as wide as the access, or the header lays the class out smaller than
+	# the offsets it claims: a `movaps` through `this` is a 16-byte member, not a float.
+	if item.kind == "float" and item.size == 4:
+		return "float"
+	if item.kind == "double" and item.size == 8:
+		return "double"
 	if item.size == 1:
-		return "unsigned char" if item.kind != "narrow-int" else "unsigned char"
+		return "unsigned char"
 	if item.size == 2:
 		return "short"
-	if item.kind == "float":
-		return "float"
-	if item.kind == "double":
-		return "double"
-	if item.size == 8:
-		return "unsigned long"
 	if item.size == 4:
 		return "int"
-	if item.size >= 16:
-		return "unsigned char[%d]" % item.size
-	return "unsigned char pad%d" % item.size
+	if item.size == 8:
+		return "unsigned long"
+	return "unsigned char[%d]" % item.size
 
 
 def _width_text(item: Field) -> str:
@@ -1105,3 +1656,20 @@ def _written_regs(instruction, handle) -> list[tuple[int, int]]:
 	except Exception:  # noqa: BLE001 - a decoder without register info
 		return []
 	return [(reg, 0) for reg in written]
+
+
+def _stack_adjustment(instruction, operands, stack_register) -> int:
+	"""How much this instruction moved the stack pointer, 0 when it did not touch it.
+
+	AT&T writes `subq $0x28,%rsp` as (imm, reg) and `addq $0x28,%rsp` the same way; a `sub`
+	lowers the pointer, so every offset measured from it grows.
+	"""
+	from capstone import CS_OP_IMM, CS_OP_REG
+	if not stack_register or len(operands) != 2 or not instruction.mnemonic.startswith(
+			("add", "sub")):
+		return 0
+	if operands[1].type != CS_OP_REG or operands[0].type != CS_OP_IMM or \
+			operands[1].reg != stack_register:
+		return 0
+	amount = operands[0].imm
+	return amount if instruction.mnemonic.startswith("sub") else -amount

@@ -3,11 +3,10 @@
 Read this only when the target is a PE built by MSVC. Counts and versions below are a snapshot from when this was written; re-check with `decomp check` and `decomp status`.
 
 **Consequence for the main workflow:** none different. Scope the request and score candidates
-exactly as SKILL.md describes - `try` works on a PE target and a COFF candidate (since MS-3).
-What is still missing on a PE is `decomp types`: that RTTI format is `MS-5`, so a class or a
-type descriptor cannot be named on the target side, and a unit that reaches one (a
-`dynamic_cast`) will report a relocation difference that is not the candidate's fault. Name that
-reason rather than chasing it.
+exactly as SKILL.md describes - `try` works on a PE target and a COFF candidate (since MS-3), and
+since MS-5 `decomp types` works on a PE too: the MSVC RTTI graph is read as its own model, so a
+class, its bases, its vftable and its type descriptors can be named on the target side, and a
+unit that reaches one (a `dynamic_cast`) scores like any other.
 
 ## What works
 
@@ -21,9 +20,9 @@ reason rather than chasing it.
   If `detect` answers `/O1|/O2`, treat that as a class: try the other level before believing a
   bad score is the candidate's fault.
 - `try` works on a PE target: the candidate is compiled to a `.obj` and read back with COFF
-  semantics (extents derived from the object, relocations with no addend). `decomp types` claims
-  nothing for a PE, because that RTTI format is `MS-5` - a named, phased gap, not something to
-  debug mid-task.
+  semantics (extents derived from the object, relocations with no addend).
+- `decomp types` works on a PE target (MS-5) and picks its model from the target's build note,
+  not from the container: see the next section for what it can and cannot say.
 
 ## The MSVC toolchain (since MS-2)
 
@@ -59,6 +58,43 @@ reason rather than chasing it.
   (hot/cold splitting, one COMDAT each), so a unit may be reported as a handful of bytes while
   the candidate holds the whole function. That is a known open gap in the tool, not a candidate
   bug - it is the 8 units `msvc-o2` does not pass.
+
+## The C++ structure of a PE (MS-5)
+
+`decomp types` reads MSVC's own type system. The entry point is the type-name string
+(`.?AVCVehicleEntity@@` - `.?AV` class, `.?AU` union, `.?AE`/`.?AX` enum, `?$…` template); from
+it the tool walks the type descriptor → the RTTICompleteObjectLocator that names it (its CHD must
+carry a base-class descriptor for that same descriptor, which is what separates a locator from a
+base-class descriptor) → the class hierarchy descriptor → the base-class descriptors, whose two
+numbers are the subobject displacement and its vftable offset. A vftable begins after the slot
+that holds a locator pointer.
+
+What that means when you read or write a report:
+
+- **Field widths come from the file.** x64 locators use 4-byte RVAs while vftable slots and the
+  descriptor header hold absolute qwords; a 32-bit MSVC binary uses absolute 4-byte addresses
+  everywhere. The tool probes and says which mode it read ("4-byte RVAs" / "absolute 4-byte
+  addresses"); a claim about an offset is only as good as that probe.
+- **MSVC's vtable has no offset-to-top and one destructor slot.** The benchmark's classes have 3
+  slots there and 4 under g++; slot 0 is the *deleting* destructor, which writes no vptr itself -
+  it calls the one that does, then frees. A derived class with nothing to clean up has a
+  destructor that writes no vptr at all (`??1CVehicleEntity@@UEAA@XZ` is a stub calling the base's),
+  so the evidence is a call chain, not a store.
+- **Identical COMDAT folding is real and it is reported as what it is.** `??_ECVehicleEntity` and
+  `??_ECCharacterEntity` are the same function referenced by two vftables, so the tool says the
+  destructor slot is *shared* and refuses to name a destructor for either class. Do not "fix" that.
+- **A pure slot is only claimed when `_purecall` is named**, which needs a `/MD` build. In `/MT`
+  the shape (same target, two vftables, no call reaching it) is indistinguishable from a folded
+  destructor - it mislabelled one, and that heuristic is gone.
+- **`this` is `%rcx`** on MSVC x64 (and `%ecx` in 32-bit thiscall), and at `/Od` it is spilled to
+  `8(%rsp)` and reloaded from `0x30(%rsp)` after `sub $0x28,%rsp`: a frame slot belongs to one
+  stack-pointer value. Offsets through `%rbp`/`%ebp` do not move when `%rsp` does.
+- **Nested names are stored innermost-first** (`.?AUSimpleMapping@hkaSkeletonMapper@@` →
+  `hkaSkeletonMapper::SimpleMapping`); template names (`?$BasicArrayImplementation@E$00`) are kept
+  verbatim and are *not* declarable, so they stay out of the generated header and out of base lists.
+- **A PE is not an MSVC target.** A MinGW-built PE carries Itanium RTTI; the model is chosen from
+  `compiler_hint` (the file's own build note) and only then from the analysis' variant, and a PE
+  with neither is tried as MSVC and falls back with a note if no `.?AV` string exists.
 
 ## The function table (`.pdata`)
 

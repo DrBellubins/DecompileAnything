@@ -14,14 +14,14 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 | 1 | package, config, startup checks, `analyze`, analysis cache | **implemented** |
 | 2 | `try`: compile -> extract -> normalise -> diff | **implemented** |
 | 3 | `detect`: compiler/object/flags from the file; `find`: xrefs, vtables, related functions | **implemented** |
-| 4 | `types`: vtables, RTTI, the shared header | **implemented** - see "The C++ underneath (`decomp types`)"; acceptance is `python Tests/tools/check_phase4_structures.py` |
+| 4 | `types`: vtables, RTTI, the shared header | **implemented** - see "The C++ underneath (`decomp types`)"; acceptance is `python Tests/tools/check_phase4_structures.py` for an ELF target and `python Tests/tools/check_msvc_structures.py` for a PE one |
 | 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | **implemented** for the unit extents and the diff - a `-O2` unit's extent now comes from the file's own function table (`.eh_frame` FDEs, `st_size` where symbols survive), so 89/89 units are compared over the compiler's own range and the `-O2` row is 99.91 % mean / 88 of 89 past the gate, above the harness's own 98.27 %/72; acceptance is `python Tests/tools/check_phase5_o2.py`. The Unicorn behaviour check and the `objdiff-cli` `.o` synthesis are not done - see [Docs/Design-Plan.md](Docs/Design-Plan.md) |
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
 | MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **done** - toolset v141 14.12 + Windows SDK 10.0.19041: `cl`/`link` build and run a PE under Wine, and the benchmark itself builds with `cl` at `/Od` and `/O2` with an 89/89 answer key (`python Tests/tools/check_msvc_toolchain.py`, exit 0) |
-| MS-3 | COFF candidates: `try` on a PE target, candidate extents from the object | **implemented** - the untouched source through `decomp try` at `cl /Od` is **100.00 % mean, 88 of 89 past the gate** (54 byte-identical: a `.o` keeps placeholder displacements, so bytes are reported, not required), and the extent the tool derives from the `.obj` equals the compiler's for **all 89 units**. Acceptance is `python Tests/tools/check_coff_candidate.py`; the one unit that does not pass is MSVC RTTI (MS-5) |
+| MS-3 | COFF candidates: `try` on a PE target, candidate extents from the object | **implemented** - the untouched source through `decomp try` at `cl /Od` is **100.00 % mean, 89 of 89 past the gate** (54 byte-identical: a `.o` keeps placeholder displacements, so bytes are reported, not required), and the extent the tool derives from the `.obj` equals the compiler's for **all 89 units**. Acceptance is `python Tests/tools/check_coff_candidate.py`; the one unit that did not pass was MSVC RTTI, and MS-5 closed it |
 | MS-4 | what an MSVC build *is*: toolset (Rich + linker version, read twice and compared), `/Od` vs `/O1|/O2`, `/GL`, `/std:`, `/MT`, C++/CRT from names | **implemented** - the Rich product ids are named and the toolset is read from link.exe's own record (whose build number *is* its version: measured against the installed toolchain) and cross-checked against the optional header; the per-front-end compiland counts confirm `/GL` and the C/C++/asm mix; language comes from decorated names and the CRT family from the imports (`/MT` = no CRT DLL); `build_flags` carries `/Od|/O1|/O2`, `/MT|/MD`, `/GS-`, `/GL`+`/LTCG`, `/std:`; an MSVC set of shape features separates `/Od` from `/O1|/O2` (reported as a class - no shape tells those two apart) and the shape sample now walks `.pdata` units. Acceptance is `python Tests/tools/check_msvc_detect.py` |
-| MS-5 | MSVC C++ structure (`.?AV…` RTTI, `RTTICompleteObjectLocator`) | not implemented - it is the reason one unit of `check_coff_candidate.py` does not pass |
+| MS-5 | MSVC C++ structure (`.?AV…` RTTI, `RTTICompleteObjectLocator`) | **implemented** - a second model next to Phase 4's, chosen from the target's build note: the `.?AVX@@` string → type descriptor → complete object locator → class hierarchy descriptor → base-class descriptors → vftable (whose slot before the methods holds the locator), in both RVA- and absolute-address form. Names, bases, 3-slot vftables, constructors/destructors (incl. the deleting form) and member offsets, at `/Od` and on a shipped 32-bit game (769 classes); one descriptor gets the same name on both sides of the loop, which is what makes `check_coff_candidate.py` gate 89/89. Acceptance is `python Tests/tools/check_msvc_structures.py` |
 
 ## Use it
 
@@ -276,9 +276,15 @@ else. `--json`, `--max-diff`, `--max-symbols`, `--size`, `--include`, `--fn` and
 
 ## The C++ underneath (`decomp types`)
 
-`decomp types` reads the Itanium-ABI structures the compiler left in the file and answers the
-question a candidate cannot otherwise ask: what object is this code working on, what is its
-layout, and which of these functions are its constructor and destructor.
+`decomp types` reads the type system the compiler left in the file and answers the question a
+candidate cannot otherwise ask: what object is this code working on, what is its layout, and
+which of these functions are its constructor and destructor. Which model it uses is read from
+the target, not guessed: a GCC or Clang build leaves Itanium `type_info` objects, a build by
+Microsoft's compiler leaves MSVC's RTTI graph, and the build note (the Rich header, the
+`.comment` section) says which. The two are implemented separately - a PE's vftables are
+absolute qwords in `.rdata`, and its type information is a graph of descriptors and locators -
+so there is one model per ABI, with the class, vtable, constructor/destructor and field logic
+shared.
 
 ```
 $ .venv/bin/decomp types -C Tests/project.toml --bin Tests/build/gcc-o0/da_tests.stripped --class CVehicleEntity
@@ -301,8 +307,35 @@ class CVehicleEntity (type_info 0x111d78, vtable 0x111d00)
   object size at least 24 bytes (from its last field)
 ```
 
-**Measured** (`python Tests/tools/check_phase4_structures.py`, whose expectations come from
-`answer_key.json` and from the field offsets in `TestBinary/TestFunctions/structs.h`):
+The same three classes in the `cl /Od` build, where none of it is named and the type system is a
+graph of RTTI records instead of a vtable header:
+
+```
+$ .venv/bin/decomp types -C Tests/project.toml --bin Tests/build/msvc-o0/da_tests.stripped --class CEntityBase
+CEntityBase
+  vftable 0x140023a70, type descriptor 0x14002fa30
+    - MSVC type descriptor at 0x14002fa30: the name string at 0x14002fa40 is '.?AVCEntityBase@@',
+      which is the decoration for a class named CEntityBase; its own vftable pointer is 0x140023b00
+    - RTTICompleteObjectLocator at 0x14002bcc0 (signature 1, vftable offset 0, cdOffset 0) names
+      it, and its RTTIClassHierarchyDescriptor at 0x14002bce8 carries 0 base class descriptor(s)
+    - vftable at 0x140023a70, 3 slots: an object's vptr is its first slot (+0x0) and the locator
+      for this class sits in the slot before it at 0x14002bcc0
+    - constructor or destructor at 0x14000c3b0: it stores this class's vptr (…+0x0) and is in no vtable
+    - destructor at 0x14000c460: the deleting destructor of the same class calls it
+    - deleting destructor at 0x14000c4c0: it is vtable slot 0 and it calls 0x14000c460, which
+      reaches a destructor of this class or of one of its bases - the form that frees the storage
+    ! one or more slots point at a function no call in this image reaches; a pure virtual's
+      `_purecall` slot has exactly that shape, and with the CRT linked in this file names no
+      function, so those slots are reported as slots and not claimed pure
+  fields (offsets the class's own code uses through `this`):
+    +0x0  8 bytes  written 2   (the vptr)
+    +0x8  4 bytes  written 1   ← m_health
+    +0xc  4 bytes  written 1   ← m_tag
+```
+
+**Measured** (`python Tests/tools/check_phase4_structures.py` for the Itanium model and
+`python Tests/tools/check_msvc_structures.py` for the MSVC one; both sets of expectations come
+from `answer_key.json` and from the field offsets in `TestBinary/TestFunctions/structs.h`):
 
 ```
 gcc-o0 stripped        3 classes, 3 vtables, 3 type_info in 0.03 s
@@ -310,32 +343,55 @@ gcc-o0 with symbols    the same, plus method names from the file's own symbols
 gcc-o0-x86 stripped    9 classes, 7 vtables, 9 type_info in 0.2 s - the extra ones are the
 \t\tC++ runtime's own (__class_type_info, __si_class_type_info, the exception types),
 \t\tbecause that build is statically linked
-notepad.exe (MSVC PE)  0 classes, and it says so instead of guessing
+msvc-o0 stripped       9 classes, 9 vftables, 9 type descriptors in 0.05 s - the same three
+\t\tclasses, named from `.?AVCVehicleEntity@@`, with their 3-slot vftables
+msvc-o2 stripped       the same 9 classes and their hierarchies; fields partial (see below)
+mingw-o0 (a PE, g++)   read as Itanium: 9 classes with their bases - a PE is not MSVC
+Tests/Proprietary/deadrising2.exe (32-bit MSVC game)  769 classes, 685 vftables, 770 type
+\t\tdescriptors in ~9 s, bases right (`hkReferencedObject` → `hkBaseObject`), 107 nested
+\t\tnames decoded, and it reports that this file's records are absolute-address referenced
+notepad.exe (MSVC PE)  0 classes, and it says why: no `.?AV` string anywhere in it
 ```
 
 Judged against the answer key and the source, not against the tool's own opinion:
 
-* every class is named from its `type_info` name string - `_ZTV`/`_ZTI` symbols are not used,
-  so this works on a stripped binary; the name is decoded by demangling `_ZTV<name>` and
-  dropping the "vtable for " the ABI puts in front of it;
-* the base/derived relation is right, including that `CEntityBase` has no base;
+* every class is named from the file's own type-name string - `_ZTV`/`_ZTI` symbols are not used
+  on the ELF side (the name is decoded by demangling `_ZTV<name>` and dropping the "vtable for "
+  the ABI puts in front of it), and nothing at all is named on the PE side: `.?AVCVehicleEntity@@`
+  *is* the name, and the locators and vftables are found structurally;
+* the base/derived relation is right, including that `CEntityBase` has no base - and on a PE it
+  comes from the class hierarchy descriptor's base-class descriptors, which also state the
+  subobject displacement and its vftable offset (what a thunk adjusts `this` by);
 * each class's real `GetHealth`/`Classify` are found at their real vtable slots, and the
-  abstract class's pure slot resolves to `__cxa_pure_virtual`;
-* every address the tool calls a constructor or destructor is one the compiler really built
-  for that class, and the real ones are identified where the file makes that possible;
-* every member offset in the source is recovered - `+0x8`/`+0xc` in the 64-bit build,
-  `+0x4`/`+0x8` in the 32-bit one - with the widths the instructions imply, and no recovered
-  offset lies outside the object;
-* `types --write` produces a header that compiles: `g++ -std=c++17 -fsyntax-only` accepts it,
+  abstract class's pure slot resolves to `__cxa_pure_virtual` on the ELF side; MSVC gives the
+  same source **3 slots, not 4** (no offset-to-top, one destructor slot), and its slot 0 is the
+  *deleting* destructor;
+* every address the tool calls a constructor or destructor is one the compiler really built for
+  that class, and the real ones are identified where the file makes that possible;
+* every member offset in the source is recovered - `+0x8`/`+0xc` in the 64-bit glibc build,
+  `+0x4`/`+0x8` in the 32-bit one, `+0x8`/`+0xc` and `+0x10`/`+0x14` in the MSVC one, which is
+  the Microsoft x64 layout of the same header - with the widths the instructions imply, and no
+  recovered offset lies outside the object;
+* on a PE, `??_R0?AVCVehicleEntity@@@8` (what the candidate's object relocates against) and the
+  target's descriptor get the same name, `typeinfo for CVehicleEntity`, and the unit that
+  `dynamic_cast`s between them passes `try` at 100 % (that pairing is what closed MS-3's one gap:
+  89 of 89 units);
+* `types --write` produces a header that compiles: `g++ -std=c++17 -fsyntax-only` accepts the one
+  generated for either benchmark build and the one generated for the shipped game (27,796 lines),
   and the `static_assert(sizeof(X) >= N)` inside it is what fails if a layout is wrong - so a
   wrong layout breaks the candidate's build, which is evidence rather than an opinion.
 
 What it does not claim: the *names* and *types* of members (the header spells them `f0x8` and
 `int` and says the type is a guess), member functions that are in no vtable and are neither a
-constructor nor a destructor, multiple or virtual inheritance, and anything about an MSVC PE -
-that ABI stores an RTTI Complete Object Locator per function instead, which is MS-5. A vtable
-whose slots the file leaves null (the abstract base's, in the `-m32` and `-O2` builds) is
-reported as null slots rather than filled with guesses.
+constructor nor a destructor, multiple or virtual inheritance (the PE side reads the displacements
+out of the base-class descriptors, but neither benchmark has an MI class to exercise it), a
+pure-virtual slot in an MSVC `/MT` build (`_purecall` has no name once it is linked in, and the
+shape - the same target in two vftables, reached by no call - is also what a folded destructor
+is), or a derived class's destructor when the linker folded it with another class's (the tool
+says the slot is shared). Field offsets at `cl /O2` are partial: `this` stays in registers and
+the accesses move into callers, so `+0x14` is not seen there. A vtable whose slots the file
+leaves null (the abstract base's, in the `-m32` and `-O2` glibc builds) is reported as null
+slots rather than filled with guesses.
 
 ## Verified on the loop (measured here, 2026-11-03)
 
@@ -349,18 +405,19 @@ binutils only):
 | gcc-o0 (x86-64) | 89 / 89 | **100.00 %** | 54 | **89 / 89** | 99.53 %, 83 / 89 |
 | gcc-o0-x86 (-m32, static) | 89 / 89 | 99.38 % | 58 | 81 / 89 | 87.19 %, 11 / 89 |
 | gcc-o2 (x86-64) | 89 / 89 | **99.91 %** | 55 | **88 / 89** | 98.27 %, 72 / 89 |
-| msvc-o0 (`cl /Od`, x86-64 PE) | 89 / 89 | **100.00 %** | 54 | **88 / 89** | - (the answer key is `.pdata` + `link /MAP`) |
+| msvc-o0 (`cl /Od`, x86-64 PE) | 89 / 89 | **100.00 %** | 54 | **89 / 89** | - (the answer key is `.pdata` + `link /MAP`) |
 
 The last row is the same loop against a **PE target with a COFF candidate** (`cl` under Wine, the
 toolchain of [Docs/Setup.md](Docs/Setup.md) §6) and is gated by its own script,
 `python Tests/tools/check_coff_candidate.py`, which also requires that the extent the tool reads
-out of the `.obj` is the compiler's for all 89 units. Its one gap is MSVC RTTI: the `.obj` names
-each type descriptor by symbol (`??_R0?AVCVehicleEntity@`) while the target side can only repeat
-the data type Ghidra applied to all three (`RTTI_Type_Descriptor`), so nothing pairs them - that
-is MS-5.
+out of the `.obj` is the compiler's for all 89 units. The unit that used to be its gap -
+`dynamic_cast` between three type descriptors - now passes: the target side reads the MSVC RTTI
+graph and names each descriptor (`typeinfo for CVehicleEntity`), the object side has its symbol
+(`??_R0?AVCVehicleEntity@@@8`), and `normalize` maps the two to the same words (MS-5).
 
 `msvc-o2` (the same script, `--variant msvc-o2`) is **measured but not gated**: 89/89 scored,
-91.40 % mean, 74 of 89 past the gate. `cl /O2` implies `/Gy` (every function its own COMDAT, so
+91.40 % mean, 75 of 89 past the gate (one more than before MS-5: the `dynamic_cast` unit passes
+at `/O2` too). `cl /O2` implies `/Gy` (every function its own COMDAT, so
 an exact extent) *and* splits a function into hot and cold blocks, each its own COMDAT, so for 8
 units the image's `.pdata` names a **block** rather than the function. Joining those block groups
 is the MS-4/Phase-5 crossover item, and MS-4 left it open on purpose: both readings now exist
@@ -474,8 +531,13 @@ all three scripts print OK on this machine).
   address: `s_<literal>_140023260` is Ghidra's, not a name the candidate could ever agree with.
 * Structure recovery names classes, bases, vtable slots and member **offsets**; it does not
   recover member **names** or **types** (the generated header writes `f0x8` and an inferred
-  `int`, and says so), it assumes single inheritance, and it reads Itanium RTTI only - an MSVC
-  PE stores an RTTI Complete Object Locator per function instead, which is MS-5.
+  `int`, and says so) and it assumes single inheritance. On a PE the member offsets at `cl /O2`
+  are partial (`this` stays in registers there), a pure-virtual slot is only claimed when
+  `_purecall` is named, which `/MT` builds do not do, and a destructor the linker folded with
+  another class's is reported as a shared slot rather than attributed.
+* The Itanium model seeds `this` from `%rdi`, which is the SysV ABI and not what x86-64 MinGW
+  uses (Microsoft's `%rcx`): the classes in `Tests/build/mingw-o0` come out with their names and
+  bases but no field offsets. Found while checking MS-5, and a Phase 4 item, not an MS-5 one.
 * A candidate that calls a helper it does not define reaches it by name, while the analysis of
   a stripped target knows it by address only: that call reads as an operand difference, and
   the symbol table prints both names so the loop can still see what happened.

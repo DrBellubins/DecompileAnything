@@ -60,15 +60,13 @@ NEGATIVE_CONTROLS = [
 # MSVC-Plan.md MS-3 says why - `cl /O2` splits a function into hot and cold COMDAT blocks, so
 # the image's own `.pdata` unit is a block rather than the function, which is MS-4's question and
 # not this phase's.
+#
+# `msvc-o0` used to carry one entry here, STRUCT-24: the `.obj` named each MSVC type descriptor
+# by symbol while the target could only repeat the data type Ghidra had applied to all three.
+# MS-5 reads the MSVC RTTI graph out of the target instead (Docs/MSVC-Plan.md MS-5), so both
+# sides now say `typeinfo for CVehicleEntity`, and the entry is gone: 89 of 89 units pass.
 KNOWN_GAPS: dict[str, dict[str, str]] = {
-	"msvc-o0": {
-		# ClassifyEntity compares three type descriptors. The `.obj` names each one by its COFF
-		# symbol (`??_R0?AVCVehicleEntity@`), which is right; the target side can only repeat the
-		# *data type* Ghidra applied to all three (`RTTI_Type_Descriptor`), so nothing pairs one
-		# descriptor with the other side's. That is MS-5: the MSVC RTTI model
-		# (`RTTICompleteObjectLocator`, `.?AV…` descriptors), not a candidate or extent problem.
-		"STRUCT-24": "MSVC RTTI descriptors: the target names a type, the object names each descriptor",
-	},
+	"msvc-o0": {},
 }
 
 

@@ -48,8 +48,9 @@ decomp/
 
 ## Phases
 
-Status: **Phase 1, Phase 2 and Phase 3 are implemented.** What the commands do, the cache format, the
-measured results on `Tests/`, and the open gaps are documented in [README.md](README.md). The
+Status: **Phases 1-5 and the MS-0..MS-5 track are implemented.** What the commands do, the cache
+format, the measured results on `Tests/`, and the open gaps are documented in [README.md](README.md).
+The
 rest of this plan is unchanged and still authoritative for what comes next.
 
 **Phase 1: Skeleton and analysis cache** - done, 2026-11-03
@@ -103,7 +104,7 @@ What Phase 3 learned, for whoever extends it:
   build (`-fcf-protection`, `-fstack-protector-strong` vs `-all`, `-fno-omit-frame-pointer`);
   they came free with the shape profile.
 
-**MS-0..MS-5: MSVC / PE targets, a separate track** - MS-0 through MS-4 implemented, MS-5 not
+**MS-0..MS-5: MSVC / PE targets, a separate track** - all of it implemented, 2026-11-05
 Measured against a real MSVC binary (`Tests/Proprietary/notepad.exe`) in
 [Docs/MSVC-Plan.md](MSVC-Plan.md), which is authoritative for that track: what a PE target already
 gives the tool (its build note, and `.pdata` - the compiler's own table of 186 function ranges,
@@ -121,6 +122,13 @@ carries, `/std:` bounded by the toolset rather than invented, the full MSVC flag
 `build_flags` (`/Od|/O1|/O2`, `/MT`, `/GS-`, `/GL` with `/LTCG`), and an MSVC set of shape
 features so `detect` separates `/Od` from `/O1|/O2` on a PE - reporting the latter two as a
 class, because no shape tells them apart. `python Tests/tools/check_msvc_detect.py` is its gate.
+MS-5 is the C++ structure of a PE: MSVC's RTTI graph (`.?AV…` type descriptor →
+RTTICompleteObjectLocator → class hierarchy descriptor → base-class descriptors, and the vftable
+whose slot before the methods points at the locator) read as a second model next to Phase 4's
+Itanium one, with the ABI chosen from the target's build note. That is what names a type
+descriptor on the target side, so the unit MS-3 left as its one gap now pairs: `msvc-o0` gates
+**89 of 89**, and a shipped 32-bit MSVC game yields 769 classes with their bases. `python
+Tests/tools/check_msvc_structures.py` is its gate.
 
 **Phase 4: C++ structure recovery** - done, 2026-11-04
 1. Identify vtables, constructors, and destructors from Ghidra data and RTTI where present.

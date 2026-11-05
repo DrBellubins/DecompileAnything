@@ -1108,9 +1108,9 @@ def _type_lines(recovered, only: str = "", limit: int = 40) -> list[str]:
 	for name, klass in sorted(recovered.classes.items())[:limit]:
 		lines.append("%s%s" % (name, "  : public " + ", public ".join(klass.bases)
 			if klass.bases else ""))
-		lines.append("  vtable %s, type_info %s%s" % (
+		lines.append("  %s %s, %s %s%s" % (recovered.words["table"],
 			_hex(klass.vtable) if klass.vtable else "not found in this file",
-			_hex(klass.typeinfo),
+			recovered.words["type"], _hex(klass.typeinfo),
 			", abstract (%d pure slots)" % klass.pure_count if klass.pure_count else ""))
 		for line in klass.evidence:
 			lines.append("    - %s" % line)
@@ -1147,11 +1147,15 @@ def types_cmd(
 	as_json: bool = typer.Option(False, "--json"),
 ) -> None:
 	"""The C++ structure the target itself proves: vtables, RTTI, constructors, destructors,
-	and the field offsets - and the shared header a candidate can include (Phase 4).
+	and the field offsets - and the shared header a candidate can include (Phase 4, MS-5).
 
-	Nothing here needs Ghidra or symbols: a class with a key function emits a `type_info`
-	object naming its own type, and the vtable points at it, so the class name, its base,
-	its method slots and the offsets its code uses are all in the file.
+	Nothing here needs Ghidra or symbols. A C++ program leaves its own type system in the file,
+	and which one it is follows from the compiler: a GCC or Clang target emits a `type_info`
+	object naming its type, with the vtable pointing at it; a target built by Microsoft's
+	compiler emits a `.?AV<name>@@` type descriptor, an RTTICompleteObjectLocator that names it,
+	and a vftable whose slot before the methods points at that locator. Either way the class
+	name, its bases, its method slots and the offsets its code uses through `this` are in the
+	data, and the model is chosen from the target's build note, not guessed.
 	"""
 	cfg = load_config(config_file)
 	store = cache.Cache(config.cache_dir(cfg))
@@ -1178,15 +1182,17 @@ def types_cmd(
 			raise typer.Exit(EXIT_OK if summary["classes"] else EXIT_NOT_FOUND)
 		echo("; %s (key %s) %d-bit" % (values.get("target_path"), values.get("target_key"),
 			summary["bits"]))
-		echo("recovered in %.3fs: %d classes, %d vtables, %d type_info objects (%d candidate "
-			"addresses probed)" % (summary["seconds"], summary["classes"], summary["vtables"],
-				summary["typeinfos"], summary["probed"]))
+		echo("recovered in %.3fs: %d classes, %d %s, %d %s (%d candidate addresses probed)"
+			% (summary["seconds"], summary["classes"], summary["vtables"],
+				"vftables" if summary["abi"] == "msvc" else "vtables",
+				summary["typeinfos"], "MSVC type descriptors" if summary["abi"] == "msvc"
+					else "type_info objects", summary["probed"]))
 		for line in _type_lines(recovered, show_class or "", limit):
 			echo(line)
 		if not summary["classes"]:
-			echo("nothing recovered: this file carries no Itanium-ABI vtable/RTTI. A PE built "
-				"by MSVC keeps its RTTI in a different form (Docs/MSVC-Plan.md MS-5), and a "
-				"C binary has none.")
+			echo("nothing recovered: this file carries no C++ type system at all - no MSVC type "
+				"descriptor (`.?AV…`), and no Itanium `type_info` and vtable pair. It is a C "
+				"binary, or C++ built with RTTI off (`/GR-`, `-fno-rtti`).")
 	finally:
 		conn.close()
 	raise typer.Exit(EXIT_OK if summary["classes"] else EXIT_NOT_FOUND)

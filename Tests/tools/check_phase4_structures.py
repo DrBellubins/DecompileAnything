@@ -24,8 +24,11 @@ constructors, destructors and virtual methods) and against the field offsets in
 7. **the loop**: the `dynamic_cast` unit (STRUCT-24), which was the named gap Phase 4 exists
    to close, passes `try` - both sides have to name the same type_info for that to happen.
 
-A PE built by MSVC (Tests/Proprietary/notepad.exe) is checked for the opposite: it must
-report no classes, because its RTTI is not this format, and must not crash doing so.
+A PE built by MSVC (Tests/Proprietary/notepad.exe) is checked for the opposite: it must report
+no classes, because its RTTI is not this format, and must not crash doing so. (Since MS-5 a PE
+is tried as MSVC first, so this file now also proves the hand-off: the MSVC model reports that
+the file has no `.?AV` descriptor at all and the Itanium model is tried in its place. What a PE
+that *does* carry MSVC RTTI yields is `check_msvc_structures.py`, not this script.)
 """
 
 from __future__ import annotations

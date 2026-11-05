@@ -491,7 +491,7 @@ names all three type descriptors by symbol (`??_R0?AVCVehicleEntity@`, `??_R0?AV
 `??_R0?AVCCharacterEntity@`), while the target side can only repeat the *data type* Ghidra
 applied to all three (`RTTI_Type_Descriptor`) - nothing on the target side says which descriptor
 is which, so no token pairs. MS-5's model of `RTTICompleteObjectLocator`/`.?AV…` is what would
-name them. **Measured and not gated: `msvc-o2`** (`--variant msvc-o2`, 89/89 scored, **91.40 % mean, 74 of
+name them - and it does: that unit now scores 100.00 % and `msvc-o0` gates 89 of 89 (see MS-5). **Measured and not gated: `msvc-o2`** (`--variant msvc-o2`, 89/89 scored, **91.40 % mean, 74 of
 89 past the gate**, extents agreeing for 81 of 89). Two things happen at `/O2` and neither is a
 COFF-reading problem. `/O2` implies `/Gy`, so *every* function is its own COMDAT - all 223
 candidate functions in this benchmark's three objects are COMDATs, which is the exact-extent path,
@@ -600,15 +600,97 @@ here (joining `.text$mn`, `.text$mn$00`, `.text$x` into one unit, the mirror of 
 `.cold` join). Both readings now exist - the image's `.pdata` names the blocks and the candidate's
 COMDATs name the function - but joining them needs the unwind chain (a chained `UNWIND_INFO`
 carries the target block's RVA), which is a reader of its own. `msvc-o2` therefore stays
-measured-and-not-gated at 91.40 % / 74 of 89 with its reason named.
+measured-and-not-gated at 91.40 % / 74 of 89 with its reason named (MS-5 has since closed one of
+those 14 - the `dynamic_cast` unit now passes at `/O2` as well - so it is 75).
 
 
-**MS-5 (after Design-Plan Phase 4): MSVC C++ structure.** vtables in PE are `.rdata` absolute
-RVAs - readable straight from the file, no relocation addends, unlike a PIE's `.data.rel.ro` -
-but the type system is MSVC RTTI (`RTTICompleteObjectLocator`, `.?AV…` descriptors) with thunks
-for multiple inheritance, so `--table`/`--members` need a second model rather than a
-generalisation of the Itanium one. Do it after Phase 4 exists, so it is a parallel implementation
-and not a redesign.
+**MS-5 (after Design-Plan Phase 4): MSVC C++ structure.** *Done 2026-11-05.* The plan was to do
+this as a parallel model, not a redesign of Phase 4, and that is what it is: `structures.Recovery`
+now picks an ABI (`_choose_abi`) and has a second reader for the RTTI graph
+(`_msvc_read`/`_msvc_typeinfo_at`/`_msvc_chd`/`_msvc_vftable`) next to the Itanium probe.
+`Tests/tools/check_msvc_structures.py` is the gate; six groups, all passing. The vftables in a PE
+are `.rdata` absolute qwords - readable straight from the file, no relocation addends, unlike a
+PIE's `.data.rel.ro` - and that part turned out to be the easy half.
+
+* **Choosing the model is a fact about the file, not about the container.** The build note comes
+  first: `compiler_hint` (the Rich header / `.comment` the analysis read) is evidence about the
+  target. The variant the analysis was configured with comes second, because for a proprietary
+  binary that is a stand-in guess - `Tests/Proprietary/deadrising2.exe` is recorded under a
+  `g++ -m32` variant and reading it as Itanium found 6 classes where MSVC's own records name
+  769. With neither, a PE is tried as MSVC and, if the file carries no `.?AV` string, the note
+  says so and the Itanium model is tried in its place. Group 6 asserts the §1 trap the other way:
+  `Tests/build/mingw-o0` (a PE built by `x86_64-w64-mingw32-g++`, no build note of its own) is
+  read as Itanium and its three classes come out with their bases.
+* **The entry point is the type-name string.** `.?AVCVehicleEntity@@` is the decoration for a
+  class named `CVehicleEntity` (`.?AV` class/struct, `.?AU` union, `.?AE` enum class, `.?AX` enum,
+  `?$…` a template). Everything else hangs off it: the **TypeDescriptor** is the 16-byte header
+  (x64) whose first qword is the CRT's own `type_info` vftable, followed by the string. The
+  **RTTICompleteObjectLocator** carries signature, *offset of this vftable from the top of the
+  object*, `cdOffset`, the TypeDescriptor, and the **RTTIClassHierarchyDescriptor**; the CHD's
+  array of **BaseClassDescriptor**s is what names the bases, and each BCD's two numbers are the
+  subobject displacement and its vftable offset - the amount a thunk adjusts `this` by. A locator
+  is only a locator if its CHD contains a BCD for that same descriptor; that test is what tells a
+  locator apart from the base-class descriptors that also point at it.
+* **Field widths come from the target, not from the ABI document.** x64: the COL's five fields are
+  4-byte **RVAs** and the vftable slots and the descriptor header are absolute **qwords**. A
+  shipped 32-bit MSVC binary (`deadrising2.exe`) uses absolute 4-byte addresses for all of it.
+  The reader probes once per target, records which mode it found, and says which in the note -
+  "4-byte RVAs" for the benchmark, "absolute 4-byte addresses" for the game. Group 4 requires that
+  the second case stays in the report.
+* **Where a vftable begins is structural.** The slot that holds a pointer to a locator *is* the
+  boundary: the methods start at the next slot. There is no offset-to-top in MSVC's vtable, so the
+  benchmark's classes have **3 slots (deleting destructor, `GetHealth`, `Classify`)** where the
+  same source under g++ gives 4 (the D1/D2 pair). Group 2 asserts the slot count, that every slot
+  points at the answer key's real method, the bases, and the member offsets - `+0x8`/`+0xc` for
+  `CEntityBase`, `+0x10`/`+0x14` for `CVehicleEntity`, `+0x10` for `CCharacterEntity`, which is
+  what the Microsoft x64 layout of `structs.h` says.
+* **`this` is `%rcx`, and the frame is not stable.** Field recovery seeds `this` from `%rcx` on
+  MSVC x64 (SysV uses `%rdi`; 32-bit MSVC thiscall is `%ecx`, and 32-bit *GCC* passes it on the
+  stack at `8(%ebp)`). At `/Od` `cl` spills it to `8(%rsp)`, then `sub $0x28,%rsp`, then reloads
+  `0x30(%rsp)` - so a frame slot is an offset from one *stack pointer value* and has to move when
+  `%rsp` moves. Doing that unconditionally broke the `-m32` Itanium case, which addresses its
+  frame through `%ebp`: slots are now tracked per frame register.
+* **Destructors come in two forms and the vftable says which.** The slot holds the *deleting*
+  destructor; at `/Od` it writes no vptr itself - it calls the one that does, then frees. A derived
+  class with nothing of its own to clean up has a destructor that writes no vptr at all: `cl` emits
+  `??1CVehicleEntity@@UEAA@XZ` as a stub whose only call is the base's. So the rule follows the
+  call chain (bounded, 3 hops) from the slot to a function that stores this class's vptr or a
+  base's. Two limits came out of that and are stated rather than papered over: `/Od` `/MT` builds
+  fold identical destructors (`??_ECVehicleEntity` and `??_ECCharacterEntity` are one function
+  referenced by both vftables - the tool says the destructor slot is shared instead of naming a
+  destructor), and at `/O2` both derived constructors are the same folded address.
+* **A pure slot is only claimed when it is named.** `/MD` builds import `_purecall`, and matching
+  that name is decisive. `/MT` links it in and leaves it unnamed, and the shape that was going to
+  stand in for it - the same target in two vftables, reached by no call - is *also* exactly what a
+  folded destructor looks like: it called `CVehicleEntity`'s deleting destructor a pure virtual.
+  That heuristic is gone; unnamed cases get the limit stated instead.
+* **One object, one name, both sides.** `normalize.msvc_object_name`/`msvc_type_symbol` map
+  `??_R0?AVX@@@8` ↔ `typeinfo for X`, `??_R1A@?0A@EA@X@@8` ↔ `complete object locator for X`,
+  `??_7X@@6B@` ↔ `vtable for X` (`??_R1`'s four fixed numbers - `A@?0A@EA` - are between the
+  record kind and the name, so those symbols are matched whole). That is what lets the
+  candidate-side relocation against `??_R0?AVCVehicleEntity@@@8` pair with the target-side
+  descriptor: **STRUCT-24 scores 100.00 %** and `check_coff_candidate.py` now gates **89 of 89**
+  units at `msvc-o0` with `KNOWN_GAPS` empty - MS-3's one gap is closed.
+* **At the size of a shipped binary.** `deadrising2.exe` (32-bit, Havok): 770 type descriptors,
+  685 locators, 685 vftables, **769 classes** in ~9 s, correct bases (`hkReferencedObject` →
+  `hkBaseObject`), 107 nested names decoded from MSVC's innermost-first `.?AUSimpleMapping@hkaSkeletonMapper@@`
+  to `hkaSkeletonMapper::SimpleMapping`, and 64 template names kept verbatim because they are not
+  one identifier. `notepad.exe`, which has no `.?AV` string anywhere, stays at 0 classes and says
+  why (group 5).
+* **Two header bugs this found**, both only visible at that scale: a 16-byte `movaps` through
+  `this` was declared `float`, so the class body contradicted its own `static_assert`; and a
+  non-identifiable name was emitted in a *base list* (`public ?$BasicArrayImplementation@E$00`).
+  A member is now typed as wide as the access that proved it, an unprovable lower bound is said in
+  a comment instead of asserted, and undeclarable bases stay in the comment. `types.h` for the
+  benchmark PE (140 lines) and for `deadrising2.exe` (27,796 lines) both pass `g++ -fsyntax-only`.
+
+Not done, and not hidden: field recovery at `/O2` is partial (`m_speed` at `+0x14` is not seen -
+the accesses are inlined into a caller and `this` stays in registers), so `msvc-o2` stays
+measured-and-not-gated, as in MS-3; multiple inheritance is read from the BCDs (displacement and
+vftable offset) but the benchmark has no MI class to exercise it, only the shipped binary; and
+while reading the MinGW PE it became clear the *Itanium* model seeds `this` from `%rdi`, which is
+wrong for x86-64 MinGW (`%rcx`) - its field offsets come out empty there, and that is a Phase 4
+gap, not an MS-5 one.
 
 Dependency order: **MS-0 → MS-1** is self-contained and improves the tool on this very file with
 no compiler at all. **MS-2 → MS-3** is the path to `try` on PE. **MS-4** and **MS-5** are
