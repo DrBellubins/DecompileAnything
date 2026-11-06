@@ -11,6 +11,27 @@ Ordered by impact on the project's claim. Each phase is small enough to land and
 
 **Acceptance:** synthetic token streams with unequal `replace` blocks yield exact `missing`/`extra` counts, and the invariant holds on every function in your benchmark set.
 
+**Done** (2026-11-06, `Tests/tools/check_diff_accounting.py`). The leftover tail is now reported,
+and `Verdict` keeps `matched`/`replaced`/`hidden_relocations` so the counts can be checked
+(`accounting()` / `accounting_problems()`; the runtime appends an "internal error in the
+comparison" note only if they break, and the old "same shape but not the same length" warning
+is gone). Two things the plan did not know:
+
+* The stated invariant needs one correction. A region that turns N original lines into M
+  candidate lines is one differing region but counts on **both** sides, so the exact form is
+  `matched + categories(excl. hidden) == max(len, len) + min(missing, extra)`. `diff.py` states
+  the two-sided identity (`matched + replaced + missing == len(original)`, same on the candidate
+  side), which is what holds for any alignment.
+* The bug was worse than the warning suggested: the warning only fired when *nothing* was
+  categorised. A unit with any other difference reported "instructions 5 vs 3 (-2)" next to
+  "missing 0, extra 0" and looked fine. The three negative controls gained the lines they had
+  been dropping (MATH-02: `operand 6` → `operand 6, missing 5`; MATH-38: `+8 extra`;
+  STR-01: `+3 extra`). Match percentages do not move - the bug was in the categories only.
+
+Measured: 285 verdicts over all three ELF variants of the benchmark (untouched source, the wrong
+candidates, and truncated extents) all satisfy the invariant; `check_phase2_try.py` still passes
+with unchanged means (100.00 / 99.91 / 99.38) and the same 89/88/81 past the gate.
+
 ## Phase 2: Make the gate mean something
 *Highest impact on trust. The 97% rule currently lets real errors pass.*
 

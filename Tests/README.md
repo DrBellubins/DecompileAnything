@@ -51,6 +51,22 @@ they are. Every variant is gated against its own `KNOWN_GAPS` list: none at -O0,
 re-scores each unit whose *analysis* size differs from the answer key's over the answer key's
 range, which is the cross-check that the extent the tool derives is the compiler's.
 
+To check that the scorer's own counts add up (Docs/byte-cleanup-plan.md, Phase 1):
+
+```sh
+.venv/bin/python Tests/tools/check_diff_accounting.py
+```
+
+A `replace` region whose two sides are different lengths used to be zipped, so the leftover
+lines were counted nowhere: "instructions 5 vs 3 (+-2)" beside "missing 0, extra 0". The gate
+asserts the accounting identity instead of hoping for it - `matched + replaced + missing ==` the
+original's instruction count, the same on the candidate side, one `diff` entry per counted line,
+and `size delta == extra - missing` - over synthetic streams built to shrink, to grow, to do both
+in one diff, and to hide a relocation in a matched line; then over every verdict the benchmark
+can produce (each unit of all three ELF variants, the wrong candidates, and truncated extents:
+285 verdicts, 32 with a difference, 17 whose length differs). A verdict that reports different
+instruction counts with nothing in `missing`/`extra` fails the group by name.
+
 To check the `-O2` work itself (Phase 5):
 
 ```sh

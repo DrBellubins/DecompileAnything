@@ -318,7 +318,12 @@ What makes the two sides comparable (`extract.py`, `normalize.py`, `diff.py`):
 
 A unit counts as done at `match >= threshold` **and** `opcode 0` **and** `relocation 0`
 (Design-Plan, Key Design Decisions): the ratio alone can be met by code that does something
-else. `--json`, `--max-diff`, `--max-symbols`, `--size`, `--include`, `--fn` and
+else. The counts behind those numbers add up: every line of either side is counted once, a
+differing pair on both sides, and where a replaced region is asymmetric the leftover lines are
+reported as `missing`/`extra` with their addresses. `diff.accounting()` states the identity
+(`matched + replaced + missing ==` the original's instruction count, the same on the candidate
+side, one report entry per counted line, `size delta == extra - missing`), and
+`python Tests/tools/check_diff_accounting.py` asserts it over the whole benchmark. `--json`, `--max-diff`, `--max-symbols`, `--size`, `--include`, `--fn` and
 `--register-abstract` are documented in `decomp try --help`.
 
 ## The C++ underneath (`decomp types`)

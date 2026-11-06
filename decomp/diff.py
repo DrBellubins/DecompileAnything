@@ -10,6 +10,13 @@ object, and `missing`/`extra` mean the control flow or size differs.
 A unit counts as done at `match >= threshold` **and** no `opcode` and no `relocation`
 differences (Docs/Design-Plan.md, Key Design Decisions): the ratio alone can be met by code
 that does something else.
+
+The counts add up exactly (Docs/byte-cleanup-plan.md, Phase 1). Every line of either stream is
+either matched or appears in `diff` once: a replaced pair counts once as a difference and on
+both sides, a `missing` line on the original side only, an `extra` line on the candidate side
+only, and a `replace` block whose two sides are different lengths reports its leftover tail as
+`missing`/`extra` instead of dropping it. `accounting()`/`accounting_problems()` state that
+identity: the tests assert it, the runtime only complains when it breaks.
 """
 
 from __future__ import annotations
@@ -34,6 +41,12 @@ class Verdict:
 	candidate_instructions: int = 0
 	original_bytes: int = 0
 	candidate_bytes: int = 0
+	# How the categories were arrived at, kept so the counts can be checked against the stream
+	# lengths: `matched` lines are identical on both sides, `replaced` is the number of one-to-one
+	# differing pairs, `hidden_relocations` re-counted lines already counted as matched.
+	matched: int = 0
+	replaced: int = 0
+	hidden_relocations: int = 0
 	identical: bool = False
 	bytes_equal: bool = False
 	register_abstract: bool = False
@@ -51,6 +64,61 @@ class Verdict:
 	def worst(self) -> str:
 		ranked = sorted(self.categories.items(), key=lambda item: -item[1])
 		return ranked[0][0] if ranked and ranked[0][1] else ""
+
+
+# --------------------------------------------------------------------------------------
+# the counts have to add up
+
+
+def accounting(verdict: Verdict) -> dict[str, int]:
+	"""The line-count identity `compare` is required to satisfy:
+
+		matched + replaced + missing == original_instructions
+		matched + replaced + extra   == candidate_instructions
+		sum(categories) - hidden_relocations == replaced + missing + extra
+
+	Those two imply, for any alignment, the form `Docs/byte-cleanup-plan.md` Phase 1 asks for,
+	with the one correction that makes it exact:
+
+		matched + sum(categories) - hidden == max(len, len) + min(missing, extra)
+
+	A region that turns N original lines into M candidate lines is one differing region but
+	counts on both sides, so the plan's `== max(len, len)` holds only when the differences are
+	all on one side (min(missing, extra) == 0). Pairing both sides through `replaced` is the
+	equivalent that holds for this counting either way.
+	"""
+	visible = sum(verdict.categories[name] for name in CATEGORIES) - verdict.hidden_relocations
+	return {
+		"matched": verdict.matched,
+		"replaced": verdict.replaced,
+		"hidden_relocations": verdict.hidden_relocations,
+		"visible_differences": visible,
+		"original_lines_accounted": verdict.matched + verdict.replaced + verdict.categories["missing"],
+		"candidate_lines_accounted": verdict.matched + verdict.replaced + verdict.categories["extra"],
+	}
+
+
+def accounting_problems(verdict: Verdict) -> list[str]:
+	"""Why the counts do not add up - empty for a verdict that accounts for every line."""
+	acc = accounting(verdict)
+	problems = []
+	missing, extra = verdict.categories["missing"], verdict.categories["extra"]
+	for side, total, name in (("original", verdict.original_instructions, "missing"),
+			("candidate", verdict.candidate_instructions, "extra")):
+		count = acc["%s_lines_accounted" % side]
+		if count != total:
+			problems.append("%s side: matched %d + replaced %d + %s %d = %d, but the stream has %d "
+				"instructions" % (side, acc["matched"], acc["replaced"], name,
+					verdict.categories[name], count, total))
+	if acc["visible_differences"] != acc["replaced"] + missing + extra:
+		problems.append("%d categorised differences do not come from %d replaced pairs + %d "
+			"missing + %d extra" % (acc["visible_differences"], acc["replaced"], missing, extra))
+	if any(value < 0 for value in verdict.categories.values()):
+		problems.append("a category is negative")
+	if acc["hidden_relocations"] > acc["matched"]:
+		problems.append("%d hidden relocations is more than the %d matched lines" % (
+			acc["hidden_relocations"], acc["matched"]))
+	return problems
 
 
 # --------------------------------------------------------------------------------------
@@ -129,15 +197,31 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 
 	categories = {name: 0 for name in CATEGORIES}
 	diff: list[dict] = []
+	replaced = 0
 	for tag, i1, i2, j1, j2 in matcher.get_opcodes():
 		if tag == "equal":
 			continue
 		if tag == "replace":
-			for a, b in zip(original[i1:i2], candidate[j1:j2]):
+			# The two blocks are not necessarily the same length. Pair the common prefix, then
+			# report the leftover tail of whichever side is longer as missing/extra: `zip` alone
+			# dropped it, so a candidate that turned three original lines into one reported one
+			# difference and never said two lines went away - `missing + extra == 0` read as
+			# "same length" and was wrong.
+			a_block, b_block = original[i1:i2], candidate[j1:j2]
+			for a, b in zip(a_block, b_block):
 				kind, why = _difference(a, b)
 				categories[kind] += 1
+				replaced += 1
 				diff.append({"category": kind, "original": a.text, "candidate": b.text,
 					"original_address": a.address, "candidate_address": b.address, "why": why})
+			for a in a_block[len(b_block):]:
+				categories["missing"] += 1
+				diff.append({"category": "missing", "original": a.text, "candidate": None,
+					"original_address": a.address, "candidate_address": None, "why": ""})
+			for b in b_block[len(a_block):]:
+				categories["extra"] += 1
+				diff.append({"category": "extra", "original": None, "candidate": b.text,
+					"original_address": None, "candidate_address": b.address, "why": ""})
 		elif tag == "delete":
 			categories["missing"] += i2 - i1
 			for a in original[i1:i2]:
@@ -163,6 +247,7 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 						"original_address": a.address, "candidate_address": b.address,
 						"why": "the lines match but not what they reach: " + why, "hidden": True})
 	categories["relocation"] += hidden
+	hidden_relocations = hidden
 
 	symbols = []
 	for token, left_ref, right_ref in _pair(vocabulary.entries["original"], vocabulary.entries["candidate"]):
@@ -185,9 +270,12 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 		original_bytes=len(original_bytes), candidate_bytes=len(candidate_bytes),
 		identical=left == right, bytes_equal=bool(original_bytes) and original_bytes == candidate_bytes,
 	)
-	if not verdict.passed and not verdict.worst:
-		verdict.warnings.append("below the threshold with no categorised difference - the "
-			"streams are the same shape but not the same length")
+	verdict.matched, verdict.replaced, verdict.hidden_relocations = matched, replaced, hidden_relocations
+	# Falling short of the threshold always has a categorised difference now, so the only way to
+	# fail with nothing categorised is a count that went wrong here.
+	problems = accounting_problems(verdict)
+	if problems:
+		verdict.warnings.append("internal error in the comparison: " + "; ".join(problems))
 	return verdict
 
 
