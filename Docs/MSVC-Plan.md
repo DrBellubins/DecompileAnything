@@ -60,10 +60,10 @@ print(b.header.machine, [ (hex(e.id), hex(e.build_id), e.count) for e in b.rich_
 # .pdata (RVA + image base):
 .venv/bin/python -c "import lief,struct; b=lief.PE.parse('Tests/Proprietary/notepad.exe'); \
 d=bytes(b.get_section('.pdata').content); print([struct.unpack_from('<III',d,k*12) for k in range(len(d)//12)][:8])"
-# the PDB (no Windows tools needed):
-curl -sSL -o /tmp/notepad.pdb \
-  https://msdl.microsoft.com/download/symbols/notepad.pdb/5C1BB1418276E6C4C297FCBAEC420F581/notepad.pdb
-llvm-pdbutil dump --summary --modules --publics --section-contribs /tmp/notepad.pdb
+# the PDB (no Windows tools needed) - fetch, verify, and keep it in a symbol-store layout:
+.venv/bin/decomp symbols Tests/Proprietary/notepad.exe
+llvm-pdbutil dump --summary --modules --publics --section-contribs \
+  cache/symbols/notepad.pdb/5C1BB1418276E6C4C297FCBAEC420F581/notepad.pdb
 ```
 
 ## 3. What already works on a PE, and what does not (measured)
@@ -122,7 +122,21 @@ Two things are worth more than anything in §3:
   base, so they must be biased by `imagebase` to meet Ghidra's addresses.
 * **Microsoft publishes the PDB for shipped Windows binaries.** With the GUID and age from the
   CodeView record, `https://msdl.microsoft.com/download/symbols/<pdb>/<GUID><age>/<pdb>`
-  returned the real file here (249 856 bytes). `llvm-pdbutil` (LLVM 23, installed) reads it on
+  returned the real file here (249 856 bytes). Since 2026-11-06 that is a command, not a recipe:
+  `decomp symbols <target>` (`decomp/symbols.py`) asks the server with the record `detect` reads,
+  verifies the answer out of the PDB's own MSF stream 1 (its GUID, and the link timestamp that
+  equals this image's `TimeDateStamp`), and stores it as `<store>/<pdb>/<GUID+age>/<pdb>` - the
+  layout a `_NT_SYMBOL_PATH` symsrv client looks in. Two key facts it had to get right: the age in
+  the key is **hex** (age 1 → `…581`, age 10 → `…A`; `detect` printed it in decimal before, which
+  404s on images the linker rewrote ten or more times), and the key is the **bare file name**
+  (`deadrising2.exe` asks for `c:\bcg\…\deadrising2.pdb`, served as `deadrising2.pdb` - and not
+  served at all, since Microsoft only has Windows' own symbols: exit 1 with the URL, which is a
+  different answer from the exit 3 "no CodeView record"). Its own header age is 3 against the
+  record's 1: a shipped PDB is rewritten after the link, and the record's age is the key, so the
+  command says that instead of calling it a mismatch. Reading the stream directory needed a real
+  MSF reader: this file's directory is one block below the address its superblock gives, so a
+  candidate is accepted only when it accounts for exactly `NumDirectoryBytes`.
+  `llvm-pdbutil` (LLVM 23, installed) reads it on
   Linux and gives: 978 public symbols with decorated names and `section:offset`, **239 `.text`
   section contributions** - one COMDAT per function, i.e. name → address → size - and the
   link-time module list, which names the original translation units

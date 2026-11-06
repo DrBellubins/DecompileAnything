@@ -339,6 +339,32 @@ def _read_pe(binary, note: dict) -> None:
 	note["link_flags"] = []
 
 
+SYMBOL_SERVER = "https://msdl.microsoft.com/download/symbols"
+
+
+def symbol_server_key(guid: str, age: int) -> str:
+	"""The directory a PDB is served under: its GUID with no dashes, then the age.
+
+	The age is written in hex (pefile builds the same string with `%X`, and that is what the
+	server indexes), so an image the linker rewrote ten or more times is 404 if it is spelled
+	in decimal.
+	"""
+	return "%s%s" % (str(guid).replace("-", "").upper(), format(int(age or 0), "X"))
+
+
+def pdb_name(path_or_name: str) -> str:
+	"""The bare file name of a PDB. A CodeView record can hold the path the link ran with
+	(deadrising2.exe names `c:\\bcg\\deadrising\\build\\pc\\deadrising2.pdb`), and a symbol store
+	keys on the file name alone. Every Windows binary checked here carries a bare name already.
+	"""
+	return str(path_or_name or "").replace("/", "\\").split("\\")[-1]
+
+
+def symbol_server_url(name: str, guid: str, age: int) -> str:
+	name = pdb_name(name)
+	return "%s/%s/%s/%s" % (SYMBOL_SERVER, name, symbol_server_key(guid, age), name)
+
+
 def _debug_records(binary) -> list:
 	"""The debug directory of a PE: CodeView, POGO, REPRO, ... LIEF 1.0 calls this `debug`;
 	`debug_info` is what older LIEF called it, and in 1.0 it is something else entirely (the
@@ -371,8 +397,7 @@ def _read_pe_debug(binary, note: dict) -> None:
 			entry = {"name": name, "guid": guid, "age": age,
 				"signature": _short(getattr(record, "cv_signature", "") or "")}
 			if name and guid:
-				entry["symbols_url"] = "https://msdl.microsoft.com/download/symbols/%s/%s%d/%s" % (
-					name, guid.replace("-", "").upper(), age, name)
+				entry["symbols_url"] = symbol_server_url(name, guid, age)
 			note["pdb"] = entry
 			note["comment"].append("codeview:%s guid=%s age=%d" % (name or "?", guid or "?", age))
 		elif kind == "POGO":

@@ -28,6 +28,7 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 ```sh
 .venv/bin/decomp check -C Tests/project.toml                  # Ghidra/JDK/Python/cache/compilers
 .venv/bin/decomp detect Tests/build/gcc-o0/da_tests.stripped  # who built it, and at what -O
+.venv/bin/decomp symbols Tests/Proprietary/notepad.exe      # the PDB this binary asks Microsoft for
 .venv/bin/decomp analyze Tests/build/gcc-o0/da_tests.stripped --variant gcc-o0
 .venv/bin/decomp status                                       # what is cached
 .venv/bin/decomp find strncmp                                 # name, 0xaddr, string, global, vtable
@@ -42,6 +43,8 @@ Only `analyze` starts Ghidra (about 10 s for a 193-function binary, once per bin
 `detect`, `show`, `find`, `status` and `try` never start a JVM: they read the file's own
 headers or the SQLite cache, and a `try` takes about as long as compiling the candidate
 (~0.2 s here), which is what makes a stateless CLI usable inside an agent loop.
+`symbols` is the one command that talks to the network, and only when asked for: see
+"Debug symbols of a shipped Windows binary (`decomp symbols`)".
 `show`/`find`/`try` accept the file addresses that `nm` and `objdump` print as well as
 Ghidra's (see "Address domains"); `detect`'s `--range` is always in file addresses.
 
@@ -193,6 +196,50 @@ also says `/MD` versus `/MT` - no CRT DLL imported means the runtime is in the f
 generation. MSVC decoration encodes no standard level, so what `detect` states for `/std:` is
 what the toolset bounds: the level it defaults to and the levels it has a switch for, labelled
 "proved by the toolset, not by a name".
+
+## Debug symbols of a shipped Windows binary (`decomp symbols`)
+
+A PE's CodeView record is not debug information, it is the *address* of debug information: the
+PDB name, GUID and age in it are the key under which Microsoft's public symbol server serves the
+real file. Neither LIEF nor pefile makes that request - pefile goes exactly as far as spelling
+the key out (`DIRECTORY_ENTRY_DEBUG[i].entry.Signature_String`), LIEF as far as handing over the
+GUID and the age - so `decomp symbols` does the one HTTPS GET, and then proves what came back:
+
+```text
+$ .venv/bin/decomp symbols Tests/Proprietary/notepad.exe
+  pdb         notepad.pdb  guid 5c1bb141-8276-e6c4-c297-fcbaec420f58 age 1
+  served at   https://msdl.microsoft.com/download/symbols/notepad.pdb/5C1BB1418276E6C4C297FCBAEC420F581/notepad.pdb
+  stored      cache/symbols/notepad.pdb/5C1BB1418276E6C4C297FCBAEC420F581/notepad.pdb  (249856 bytes, fetched)
+  identity    guid 5c1bb141-8276-e6c4-c297-fcbaec420f58  link timestamp 2638686146  age 3  MSF format version 20000404
+  match       the PDB the image asks for: its GUID is the one in the CodeView record, and it carries this image's TimeDateStamp
+  note        the PDB header says age 3 but the image asks for 1: the key the server indexes is the one in the CodeView record
+```
+
+Three facts are only knowable by reading, and the command states them rather than assuming them:
+
+* The file is checked from its own bytes, not from the URL that served it. A PDB's MSF stream 1
+  carries a format version (20000404 here), a link timestamp that has to equal the image's
+  `TimeDateStamp`, an age and its GUID; the GUID matching the CodeView record is the match. That
+  header's age is 3 while the image asks for 1, because a shipped PDB is rewritten after the link
+  - the CodeView age is part of the key, so that is reported as a note, not a mismatch. Reading
+  it also needed a real MSF reader: `notepad.pdb`'s stream directory sits one block below the
+  address its own superblock gives, so a directory is only accepted when it accounts for exactly
+  `NumDirectoryBytes`.
+* The age in the key is hexadecimal (`…F581` for age 1, `…A` for age 10). `detect` spelled it in
+  decimal, which 404s on the handful of images the linker rewrote ten or more times.
+* The key is the bare PDB file name: `deadrising2.exe` names
+  `c:\bcg\deadrising\build\pc\deadrising2.pdb` and is asked for as `deadrising2.pdb`. Microsoft
+  does not have it - a third party's symbols were never published there - so that is a 404 naming
+  the URL, exit 1, and "no CodeView record" (exit 3) is a different answer from "not served".
+
+The store is laid out `<store>/<pdb>/<GUID+age>/<pdb>`, which is the layout a `_NT_SYMBOL_PATH`
+symsrv cache uses, so `_NT_SYMBOL_PATH=srv*cache/symbols*https://msdl.microsoft.com/download/symbols`
+points any other tool at the same files. What is *inside* a PDB is still read outside the tool
+(Ghidra's importer on Linux is the old DIA `pdb.exe`, Docs/Setup.md §3): this one has 978 public
+symbols with `section:offset`, and its module list names the translation units - `notepad`,
+`npfile`, `npinit`, `npmisc`, `npprint`, `npreplace`, `npdate`, `nputil`, `edpapphelper`,
+`filedialogevents`. Merging those names into the cache is not done; the answer key `analyze`
+uses on a PE is still `.pdata` (Docs/MSVC-Plan.md §4).
 
 ## The group a request asks about (`decomp find`)
 

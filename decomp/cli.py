@@ -20,7 +20,7 @@ from typing import Optional
 import typer
 
 from . import (__version__, cache, check, compile, config, discover, diff, extract,
-	ghidra, normalize, structures, toolchain)
+	ghidra, normalize, structures, symbols, toolchain)
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_FOUND = 0, 1, 2, 3
 
@@ -737,6 +737,61 @@ def _write_config(target: Path, path: Path, note: dict, guess: dict | None, forc
 	path.parent.mkdir(parents=True, exist_ok=True)
 	path.write_text(toolchain.starter_config(target, note, guess))
 	return path
+
+
+# --------------------------------------------------------------------------------------
+# symbols
+
+
+@app.command("symbols")
+def symbols_cmd(
+	binary: Path = typer.Argument(..., help="a PE whose debug directory names a PDB"),
+	store: str = typer.Option(symbols.DEFAULT_STORE, "--store",
+		help="local symbol store to keep the PDB in, laid out like a symbol server cache"),
+	url_only: bool = typer.Option(False, "--url",
+		help="print where the PDB is served from and stop (no request)"),
+	refresh: bool = typer.Option(False, "--refresh", help="re-download even if the store has it"),
+	as_json: bool = typer.Option(False, "--json"),
+) -> None:
+	"""Fetch the debug symbols this binary asks for from Microsoft's public symbol server.
+
+	A CodeView record is the address of the debug info, not the debug info: the PDB name, GUID
+	and age in it are the key `msdl.microsoft.com` serves the real file under. LIEF and pefile
+	both stop at spelling that key out, so this makes the request, checks that what came back
+	carries this image's GUID and TimeDateStamp, and keeps it in the store layout a
+	`_NT_SYMBOL_PATH` client would look in. For a target without its own symbols (a stripped
+	image, an ELF, a Mach-O) this says so instead of guessing.
+	"""
+	target = Path(binary).expanduser()
+	if not target.is_file():
+		raise Stop(EXIT_USAGE, "no such file: %s" % target)
+	target = target.resolve()
+	try:
+		record = symbols.codeview(target)
+	except symbols.SymbolError as exc:
+		echo(str(exc), err=True)
+		raise typer.Exit(EXIT_NOT_FOUND)
+	if url_only:
+		echo(record["symbols_url"])
+		raise typer.Exit(EXIT_OK)
+	try:
+		result = symbols.fetch(target, store, refresh=refresh)
+	except symbols.SymbolError as exc:
+		echo(str(exc), err=True)
+		raise typer.Exit(EXIT_FAIL)
+	if as_json:
+		echo(json.dumps(result, indent=1, default=str))
+	else:
+		echo("target %s" % target)
+		for line in symbols.lines(result):
+			echo(line)
+		echo()
+		echo("what is in it (llvm-pdbutil, Docs/Setup.md): "
+			"llvm-pdbutil dump --summary --modules --publics --section-contribs %s" % result["path"])
+		echo("a store any symsrv client understands: _NT_SYMBOL_PATH=srv*%s*%s"
+			% (store, symbols.SYMBOL_SERVER))
+	if not result["match"]["guid"]:
+		raise typer.Exit(EXIT_FAIL)
 
 
 # --------------------------------------------------------------------------------------
