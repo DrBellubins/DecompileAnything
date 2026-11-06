@@ -593,6 +593,8 @@ def next_own_symbol(conn: sqlite3.Connection, address: int) -> int | None:
 
 
 def function_at(conn: sqlite3.Connection, address: int) -> sqlite3.Row | None:
+	if not fits_rowid (address):
+		return None
 	return conn.execute("SELECT id, name, namespace, entry, size, kind, section FROM functions"
 		" WHERE entry = ?", (address,)).fetchone()
 
@@ -606,9 +608,18 @@ def targets_of(conn: sqlite3.Connection, fn_id: int) -> list[dict]:
 			" WHERE fn = ? AND to_address IS NOT NULL", (fn_id,)).fetchall()]
 
 
-def inside_function(conn: sqlite3.Connection, address: int) -> bool:
+def fits_rowid (address) -> bool:
+	"""Can this address be handed to SQLite at all? A data slot read as unsigned can hold
+	0xffff... - a value that is not an INTEGER to SQLite and raises OverflowError. It is
+	never a code address, so every caller of the two lookups below wants 'no'."""
+	return isinstance (address, int) and 0 <= address < 1 << 63
+
+
+def inside_function (conn: sqlite3.Connection, address: int) -> bool:
 	"""Is an address inside a function body? Then it is a code label, not an object."""
-	return conn.execute("SELECT 1 FROM functions WHERE entry <= ? AND entry + size > ? LIMIT 1",
+	if not fits_rowid (address):
+		return False
+	return conn.execute ("SELECT 1 FROM functions WHERE entry <= ? AND entry + size > ? LIMIT 1",
 		(address, address)).fetchone() is not None
 
 
