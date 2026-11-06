@@ -271,18 +271,27 @@ def tiers() -> int:
 # and every one of them is a unit where the candidate really does assemble to the original.
 # Phase 4 costs two of those: MATH-13 and STRUCT-21 reach nothing but data neither side can
 # describe, so they are counted `unverified` and stop at `structural` (see the note printed below).
-MIN_EXACT = {"gcc-o0": 87, "gcc-o2": 84, "gcc-o0-x86": 63}
-# the units that do not reach the gate at all, and why (the same list check_phase2_try.py owns)
+# Phase 5 costs more, and says why: two function bodies of the same measured size are not a name,
+# so a call matched on size alone is counted with the references that are not verified, and a unit
+# whose only remaining gap is such a callee stops at `structural` until the callee has a name in the
+# match ledger. None of those bodies differ - they are byte-identical - and
+# Tests/tools/check_phase5_ledger.py measures the same units reaching `exact` once the helpers they
+# call have been reproduced. Measured: 87 -> 79 at -O0 (10 units capped: MATH-13/24/27/29,
+# STR-04/07/08, STRUCT-21/22/25), 84 -> 78 at -O2, 63 -> 59 at -m32.
+MIN_EXACT = {"gcc-o0": 79, "gcc-o2": 78, "gcc-o0-x86": 59}
+# the units that do not reach the gate at all, and why (the same list check_phase2_try.py owns).
+# MATH-24 and MATH-27 left this list in Phase 5: they are not reference mismatches, they are the
+# same-size-callee case, and they are reported with the units a ledger would unblock.
 KNOWN_GAPS = {
 	"gcc-o2": ["STRUCT-22", "STRUCT-23", "STRUCT-24"],
-	"gcc-o0-x86": ["MATH-11", "MATH-13", "MATH-19", "MATH-20", "MATH-22", "MATH-23", "MATH-24",
-		"MATH-32", "STR-18", "STR-19", "STRUCT-20", "STRUCT-25",
-		# Phase 4 opened these: comparing the bytes a 32-bit access reads turned two units that
-		# used to pass into reference mismatches. They are not the candidate's doing - at i386 the
-		# candidate's window in a plain `.rodata` double pool is anchored on the nearest symbol
-			# rather than the offset the relocation addresses. Open tool bug, named here so a new one
-		# still fails this check.
-		"MATH-21", "MATH-27"],
+	"gcc-o0-x86": [
+		# Phase 4 opened two of these by comparing the bytes a 32-bit access reads (MATH-21, and
+		# MATH-27, which since Phase 5 is capped by the same-size rule instead). They are not the
+		# candidate's doing - at i386 the candidate's window in a plain `.rodata` double pool is
+		# anchored on the nearest symbol rather than the offset the relocation addresses. Open tool
+		# bug, named here so a new one still fails this check.
+		"MATH-11", "MATH-13", "MATH-19", "MATH-20", "MATH-21", "MATH-22", "MATH-23",
+		"MATH-32", "STR-18", "STR-19", "STRUCT-20", "STRUCT-25"],
 }
 
 
@@ -316,6 +325,10 @@ def targets(cfg_path: str, variants: list[str], limit: int) -> int:
 		below: list[str] = []
 		unverified: list[str] = []
 		only_unverified: list[str] = []
+		# Phase 5 split the unverified reasons in two, and the notes have to say which is which: an
+		# object neither side can describe is reproduced by the structures work, a callee the ledger
+			# has no name for is reproduced by decompiling it (which is what `decomp ledger` is for)
+		by_ledger: list[str] = []
 		asymmetric: list[str] = []
 		masked = 0
 		for unit in units:
@@ -353,6 +366,9 @@ def targets(cfg_path: str, variants: list[str], limit: int) -> int:
 				# nothing about the instructions is wrong: only the references neither side can
 				# name, bound or read are standing in the way
 				only_unverified.append(unit["id"])
+				if verdict.unverified_refs and all("same size" in (item.get("why") or "")
+						for item in verdict.unverified_refs):
+						by_ledger.append(unit["id"])
 		conn.close()
 		note("%s: tiers" % variant, dict(histogram))
 		# nothing is left between the gate and the top tier: on these targets a candidate that
@@ -373,10 +389,17 @@ def targets(cfg_path: str, variants: list[str], limit: int) -> int:
 			check("%s: nothing is below the gate" % variant,
 				sorted(item for item in below if item not in only_unverified), [])
 		if only_unverified:
-			note("%s: capped by references neither side can describe" % variant,
+			note("%s: capped by references that are not verified" % variant,
 				"%d units - %s; the tier stops at `structural` because nothing proves what they "
 				"reach. Reproduce the object, or say the target cannot name it with [gate] "
 				"waive = \"unverified\"" % (len(only_unverified), ", ".join(only_unverified)))
+		if by_ledger:
+			note("%s: capped only by callees matched on equal size" % variant,
+				"%d units - %s. Their instructions, operands and bytes all agree; what is missing is a "
+				"name for a helper the stripped binary does not name. `decomp ledger` lists those "
+				"callees by how many functions call them - decompile one, `decomp try` it, and the units "
+				"that call it are scored against what it proved (Tests/tools/check_phase5_ledger.py "
+				"measures those units reaching `exact` again)" % (len(by_ledger), ", ".join(by_ledger)))
 		note("%s: bytes" % variant, "%d of %d units have identical bytes without masking, %d "
 			"with the fields the link writes zeroed; %d bytes of link-chosen fields were hidden "
 			"in total" % (raw_equal, len(units), histogram["exact"], masked))

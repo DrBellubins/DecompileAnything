@@ -209,6 +209,52 @@ Acceptance: `Tests/tools/check_phase4_evidence.py` — MATH-20's `360.0f`→`359
 
 **Acceptance:** two same-size helpers swapped in a candidate fail once either is in the ledger. `decomp ledger` lists the frontier of unmatched callees.
 
+### Done 2026-11-06 — two things had to be found before the rule worked
+
+`cache.matches` holds the ledger: `(variant, entry, kind)` — the entity in the original's
+addresses — against the candidate's spelling of it, with the evidence, the tier it was proven at,
+and the unit that showed it. `try` writes it when a unit reaches the gate (`--no-learn` to score a
+guess without the loop remembering it); `diff.compare` reads it on every scoring, and
+`decomp ledger` prints the pairs plus the frontier, most-called callee first.
+
+**The contradiction has to land in the alignment, not in the symbol table.** `ref_evidence` could
+say "the ledger says otherwise", and `symbols` reported it, and the unit still passed. The tier is
+computed from the categories the aligner produces, and a call that reaches a *different* helper of
+the same size aligns to the same token — an identical line, so nothing was categorised. Passing the
+ledger into `_difference` and the hidden-relocation recount is what makes the plan's "require the
+candidate callee's name to equal the ledger's" real: it is a `relocation` difference, the tier stops
+at `none`, and the report says which address and which name disagree. Measured on the benchmark:
+one helper renamed in the ledger takes MATH-24 from `exact` to `none`.
+
+**The frontier query was empty by construction.** `callees_of` restricted its callers with
+`entry IN (among) AND entry NOT IN (among)` — a function that is and is not in the ledger — so
+`decomp ledger` printed `the frontier (0)` on a 133-unit target with rows in it. The caller set is
+restricted to the ledger; the exclusion belongs on the callee.
+
+Equal size stayed out of the ledger deliberately (`diff.PROVEN_EVIDENCE` is name / string / bytes /
+ledger), and a function pair whose only agreement is size is counted with the unverified references,
+under its own reason — "only that both bodies are the same size" — because the fix is the opposite
+of Phase 4's: an unnamed *object* is reproduced by the structures work, an unnamed *callee* is
+reproduced by decompiling it, which is what the frontier is for. `Vocabulary.seed_ledger` does the
+other half of the plan's first-use-order fix: a callee the loop already has a name for gets the same
+token in every unit, so pairing no longer depends on the order the two sides happened to reach it.
+
+Measured (untouched source, `decomp try`'s path, gate `semantic`; the tier counts, which is what
+`exact` claims, not merely "past the gate"):
+
+| variant | `exact` before | after | what moved |
+| --- | --- | --- | --- |
+| `-O0` | 87 | 79 | 8 units stop at `structural` on same-size callees alone (MATH-24/27/29, STR-04/07/08, STRUCT-22/25); their instructions, operands and bytes all agree |
+| `-O2` | 84 | 78 | 6 of those 8 (SquareRootNewton, Vec3LengthSq, Vec3Cross, LengthOf, FindSubstring, CompareDescriptorCost) |
+| `-m32` | 63 | 59 | 6 of those, same reason; the other PLT-thunk and anonymous-global caps are Phase 4's |
+
+The numbers went down and that is the point: those units were passing on a claim the tool cannot
+make. `Tests/tools/check_phase5_ledger.py` measures them going back up — bank the helper once (the
+same write `try` makes when the helper itself is scored) and the caller reaches `exact` again with
+every callee reference reading `ledger`. It works on a copy of the analysis (`cache/phase5-ledger`,
+`Tests/phase5-scratch.toml`) because a ledger changes scores by design and the other suites measure
+the target without one.
+
 ## Phase 6: Whole-program relink and compare
 *The only real test of the stated goal. It covers vtables, static initialisers and data layout.*
 

@@ -244,7 +244,13 @@ def check_variant(cfg: dict, store: cache.Cache, variant: str, stripped: bool) -
 				outcome = cli.score_candidate(cfg, conn, meta, row,
 					[TESTS / "TestBinary" / "TestFunctions" / "structs.cpp"],
 					fn=unit["name"].split("(")[0].split("::")[-1],
-					object_dir=store.root / "candidates-check")
+					object_dir=store.root / "candidates-check",
+					# The 32-bit unit calls a `__dynamic_cast` PLT thunk that the stripped binary does
+					# not name and its own body gives no name to, so since Phase 5 that call counts as
+					# an unverified reference and caps the tier at `structural`. Waive it here: this
+					# check asks one narrow question - do both sides reach the same `type_info`? - and
+					# the answer must not depend on what the binary happened to keep a name for.
+					waive=("unverified",))
 				verdict = outcome["verdict"]
 				if verdict is None:
 					bad.append("%s: %s could not be scored: %s" % (label, RTTI_UNIT,
@@ -254,6 +260,11 @@ def check_variant(cfg: dict, store: cache.Cache, variant: str, stripped: bool) -
 						"difference(s) - both sides must name the same type_info"
 						% (label, RTTI_UNIT, verdict.match_percent,
 							verdict.categories["relocation"]))
+				elif any(not item["ok"] for item in verdict.symbols):
+					# waived or not, a pair the two sides disagree about is a reference difference
+					bad.append("%s: %s reaches something the two sides disagree about: %s"
+						% (label, RTTI_UNIT, "; ".join(item["why"] for item in verdict.symbols
+							if not item["ok"])))
 				else:
 					names = {item["original"]["name"] for item in verdict.symbols
 						if item["ok"] and item["original"]["kind"] != "function"}

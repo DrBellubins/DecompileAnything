@@ -184,14 +184,23 @@ def unverified() -> None:
 			("a name both sides know is evidence",
 			 normalize.Ref(kind="data", name="g_player_health", raw="DAT0"),
 			 normalize.Ref(kind="data", name="g_player_health", raw="DAT0")),
-			("two function bodies of the same size is evidence",
-			 normalize.Ref(kind="function", size=8), normalize.Ref(kind="function", size=8)),
 			("bytes at the width are evidence",
 			 normalize.Ref(content=b"\x01" * 4, width=4),
 			 normalize.Ref(content=b"\x01" * 4, width=4)),
 			("a string both sides can read is evidence",
 			 normalize.Ref(content=b"abc\x00", string=3), normalize.Ref(content=b"abc\x00"))):
 		ok(what, (score(left, right).unverified, score(left, right).tier), (0, "semantic"))
+	# Two bodies of the same size used to be the weakest rung here. Since Phase 5 it is not a rung:
+	# "equal size, different helper" is exactly the mistake this comparison exists to catch, and once
+	# any unit has been shown that helper and passed, the match ledger says what it is called. That
+	# rule and the ledger are checked in Tests/tools/check_phase5_ledger.py.
+	same_size = score(normalize.Ref(kind="function", size=8, raw="FUN0"),
+		normalize.Ref(kind="function", size=8, raw="FUN0"))
+	ok("two function bodies of the same size no longer clear the counter",
+		(same_size.unverified, same_size.tier, same_size.symbols[0]["evidence"]),
+		(1, "structural", "size"))
+	truth("and the report says what is missing there", any("same size" in line
+		for line in diff.report_lines(same_size, "o", "c", max_symbols=20)))
 
 	a, b = stream(["movl DAT0, %eax", "movl DAT1, %eax"]), stream(["movl DAT0, %eax"])
 	a[0].refs.append(normalize.Ref(kind="data", name="g_a", raw="DAT0"))

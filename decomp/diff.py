@@ -60,8 +60,39 @@ TIERS = ("none", "structural", "semantic", "exact")
 GATE_MODES = ("none", "percent") + TIERS
 GATE_DEFAULT = "semantic"
 # What a project may choose to wave aside rather than have it cap every unit in the target. The
-# only one today is `unverified`: references neither side can name, bound or read (Phase 4).
+# only one today is `unverified`: references nothing verifies - neither side can name, bound or read
+# the object (Phase 4), or the only thing said about a callee is that both bodies are the same size
+# and the match ledger has no name for it (Phase 5).
 WAIVABLE = ("unverified",)
+# Why a reference counts as unverified, in the two ways that happen. Constants because the report and
+# the gate note both have to name which one it is: "neither side can name it" and "all either side
+# said was that both bodies are the same size" are different things to go and fix.
+_UNNAMED = "nothing on either side names it"
+_SIZE_ONLY = "only that both bodies are the same size"
+# The kinds of evidence strong enough to bank as a claim about a name (Phase 5). `size` is not one:
+# recording a symbol on the strength of two bodies being the same length would make the next unit's
+# score rest on a name nothing proved. `ledger` is, because it was proven once already.
+PROVEN_EVIDENCE = ("name", "string", "bytes", "ledger")
+
+
+def _why_unverified(refs) -> str:
+	"""What the unverified references are each missing, grouped by kind.
+
+	This is the part of the report an LLM acts on: an unnamed `.bss` global and a callee the ledger
+	does not know are different jobs - reproduce the object, or decompile the callee first.
+	"""
+	kinds: dict[str, int] = {}
+	for item in refs or ():
+		why = item.get("why") or _UNNAMED
+		kinds[why] = kinds.get(why, 0) + 1
+	parts = []
+	if kinds.get(_UNNAMED):
+		parts.append("%d: neither side can name, bound or read it" % kinds[_UNNAMED])
+	if kinds.get(_SIZE_ONLY):
+		parts.append("%d: the only thing either side says about the callee is that both bodies are "
+			"the same size, and the match ledger has no name for it - decompile the callee first"
+			% kinds[_SIZE_ONLY])
+	return "; ".join(parts) or "nothing either side can say"
 
 TIER_MEANING = {
 	"none": "the instruction stream is not the same shape or not the same operations",
@@ -277,13 +308,19 @@ def content_window(a: Ref, b: Ref) -> tuple[int, str]:
 	return 0, ""
 
 
-def ref_evidence(a: Ref, b: Ref) -> tuple[bool, str, str]:
+def ref_evidence(a: Ref, b: Ref, ledger: list[dict] | None = None) -> tuple[bool, str, str]:
 	"""Do these two references mean the same thing, why if not, and *what let us tell*.
 
 	`refs_compatible` is the answer; the third value names the evidence the answer rests on - "name",
-	"bytes", "string", "size", or "" when nothing on either side said anything about the object. The
-	last one is what `unverified` counts: a reference neither side can pin down is not proof that a
-	unit is right, and a tier that rests on one is not honest (Phase 4).
+	"bytes", "string", "size", "ledger", or "" when nothing on either side said anything about the
+	object. The last one is what `unverified` counts: a reference neither side can pin down is not
+	proof that a unit is right, and a tier that rests on one is not honest (Phase 4).
+
+	`ledger` is what an earlier unit already proved about this entity (Phase 5): the rows the match
+	ledger holds for the address this reference reaches, each naming the `candidate` symbol that was
+	shown to reproduce it. Once something has been *shown* it is a claim about the candidate: an
+	anonymous callee in a stripped binary is the same callee in every unit that reaches it, so a unit
+	may not name it freely any more - not when a unit that passed the gate already named it.
 	"""
 	if a.cls != b.cls:
 		return False, "%s on the original, %s in the candidate" % (a.kind, b.kind), ""
@@ -308,16 +345,33 @@ def ref_evidence(a: Ref, b: Ref) -> tuple[bool, str, str]:
 	if a.size and b.size and a.size != b.size and (
 			a.kind == "function" or (a.named and b.named)):
 		return False, "%d bytes there, %d in the candidate" % (a.size, b.size), ""
+	# The ledger speaks before the size rule does: a unit that passed the gate already showed which
+	# symbol reproduces this entity, and that outranks "both bodies happen to be the same size".
+	for row in ledger or ():
+		if b.name and canonical_name(b.name) == canonical_name(row["candidate"]):
+			# weak evidence is replaced, strong evidence is left alone
+			if evidence in ("", "size"):
+				evidence = "ledger"
+			break
+		if b.name:
+			return False, "reaches %s; the ledger says the %s at 0x%x is %s (shown by %s)" % (
+				b.name, a.kind or "object", a.address or 0, row["candidate"],
+				row.get("unit") or "an earlier unit"), ""
+		# ... and the candidate named nothing at all. Nothing is claimed, so nothing is refuted: this
+		# is the frontier, and it shows up as a reference that is not verified.
+		break
 	if not evidence and a.size and b.size and a.kind in ("function", "external"):
-		# two function bodies of the same measured size: not a name, but the "equal size,
-		# different helper" case this comparison exists for, so it counts as evidence
+		# two function bodies of the same measured size. That is the weakest thing that can be said
+		# about a call - the "equal size, different helper" case this comparison exists to catch - so
+		# since Phase 5 the caller counts it with the references that are not verified. It stays named
+		# rather than blank so the report can say what the match there rests on.
 		evidence = "size"
 	return True, "", evidence
 
 
-def refs_compatible(a: Ref, b: Ref) -> tuple[bool, str]:
+def refs_compatible(a: Ref, b: Ref, ledger: list[dict] | None = None) -> tuple[bool, str]:
 	"""The two-value form of `ref_evidence`, for callers that only need the verdict."""
-	ok, why, _evidence = ref_evidence(a, b)
+	ok, why, _evidence = ref_evidence(a, b, ledger)
 	return ok, why
 
 
@@ -349,7 +403,16 @@ def _pair_registers(a, b) -> tuple[str, str]:
 	return "register", "same operation, different registers"
 
 
-def _difference(a, b) -> tuple[str, str]:
+def _ledger_for(ledger: dict[int, list[dict]] | None, ref) -> list[dict]:
+	"""The ledger rows for whatever this reference reaches (Phase 5).
+
+	Keyed by the entity in the original's addresses, which is what a reference on that side
+	resolves to (a thunk's entry included - the analysis records the call as reaching the thunk).
+	"""
+	return (ledger or {}).get(ref.address if ref.address is not None else -1, [])
+
+
+def _difference(a, b, ledger: dict[int, list[dict]] | None = None) -> tuple[str, str]:
 	"""The category of one differing line pair, and why."""
 	if a.mnemonic != b.mnemonic:
 		return "opcode", "%s vs %s" % (a.mnemonic, b.mnemonic)
@@ -358,7 +421,10 @@ def _difference(a, b) -> tuple[str, str]:
 	paired = list(zip(a.refs, b.refs))
 	if paired:
 		for left, right in paired:
-			ok, why = refs_compatible(left, right)
+			# the ledger is part of this: once an earlier unit has shown which symbol reproduces
+			# this entity, a candidate that reaches a different one is a reference difference even
+			# though the two lines look identical (Phase 5)
+			ok, why = refs_compatible(left, right, _ledger_for(ledger, left))
 			if not ok:
 				return "relocation", why
 	return "operand", "operands differ"
@@ -456,9 +522,11 @@ def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str,
 			gaps.append("the stream still differs once registers are renamed (%s)" % _say(abstract))
 		if unverified and "unverified" not in waive:
 			what = ", ".join(sorted({item["token"] for item in unverified_refs or []}))
-			gaps.append("%d reference%s %s neither side can name, bound or read (%s) - reproduce the "
-				"object, or the tier cannot be claimed" % (unverified, "s" if unverified > 1 else "",
-					"stands" if unverified > 1 else "stands", what or "unnamed"))
+			gaps.append("%d reference%s %s not verified (%s): %s - the tier cannot be claimed until "
+				"the object is reproduced or the callee has a name in the ledger"
+				% (unverified, "s" if unverified > 1 else "",
+					"stands" if unverified == 1 else "stand", what or "unnamed",
+					_why_unverified(unverified_refs)))
 	if tier_rank(want) >= tier_rank("exact") and not bytes_equal:
 		gaps.append(byte_gap or "the bytes are not equal")
 	return gaps
@@ -468,7 +536,7 @@ def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str,
 # the two comparisons
 
 
-def _align(original: list, candidate: list) -> dict:
+def _align(original: list, candidate: list, ledger: dict[int, list[dict]] | None = None) -> dict:
 	"""Align two token streams and categorise every difference.
 
 	Run twice by `compare`: once on the tokens as written, once with the registers folded. Only
@@ -491,7 +559,7 @@ def _align(original: list, candidate: list) -> dict:
 			# "same length" and was wrong.
 			a_block, b_block = original[i1:i2], candidate[j1:j2]
 			for a, b in zip(a_block, b_block):
-				kind, why = _difference(a, b)
+				kind, why = _difference(a, b, ledger)
 				categories[kind] += 1
 				replaced += 1
 				diff.append({"category": kind, "original": a.text, "candidate": b.text,
@@ -522,7 +590,7 @@ def _align(original: list, candidate: list) -> dict:
 		for step in range(block.size):
 			a, b = original[block.a + step], candidate[block.b + step]
 			for left_ref, right_ref in zip(a.refs, b.refs):
-				ok, why = refs_compatible(left_ref, right_ref)
+				ok, why = refs_compatible(left_ref, right_ref, _ledger_for(ledger, left_ref))
 				if not ok:
 					hidden += 1
 					diff.append({"category": "relocation", "original": a.text, "candidate": b.text,
@@ -549,7 +617,7 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 		original_bytes: bytes = b"", candidate_bytes: bytes = b"",
 		original_fields=None, candidate_fields=None, original_at: dict | None = None,
 		candidate_at: dict | None = None, require: str = GATE_DEFAULT,
-		waive: tuple[str, ...] = ()) -> Verdict:
+		waive: tuple[str, ...] = (), ledger: dict[int, list[dict]] | None = None) -> Verdict:
 	"""Score a candidate against the original and name the tier it reaches.
 
 	`require` is the gate from the target's `[gate]` table; `verdict.passed` is "this reaches
@@ -562,10 +630,16 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 	`original_at` / `candidate_at` map a body offset to the instruction it falls in, so a byte
 	difference can be named. Leave them `None` and the byte test runs unmasked, which is what the
 	synthetic callers do; pass empty lists to say "looked, there are none in this body".
+
+	`ledger` is the match ledger for the variant being compared (Phase 5): {entity address: [rows]},
+	each row naming the candidate symbol an earlier unit was shown to reproduce that entity with. It
+	turns a repeated anonymous callee from something a candidate may name freely into something it has
+	to name as the ledger says - which is what lets a later unit be scored against what the loop has
+	already identified, instead of against nothing.
 	"""
-	strict = _align(original, candidate)
+	strict = _align(original, candidate, ledger)
 	abstract = _align(_fold_registers(original, "original", vocabulary),
-		_fold_registers(candidate, "candidate", vocabulary))
+		_fold_registers(candidate, "candidate", vocabulary), ledger)
 	left = [token.text for token in original]
 	right = [token.text for token in candidate]
 	denominator = max(len(left), len(right), 1)
@@ -577,13 +651,19 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 	symbols = []
 	unverified: list[dict] = []
 	for token, left_ref, right_ref in _pair(vocabulary.entries["original"], vocabulary.entries["candidate"]):
-		ok, why, evidence = ref_evidence(left_ref, right_ref)
+		rows = _ledger_for(ledger, left_ref)
+		ok, why, evidence = ref_evidence(left_ref, right_ref, rows)
 		symbols.append({"token": token, "ok": ok, "why": why, "evidence": evidence,
 			"original": _describe(left_ref), "candidate": _describe(right_ref)})
 		if ok and not evidence:
 			# both sides reach something, and nothing either side knows says what it is
 			unverified.append({"token": token, "original": _describe(left_ref),
-				"candidate": _describe(right_ref)})
+				"candidate": _describe(right_ref), "why": _UNNAMED})
+		elif ok and evidence == "size":
+			# Phase 5: two bodies of the same size is not a name for what is called. It counts with
+			# the unverified references; the ledger is what settles it in either direction.
+			unverified.append({"token": token, "original": _describe(left_ref),
+				"candidate": _describe(right_ref), "why": _SIZE_ONLY})
 	for token, ref in vocabulary.entries["original"]:
 		if not any(item["token"] == token for item in symbols):
 			symbols.append({"token": token, "ok": False, "evidence": "",
@@ -630,6 +710,9 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 
 def _describe(ref: Ref) -> dict:
 	return {"kind": ref.kind, "name": ref.name or ref.raw or "?",
+		# the entity in this side's addresses. The match ledger is keyed by the original side's, which
+		# is what makes a pair recorded by one unit checkable by the next (Phase 5).
+		"address": ref.address,
 		"section": ref.section, "size": ref.size,
 		"named": ref.named,
 		# what the access itself proves: how wide the read is, and a string length when this side
@@ -682,10 +765,9 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 	lines.append("  with registers folded: %s" % ("identical" if verdict.abstract_clean
 		else _say(verdict.abstract_categories)))
 	if verdict.unverified:
-		lines.append("  %d reference%s %s neither side can verify: both reach it, but neither names "
-			"it, bounds it, or reads it at a width the other agrees to - so the match there is "
-			"assumed, not proven%s" % (verdict.unverified, "s" if verdict.unverified > 1 else "",
-				"stand" if verdict.unverified > 1 else "stands",
+		lines.append("  %d reference%s %s not verified: %s - so the match there is assumed, not "
+			"proven%s" % (verdict.unverified, "s" if verdict.unverified > 1 else "",
+				"stands" if verdict.unverified == 1 else "stand", _why_unverified(verdict.unverified_refs),
 				" (waived by [gate] waive, so it does not cap the tier)" if "unverified"
 				in verdict.waive else ", and it caps the tier at structural"))
 	if verdict.bytes_equal and verdict.match_percent == 100.0:

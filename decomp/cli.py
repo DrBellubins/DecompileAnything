@@ -799,6 +799,91 @@ def symbols_cmd(
 
 
 @app.command()
+def ledger(
+	binary: Optional[Path] = typer.Option(None, "--bin"),
+	key: Optional[str] = typer.Option(None, "--key"),
+	config_file: Optional[str] = typer.Option(None, "--config", "-C"),
+	variant: Optional[str] = typer.Option(None, "--variant", "-v",
+		help="default: the variant the analysis was run with"),
+	limit: int = typer.Option(20, "--limit", help="how many frontier entries to show"),
+	frontier: bool = typer.Option(True, "--frontier/--no-frontier",
+		help="what the ledger has no name for yet, by how many functions call it"),
+	as_json: bool = typer.Option(False, "--json"),
+) -> None:
+	"""What the loop already knows about this target: which candidate symbol reproduces which
+	entity in the original's addresses, and - more usefully - the callees it has not named yet.
+
+	The ledger is written by `decomp try` when a unit reaches the gate (Docs/byte-cleanup-plan.md
+	Phase 5): the pairs a scored unit was *shown*, not guesses. It is the memory of the loop. A
+	helper proven in one function is a name every later unit has to use, and the frontier is the
+	answer to "what should I decompile next": the callee the already-reproduced units reach most
+	often, whose name would pay off in the most places at once.
+	"""
+	cfg = load_config(config_file)
+	store = cache.Cache(config.cache_dir(cfg))
+	conn, values = open_analysis(store, binary, key)
+	try:
+		meta = cache.meta(conn)
+		name = variant or str(meta.get("variant") or "")
+		rows = cache.match_rows(conn, variant=name)
+		known = cache.matched_entries(conn, variant=name)
+		others: dict[str, int] = {}
+		for row in cache.match_rows(conn):
+			if row["variant"] != name:
+				others[row["variant"]] = others.get(row["variant"], 0) + 1
+		# with an empty ledger there is no frontier yet, so the honest thing to show is the seed:
+		# the callees with the most callers anywhere in the analysis
+		seeds = cache.callees_of(conn, among=known if known else None, exclude=known, limit=limit)
+	finally:
+		conn.close()
+
+	by_entry: dict[int, list[dict]] = {}
+	for row in rows:
+		by_entry.setdefault(int(row["entry"]), []).append(row)
+	if as_json:
+		echo(json.dumps({"target": values.get("target_path"), "key": values.get("target_key"),
+			"variant": name, "pairs": len(rows), "entities": len(by_entry),
+			"other_variants": others, "matched": rows,
+			"frontier": seeds if frontier else []}, indent=1, default=str))
+		raise typer.Exit(EXIT_OK)
+
+	echo("; %s (key %s)  ledger for variant %s" % (values.get("target_path"),
+		values.get("target_key"), name or "(none recorded)"))
+	if others:
+		echo("; other variants: %s" % ", ".join("%s (%d pairs)" % item for item in
+			sorted(others.items())))
+	if not rows:
+		echo("nothing yet: a unit that reaches the gate writes what it proved here - `decomp try`")
+	else:
+		echo("matched (%d entities, %d claims):" % (len(by_entry), len(rows)))
+		for entry, group in sorted(by_entry.items()):
+			newest = max(group, key=lambda item: str(item.get("at") or ""))
+			names = ", ".join(sorted({str(item["candidate"]) for item in group}))
+			echo("  %s  %-9s %s%s" % (_hex(entry), newest.get("kind") or "?", names,
+				"  (%d claims)" % len(group) if len(group) > 1 else ""))
+			echo("             %s at %s, shown by %s%s" % (newest.get("evidence") or "?",
+				newest.get("tier") or "?", newest.get("unit") or "?",
+				" @ %s" % _hex(newest["unit_entry"]) if newest.get("unit_entry") else ""))
+	if frontier:
+		echo("")
+		echo("the frontier (%d):" % len(seeds) if known else
+			"nothing has reached the gate yet, so this is every callee in the analysis, most-called "
+			"first (%d):" % len(seeds))
+		for row in seeds:
+			echo("  %s  %-9s %6s  called by %-3d functions, %d sites  %s"
+				% (_hex(row["entry"]), row.get("kind") or "?", row.get("size"), row["callers"],
+					row["sites"], row.get("name") or ""))
+		if seeds:
+			first = seeds[0]
+			echo("")
+			echo("next: %s is reached by %d of the functions already reproduced - `decomp find %s`, "
+				"then `decomp try %s <source>`; its name joins the ledger and the units that call it "
+				"are scored against it" % (first.get("name") or _hex(first["entry"]), first["callers"],
+					_hex(first["entry"]), _hex(first["entry"])))
+	raise typer.Exit(EXIT_OK)
+
+
+@app.command()
 def find(
 	query: str = typer.Argument(..., help="name, substring, 0x address, or string content"),
 	binary: Optional[Path] = typer.Option(None, "--bin"),
@@ -1028,7 +1113,18 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		outcome["error_code"] = EXIT_FAIL
 		return outcome
 
+	# What the loop has already been shown about this target (Docs/byte-cleanup-plan.md, Phase 5):
+	# which symbol in a candidate built this way reproduces which entity in the original's addresses.
+	# Two things follow from having that written down. The positional token for an entity the ledger
+	# knows comes from the ledger, so one helper is one thing across a target instead of a different
+	# thing per body; and a reference that reaches it is a claim about how the candidate names it,
+	# which the ledger confirms or contradicts. Both are scoped to the variant being compared: a name
+	# proven at -O0 says nothing about what -O2 calls a static helper.
+	ledger_rows = cache.match_rows(conn, variant=name)
+	ledger = cache.match_index(conn, variant=name)
+	outcome["ledger"] = len(ledger)
 	vocabulary = normalize.Vocabulary()
+	vocabulary.seed_ledger(ledger_rows)
 	bind_candidate = object_file.bindings(candidate)[0]
 	tokens_original = normalize.normalize_function(vocabulary, "original", instructions_original,
 		bind_original, original.address, original.size, False, original.extents)
@@ -1053,8 +1149,55 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		original_fields=fields_original, candidate_fields=fields_candidate,
 		original_at=normalize.body_index(blocks_original, instructions_original, tokens_original),
 		candidate_at=normalize.body_index(blocks_candidate, instructions_candidate, tokens_candidate),
-		require=require, waive=tuple(waiver))
+		require=require, waive=tuple(waiver), ledger=ledger)
 	return outcome
+
+
+def _learn(db: Path, row, variant: str, verdict, candidate) -> dict:
+	"""Write down what a unit that reached the gate proved about the target (Phase 5).
+
+	Two things a scored unit proves, and they are different things.
+
+	**The unit itself.** The candidate symbol that assembled to the bytes at this address *is* the
+	name of whatever lives there - and in a stripped binary nothing else says. That is the pair every
+	later unit is scored against: a call to `FUN_00102e1e` stops being a guess the moment the
+	function at that address has been reproduced, and named.
+
+	**What it reaches.** Only where the original side is anonymous: where the original has a name
+	(`strcmp`, a symbol of an unstripped target) the name comparison in `diff.ref_evidence` already
+	refuses a candidate that reaches something else, so there is nothing new to record. Where the
+	original is a global with no symbol in it, the candidate's name for it is new, and every other
+	unit that reaches it has to answer to it.
+
+	Nothing is recorded on the strength of equal size (`diff.PROVEN_EVIDENCE`), and nothing is
+	recorded for a unit that did not reach the gate: the ledger is a set of claims there is evidence
+	for, and a name made up in here would make the next unit fail for the wrong reason. The write is
+	a separate connection on purpose - scoring reads the analysis, learning is the one thing it does
+	to it.
+	"""
+	entries = []
+	if candidate is not None and normalize.is_synthetic(row["name"] or ""):
+		# `raw_name`, not `display`: a later candidate's call is disassembled with the symbol the
+		# object carries, which is this spelling - mangled and all
+		entries.append({"variant": variant, "entry": row["entry"], "kind": row["kind"] or "function",
+			"candidate": candidate.raw_name, "evidence": "unit", "tier": verdict.tier,
+			"unit": row["name"], "unit_entry": row["entry"], "at": time.strftime("%Y-%m-%d")})
+	for item in verdict.symbols:
+		original, candidate = item.get("original") or {}, item.get("candidate") or {}
+		if not item.get("ok") or item.get("evidence") not in diff.PROVEN_EVIDENCE:
+			continue
+		if original.get("named") or not original.get("address"):
+			continue
+		name = candidate.get("name") or ""
+		if not name or name == "?":
+			continue
+		entries.append({"variant": variant, "entry": original["address"],
+			"kind": original.get("kind") or "", "candidate": name,
+			"evidence": item["evidence"], "tier": verdict.tier, "unit": row["name"],
+			"unit_entry": row["entry"], "at": time.strftime("%Y-%m-%d")})
+	with sqlite3.connect(db) as conn:
+		written = cache.record_matches(conn, entries)
+	return {"written": written, "pairs": entries}
 
 
 @app.command("try")
@@ -1075,6 +1218,10 @@ def try_cmd(
 	register_abstract: bool = typer.Option(False, "--register-abstract",
 		help="accepted for compatibility and ignored: the register-folded comparison now runs on "
 			"every try and is part of the tier (decomp/diff.py)"),
+	learn: bool = typer.Option(True, "--learn/--no-learn",
+		help="a unit that reaches the gate writes what it proved into the match ledger (Phase 5): "
+		"its own symbol at this address, and its names for anonymous entities it reaches. Later "
+		"units are scored against that - `decomp ledger` shows it, --no-learn leaves it alone"),
 	gate: str = typer.Option("", "--gate",
 		help="override the tier this unit has to reach: %s (default: [gate] require in the "
 			"target config, else semantic)" % ", ".join(diff.GATE_MODES)),
@@ -1122,6 +1269,10 @@ def try_cmd(
 				register_abstract=register_abstract, object_dir=store.root / "candidates", gate=gate,
 				waive=([item.strip() for item in waive.replace(",", " ").split() if item.strip()]
 					if waive.strip() else None))
+			verdict = outcome["verdict"]
+			if learn and verdict is not None and verdict.passed:
+				outcome["learned"] = _learn(Path(values["db"]), row, outcome["variant"], verdict,
+					outcome["candidate"])
 		except config.ConfigError as exc:
 			raise Stop(EXIT_USAGE, "%s" % exc)
 		except NotImplementedError as exc:
@@ -1167,6 +1318,7 @@ def try_cmd(
 				"original_bytes": verdict.original_bytes, "candidate_bytes": verdict.candidate_bytes,
 				"diff": verdict.diff, "symbols": verdict.symbols,
 				"unverified": verdict.unverified, "unverified_refs": verdict.unverified_refs,
+				"ledger_known": outcome.get("ledger", 0), "learned": outcome.get("learned", {}),
 				"waived": verdict.waive},
 		}
 		echo(json.dumps(payload, indent=1))
@@ -1192,6 +1344,11 @@ def try_cmd(
 		_hex(outcome["original"].address)), "%s (%s)" % (outcome["candidate"].display,
 		outcome["candidate"].section), max_diff=max_diff, max_symbols=max_symbols):
 		echo(line)
+	learned = outcome.get("learned") or {}
+	if learned.get("written"):
+		echo("learned: %d pair%s added to the match ledger - what a later unit has to name the same "
+			"way; see them with: decomp ledger" % (learned["written"],
+				"s" if learned["written"] != 1 else ""))
 	raise typer.Exit(EXIT_OK if verdict.passed else EXIT_FAIL)
 
 

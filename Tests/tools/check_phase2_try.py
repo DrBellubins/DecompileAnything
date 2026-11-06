@@ -58,7 +58,8 @@ KNOWN_GAPS = {
 		# at 97.30 / 98.18 / 98.85 / 97.83 %, which the percentage rule let through.
 		"MATH-11": "32-bit data reference through a shared section",
 		"MATH-19": "32-bit data reference through a shared section",
-		"MATH-24": "32-bit data reference through a shared section",
+		"MATH-24": "32-bit data reference through a shared section; since Phase 5 it is also capped "
+			"by a same-size helper it calls",
 		"MATH-32": "32-bit data reference through a shared section",
 		"MATH-20": "32-bit data reference through a shared section",
 		"MATH-22": "32-bit data reference through a shared section",
@@ -72,7 +73,8 @@ KNOWN_GAPS = {
 		# pool is anchored on the nearest symbol rather than on the offset the relocation addresses -
 		# an open tool bug, named here so a new one still fails.
 		"MATH-21": "32-bit read window anchored on the nearest symbol (open tool bug)",
-		"MATH-27": "32-bit read window anchored on the nearest symbol (open tool bug)",
+		"MATH-27": "32-bit read window anchored on the nearest symbol (open tool bug); since Phase "
+			"5 it is also capped by same-size helpers it calls",
 	},
 	"gcc-o2": {
 		# Not an extent problem - Tests/tools/check_phase5_o2.py requires the tool's extent to
@@ -131,6 +133,7 @@ def main(argv=None) -> int:
 		units = answer["units"][: args.limit] if args.limit else answer["units"]
 		scores, recut, broken, below = [], [], [], []
 		unverified_only: dict[str, int] = {}
+		by_ledger: set[str] = set()
 		split = 0  # units whose body is not contiguous (.text + .text.unlikely at -O2)
 		for unit in units:
 			row = cache.resolve_function(conn, hex(unit["address"] + offset))
@@ -168,6 +171,12 @@ def main(argv=None) -> int:
 					# nothing about the instructions is wrong: the only thing standing in the way
 					# is references neither side can describe (Phase 4)
 					unverified_only[unit["id"]] = verdict.unverified
+					if verdict.unverified_refs and all("same size" in (item.get("why") or "")
+							for item in verdict.unverified_refs):
+						# Phase 5: here what is missing is a name for a *callee*, not for an object, and
+						# the fix is the other way round - decompile the helper once, and every unit
+						# that calls it is scored against what it proved
+						by_ledger.add(unit["id"])
 			(guess["object"]).unlink(missing_ok=True)
 		conn.close()
 
@@ -212,6 +221,13 @@ def main(argv=None) -> int:
 			unit_id = item.split()[0]
 			if unit_id in gaps:
 				print("   KNOWN GAP %s: %s" % (unit_id, gaps[unit_id]))
+			elif unit_id in by_ledger:
+				print("   LEDGER %s: %d callee%s matched on equal size and nothing else - the tier "
+					"stops at `structural` (Docs/byte-cleanup-plan.md Phase 5). The instructions and "
+					"bytes agree; `decomp ledger` names the helpers by how many functions call them, "
+					"and the unit is scored against what the helper proved once it has been"
+					% (unit_id, unverified_only[unit_id],
+						"s" if unverified_only[unit_id] > 1 else ""))
 			elif unit_id in unverified_only:
 				print("   UNVERIFIED %s: %d reference%s %s neither side can name, bound or read - "
 					"the tier stops at `structural` (Docs/byte-cleanup-plan.md Phase 4). Reproduce "

@@ -59,6 +59,7 @@ To check that the scorer's own counts add up (Docs/byte-cleanup-plan.md, Phase 1
 .venv/bin/python Tests/tools/check_gate_tiers.py
 .venv/bin/python Tests/tools/check_masked_bytes.py
 .venv/bin/python Tests/tools/check_phase4_evidence.py
+.venv/bin/python Tests/tools/check_phase5_ledger.py
 ```
 
 A `replace` region whose two sides are different lengths used to be zipped, so the leftover
@@ -77,7 +78,9 @@ instruction counts with nothing in `missing`/`extra` fails the group by name.
 tier counts. Measured with it, on the untouched source: **-O0 89/89, -O2 86/89, -m32 77/89**, means
 unchanged (100.00 / 99.91 / 99.38) - six units out, all six an operand difference on a reference
 the two sides cannot pair (`leaq SYM1(%rip)` against `leaq SYM0(%rip)` at -O2, an object named
-`DAT1` against `DAT0` at -m32), all six named in `KNOWN_GAPS` with the reason. The tiers, lowest
+`DAT1` against `DAT0` at -m32), all six named in `KNOWN_GAPS` with the reason. Phases 4 and 5
+moved those counts again (79 / 78 / 59 today, see "known gaps" below for what each cap is and what
+would lift it); the means did not move. The tiers, lowest
 first: `structural` (same length, operations and targets), `semantic` (+ every operand right, +
 streams identical once registers are folded), `exact` (+ the bytes are equal once the fields the
 link writes are zeroed on both sides); `percent` and `none` are the escape hatches, and `--gate`
@@ -126,7 +129,32 @@ carry `bytes` evidence, 353 strings are compared as strings, and `check_phase4_e
 the point - MATH-20's `360.0f`→`359.0f` and STR-15's `x%.1f`→`x%.2f` both fail the gate, naming
 the bytes and the instruction they are read at.
 
-To check the `-O2` work itself (Phase 5):
+To check the match ledger (`Docs/byte-cleanup-plan.md` Phase 5):
+
+```sh
+.venv/bin/python Tests/tools/check_phase5_ledger.py
+```
+
+Two function bodies of the same measured size are not a name for *which* helper a call reaches, so
+a callee matched on size alone now counts with the references that are not verified and the unit
+stops at `structural` until something proves the pair. What proves it is the ledger: `decomp try`
+writes `(variant, entry, kind)` → the candidate's own spelling of it for a unit that reaches the
+gate, plus every reference it proved by name, string or bytes — never on size — and every later
+unit that reaches that address is scored against it. The synthetic groups cover both directions: an
+unnamed same-size callee caps the tier at `structural` and names the reference; bank the pair and
+the same source reaches `exact` with every callee reading `ledger`; rename it in the ledger and the
+unit fails, naming the address and both names. Two named callees of different sizes were never
+allowed, and a candidate that names nothing is not refuted, only unverified. The token groups are
+the other half of the plan: a callee the loop already has a name for gets the same token in every
+unit, so pairing no longer depends on the order the two sides happened to reach it. Then the real
+target: `MATH-24` at -O0 is capped by one helper (`SquareRootNewton` at 0x102e1e), the frontier
+query names exactly that callee, banking it takes the unit to `exact`, renaming it in the ledger
+takes it to `none`, and `decomp ledger` / `--json` are checked as the loop sees them (`--limit`,
+`--no-frontier`, and `try --no-learn` included). It runs against a *copy* of the analysis
+(`cache/phase5-ledger`, generated `Tests/phase5-scratch.toml`) because a ledger changes scores by
+design and the other suites measure the target without one.
+
+To check the `-O2` work itself (`check_phase5_o2.py`, named for the earlier phase list):
 
 ```sh
 .venv/bin/python Tests/tools/check_phase5_o2.py
@@ -136,7 +164,8 @@ Three claims, none of them this tool's own opinion. **The extent:** for every un
 ELF builds, the `(address, size)` that `extract` settles on equals the answer key's - which comes
 from the *unstripped* build's symbol table, while the tool is only allowed the stripped file
 (89/89 on each). **The loop:** the untouched source at `-O2` through `decomp try`'s own path must
-hold (measured 99.91% mean, 86/89 past the tier gate, against the harness's 98.27%/72). **The two
+hold (measured 99.91% mean, 78/89 past the tier gate - 86 before the match ledger's same-size rule,
+see above - against the harness's 98.27%/72). **The two
 mechanisms that make a split body comparable:** a unit whose bytes sit at 0x1000 and 0x9000
 tokenises as one stream with unit-relative labels (`jmp L6`/`jmp L0` - positions, not addresses),
 and the register-folded comparison (`normalize.abstract_registers`, run on every score) makes
@@ -410,6 +439,20 @@ per-function difficulty is representative.
 
 ## Known gaps
 
+* **Same-size callees are capped until they are decompiled** (since `Docs/byte-cleanup-plan.md`
+  Phase 5). A call to a helper the stripped binary does not name, matched only because both bodies
+  are the same size, is no longer evidence: those units stop at `structural` — 8 at -O0, 6 at -O2,
+  6 at -m32 (MATH-24/27/29, STR-04/07/08, STRUCT-22/25 at -O0). Their instructions, operands and
+  bytes all agree; what is missing is a name. The counts went *down* on purpose, and the fix is on
+  the loop's side: `decomp ledger` lists those callees by how many functions call them, and banking
+  one (which is what `decomp try` does when the helper itself reaches the gate) takes every unit
+  that calls it back to `exact` — `Tests/tools/check_phase5_ledger.py` measures that on real bytes.
+  `check_masked_bytes.py` and `check_phase2_try.py` print which units those are (`capped only by
+  callees matched on equal size`, `LEDGER …`).
+* **Unnamed `.bss` data and unnamed PLT thunks** are the Phase 4 half of the same rule: MATH-13 and
+  STRUCT-21 at -O0/-O2 (data neither side can describe), and at -m32 the thunks whose import the
+  stripped binary does not name. Reproducing the object (structures-plan) lifts them; so does the
+  project saying `[gate] waive = "unverified"`.
 * **-m32 normalisation is weak** (87% ceiling): 32-bit addressing forms (`movl 0x804a2c4`,
   `$displ,%eax` + `R_386_*`) are not all mapped to names. x86 is *not* a stand-in for MSVC
   either - "-m32 as the closer match to the 32-bit MSVC targets" in `project.toml` is about

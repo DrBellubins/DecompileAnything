@@ -403,6 +403,52 @@ class Vocabulary:
 		# side touches is r<k>, so two sides that made the same choice in different registers
 		# meet, and one that made a different choice (a different operand pair) still differs
 		self._registers: dict[str, dict[str, str]] = {side: {} for side in ("original", "candidate")}
+		# What the match ledger already knows (Phase 5): {"0x…": token} for the entities a unit that
+		# passed the gate already reproduced. Keyed by the entity's address in the original's
+		# addresses, which is what the ledger is keyed by - and by the candidate symbol the ledger
+		# pairs it with, because a candidate's own call reaches that name, not that address.
+		self._from_ledger: dict[str, str] = {}
+		self._by_ledger_name: dict[tuple[str, str], str] = {}
+
+	def seed_ledger(self, rows) -> None:
+		"""Give the callees the match ledger knows the same token in every unit (Phase 5).
+
+		`rows` = the ledger's rows, in the order the pairs were proven. Without this the token for a
+		callee is its position in whichever body is being compared now, so `SYM3` in one unit and
+		`SYM3` in the next name unrelated things, and nothing the loop learned about one function
+		carries over to the next. With it, "the helper `main` calls twice" has a name the loop can
+		refer to - in a report, in the ledger, and in the next unit's symbol table.
+
+		Both sides take it from the same numbering: the original reaches the entity at its address,
+		the candidate reaches it by the symbol the ledger recorded, and those two have to meet at one
+		token or the symbol table is two columns of unrelated names again.
+
+		Only callees - a `function` or `external` row. Data is deliberately left to the positional
+		counting and the identity merge above, because the ledger cannot key an object both sides
+		agree on: it stores one candidate *name*, and what the candidate actually reads is an offset
+		in a merged `.rodata` pool or one element of an array, which carries no key back to the
+		original's address. Keying the original's side by address and the candidate's by position
+		moves the numbers apart and mis-pairs constants that the byte comparison was already getting
+		right (measured on the benchmark: MATH-24 and MATH-29, whose pool constants met at the right
+		width before). A data row still counts as *evidence* in `diff.ref_evidence` once a pair is
+		formed; it just does not name the token.
+		"""
+		for row in rows or ():
+			entry = row.get("entry")
+			if entry is None or row.get("kind") not in ("function", "external"):
+				continue
+			key = "0x%x" % int(entry)
+			if key in self._from_ledger:
+				continue
+			prefix = "SYM"
+			# numbered ahead of whatever either side has already counted, so a seeded token can never
+			# collide with a positional one handed out later
+			token = "%s%d" % (prefix, max(self._next["original"][prefix], self._next["candidate"][prefix]))
+			self._next["original"][prefix] = self._next["candidate"][prefix] = int(token[len(prefix):]) + 1
+			self._from_ledger[key] = token
+			name = canonical_name(row.get("candidate") or "")
+			if name:
+				self._by_ledger_name.setdefault((prefix, name), token)
 
 	def register_name(self, side: str, register: str) -> str:
 		"""This side's name for a register: first appearance wins, aliases of one register
@@ -428,9 +474,20 @@ class Vocabulary:
 		cached = self._tokens.get((side, prefix, key))
 		if cached:
 			return cached
-
-		token = "%s%d" % (prefix, self._next[side][prefix])
-		self._next[side][prefix] += 1
+		# An entity the ledger already has a name for keeps the token the ledger gave it: the pair
+		# was proven once, and renumbering it per body is what stops a target being described as
+		# one set of things (Phase 5). The identity merge above still comes first - reading
+		# `vtable+16` and `vtable+40` is one object, whichever of the two the ledger happens to know.
+		seeded = self._from_ledger.get("0x%x" % ref.address) if ref.address is not None else None
+		if seeded is None and ref.name and not (ref.identity and not ref.identity.startswith("symbol:")):
+			# the candidate reaches its own helpers by name, not by the original's addresses. Only a
+			# name that *is* the object counts: a reference resolved to an offset in a section
+			# (`.rodata+0x280`) is named there by whatever symbol sits nearest before it, and that
+			# guess must not be read as a claim about an entity the ledger already has a name for.
+			seeded = self._by_ledger_name.get((prefix, canonical_name(ref.name)))
+		token = seeded or "%s%d" % (prefix, self._next[side][prefix])
+		if not seeded:
+			self._next[side][prefix] += 1
 		self._tokens[(side, prefix, key)] = token
 		self.entries[side].append((token, ref))
 		return token

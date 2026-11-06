@@ -41,11 +41,17 @@ from decomp import cache, cli, config, extract, normalize  # noqa: E402
 DEFAULT_VARIANTS = ["gcc-o2", "gcc-o0", "gcc-o0-x86"]
 
 # What the untouched source has to reach at -O2 through this tool's own path. Measured here:
-# 99.91% mean, 86 of 89 past the tier gate (88 under the percentage rule that existed before
-# Phase 2) - above the independent harness's own 98.27% / 72, which is the ceiling for any
-# candidate. The five units below it are named in KNOWN_GAPS.
+# 99.91% mean, 84 of 89 past the tier gate as of Phase 4 (86 under Phase 3's rules, 88 under the
+# percentage rule that existed before Phase 2) - above the independent harness's own 98.27% / 72,
+# which is the ceiling for any candidate. The units below it are named in KNOWN_GAPS.
 MIN_MEAN = 99.0
-MIN_PAST_GATE = 83
+# Phase 5 costs six more, all of them the same thing: these units call helpers of their own
+# translation unit, and in a stripped binary nothing names those helpers. A same-size match is no
+# longer evidence, so they are counted unverified and stop at `structural` until the helper has a
+# name in the match ledger - which is what `decomp ledger` exists to find, and what
+# Tests/tools/check_phase5_ledger.py shows unblocking them. Nothing about their instructions, bytes
+# or operands changed: 78/89, mean unchanged at 99.91%.
+MIN_PAST_GATE = 78
 
 KNOWN_GAPS = {
 	"gcc-o2": {
@@ -71,6 +77,18 @@ KNOWN_GAPS = {
 		# nothing could describe was accepted silently.
 		"MATH-13": "two anonymous `.bss` objects - counted unverified, so `semantic` is not claimed",
 		"STRUCT-21": "anonymous state-machine data - counted unverified, as above",
+		# Phase 5 (Docs/byte-cleanup-plan.md) finished what Phase 4 started: two function bodies of
+		# the same measured size stopped being evidence for *which* helper is called. These six call
+		# a helper of their own translation unit - anonymous in the stripped binary, byte-identical
+		# in the candidate - and now stop at `structural` on that reference alone. The fix is not in
+		# the candidate: reproduce the helper first, and the ledger carries its name into every unit
+		# that calls it (`decomp ledger` lists those helpers by how many functions call them).
+		"MATH-24": "calls SquareRootNewton (0x103c30), same size, unnamed there - decompile it first",
+		"MATH-27": "as above: Vec3LengthSq (0x104070) and SquareRootNewton",
+		"MATH-29": "as above: Vec3Cross (0x1040a0), Vec3LengthSq, SquareRootNewton",
+		"STR-07": "as above: LengthOf (0x105c40)",
+		"STR-08": "as above: FindSubstring (0x105de0)",
+		"STRUCT-25": "as above: CompareDescriptorCost (0x107920), the static qsort comparator",
 	},
 }
 

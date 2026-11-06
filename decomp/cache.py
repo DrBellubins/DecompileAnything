@@ -29,7 +29,7 @@ DB_NAME = "analysis.db"
 PROJECT_NAME = "target"
 PROGRAM_NAME = "program"
 
-SCHEMA = """
+SCHEMA_TABLES = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 CREATE TABLE sections (
@@ -75,7 +75,36 @@ CREATE TABLE units (
 	entry INTEGER, end INTEGER, size INTEGER,
 	unwind INTEGER,                 -- the unwind record, where the format gives one
 	section TEXT);
+"""
 
+# The match ledger (Docs/byte-cleanup-plan.md, Phase 5): the pairs the tool has already been
+# *shown*, by a unit that passed the gate. One row per (variant, entity, candidate symbol):
+# the entity at `entry` in the original's addresses is reproduced by `candidate` in a candidate
+# object built with `variant`'s flags.
+#
+# It is what lets a later unit be scored against something the loop already identified: a call to
+# an anonymous helper in a stripped binary is the same call in every candidate that reaches it, so
+# once one unit has proven which symbol it is, the next one is not free to call it something else.
+#
+# A separate statement rather than part of `SCHEMA`'s body because caches written before Phase 5 do
+# not have it and are still usable: read paths check `has_table`, the write path adds it
+# (`ensure_matches`) - the same way the `units` table was added without rebuilding every analysis.
+MATCHES_DDL = """
+CREATE TABLE IF NOT EXISTS matches (
+	variant TEXT,
+	entry INTEGER,                   -- the entity's address in the original
+	kind TEXT,                       -- function | external | data
+	candidate TEXT,                  -- the symbol name in the candidate object
+	evidence TEXT,                   -- what proved the pair (name | string | bytes | object | ledger)
+	tier TEXT,                       -- the tier of the unit that proved it
+	unit TEXT,                       -- that unit's name
+	unit_entry INTEGER,              -- ... and its address
+	at TEXT,                         -- the date it was recorded
+	PRIMARY KEY (variant, entry, candidate));
+"""
+MATCHES_INDEX = "CREATE INDEX IF NOT EXISTS i_matches_entry ON matches(entry);"
+
+SCHEMA_INDEXES = """
 CREATE INDEX i_functions_entry ON functions(entry);
 CREATE INDEX i_functions_name ON functions(name);
 CREATE INDEX i_instructions_fn ON instructions(fn);
@@ -87,6 +116,8 @@ CREATE INDEX i_symbols_address ON symbols(address);
 CREATE INDEX i_units_entry ON units(entry);
 CREATE INDEX i_strings_address ON strings(address);
 """
+
+SCHEMA = SCHEMA_TABLES + MATCHES_DDL + MATCHES_INDEX + SCHEMA_INDEXES
 
 
 def target_key(path: Path) -> dict:
@@ -289,6 +320,8 @@ def counts(conn: sqlite3.Connection) -> dict:
 	if has_table(conn, "units"):
 		tables.append("units")
 	out = {name: conn.execute("SELECT count(*) FROM %s" % name).fetchone()[0] for name in tables}
+	if has_table(conn, "matches"):
+		out["matches"] = conn.execute("SELECT count(*) FROM matches").fetchone()[0]
 	out["bodies"] = conn.execute("SELECT count(*) FROM functions WHERE kind='function'").fetchone()[0]
 	out["thunks"] = conn.execute("SELECT count(*) FROM functions WHERE kind='thunk'").fetchone()[0]
 	out["with_pseudocode"] = conn.execute(
@@ -627,6 +660,122 @@ def inside_function (conn: sqlite3.Connection, address: int) -> bool:
 		return False
 	return conn.execute ("SELECT 1 FROM functions WHERE entry <= ? AND entry + size > ? LIMIT 1",
 		(address, address)).fetchone() is not None
+
+
+# --------------------------------------------------------------------------------------
+# the match ledger
+
+
+def ensure_matches(conn: sqlite3.Connection) -> None:
+	"""Add the ledger to a cache written before Phase 5. Only ever called on a writable
+	connection: a read-only one raises instead of creating it, which is why the readers below
+	answer 'nothing' when the table is absent."""
+	conn.executescript(MATCHES_DDL)
+	conn.execute(MATCHES_INDEX)
+
+
+def match_rows(conn: sqlite3.Connection, variant: str = "", entry: int | None = None,
+	limit: int = 0) -> list[dict]:
+	"""Ledger rows, in the order the pairs were proven: what the tool already knows reproduces what.
+
+	`variant` narrows it to the candidate build being compared now - a symbol name proved under `-O0`
+	is not a promise about what `-O2` calls it. `entry` narrows it to one entity."""
+	if not has_table(conn, "matches"):
+		return []
+	sql = ("SELECT variant, entry, kind, candidate, evidence, tier, unit, unit_entry, at"
+		" FROM matches")
+	values: list = []
+	if variant:
+		sql += " WHERE variant = ?"
+		values.append(variant)
+	if entry is not None:
+		sql += "%s entry = ?" % (" WHERE" if not values else " AND")
+		values.append(entry)
+	# rowid is the order they were written in, which is the order they were proven in - and the
+	# tokens the ledger seeds are numbered in that order, so they do not move between runs
+	sql += " ORDER BY rowid"
+	if limit:
+		sql += " LIMIT %d" % int(limit)
+	return [dict(row) for row in conn.execute(sql, values).fetchall()]
+
+
+def record_matches(conn: sqlite3.Connection, entries: list[dict]) -> int:
+	"""Record what a unit that passed the gate proved.
+
+	An entity is reproduced by a different symbol under a different variant, and by two symbols in
+	one build (a function split into a hot body and a cold one), so the key is the triple and not
+	the entity: every claim stays visible, and a re-run of the same unit updates its row."""
+	ensure_matches(conn)
+	count = 0
+	with conn:
+		for item in entries:
+			if item.get("entry") is None or not item.get("candidate"):
+				continue
+			conn.execute(
+				"INSERT OR REPLACE INTO matches (variant, entry, kind, candidate, evidence, tier,"
+				" unit, unit_entry, at) VALUES (?,?,?,?,?,?,?,?,?)", (
+					item.get("variant", ""), int(item["entry"]), item.get("kind", ""),
+					item["candidate"], item.get("evidence", ""), item.get("tier", ""),
+					item.get("unit", ""), item.get("unit_entry"), item.get("at", "")))
+			count += 1
+	return count
+
+
+def match_index(conn: sqlite3.Connection, variant: str = "") -> dict[int, list[dict]]:
+	"""The ledger as a lookup for one comparison: {entity address: [rows]}."""
+	out: dict[int, list[dict]] = {}
+	for row in match_rows(conn, variant=variant):
+		out.setdefault(int(row["entry"]), []).append(row)
+	return out
+
+
+def matched_entries(conn: sqlite3.Connection, variant: str = "") -> set[int]:
+	"""Which entities the ledger already names. An empty `variant` means any of them."""
+	if not has_table(conn, "matches"):
+		return set()
+	sql = "SELECT DISTINCT entry FROM matches"
+	values: list = []
+	if variant:
+		sql += " WHERE variant = ?"
+		values.append(variant)
+	return {int(row[0]) for row in conn.execute(sql, values)}
+
+
+def callees_of(conn: sqlite3.Connection, among: set[int] | None, exclude: set[int],
+	limit: int = 40) -> list[dict]:
+	"""What the ledger still has to learn, by how many functions call it.
+
+	`among` restricts the callers to that set of function entries; with `among` = the entities
+	already in the ledger this is the frontier - the helpers a reproduced unit reaches that the
+	ledger has no name for. `exclude` is what the ledger does know.
+
+	This judges no candidate. It is a query about the original, and it is what turns the next
+	decompilation from a guess into a decision: the callee with the most callers is the one whose
+	name pays off in the most units at once.
+	"""
+	if not has_table(conn, "refs") or not has_table(conn, "functions"):
+		return []
+	sql = ("SELECT f.entry, f.name, f.size, f.kind, f.section,"
+		" count(DISTINCT r.fn) AS callers, count(*) AS sites"
+		" FROM refs r JOIN functions f ON f.entry = r.to_address"
+		" WHERE (r.is_call = 1 OR r.to_kind IN ('function', 'external'))")
+	values: list = []
+	if among is not None:
+		if not among:
+			return []
+		# the callers are restricted to the ledger's entities; the callees are excluded by `exclude`
+		# below. Restricting the callers by `entry NOT IN among` as well asked for a function that
+		# is and is not in the ledger, which made the frontier empty whenever the ledger was not.
+		marks = ",".join("?" * len(among))
+		sql += " AND r.fn IN (SELECT id FROM functions WHERE entry IN (%s))" % marks
+		values.extend(sorted(among))
+	if exclude:
+		marks = ",".join("?" * len(exclude))
+		sql += " AND f.entry NOT IN (%s)" % marks
+		values.extend(sorted(exclude))
+	sql += " GROUP BY f.entry, f.name, f.size, f.kind, f.section"
+	sql += " ORDER BY callers DESC, sites DESC, f.size DESC LIMIT %d" % max(1, int(limit))
+	return [dict(row) for row in conn.execute(sql, values).fetchall()]
 
 
 def function_bodies(conn: sqlite3.Connection, sample: str = "",
