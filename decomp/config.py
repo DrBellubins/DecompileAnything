@@ -188,6 +188,30 @@ def threshold(config: dict) -> float:
 	return float(config["raw"].get("threshold", 97.0))
 
 
+def gate(config: dict, variant: dict | None = None) -> tuple[str, str]:
+	"""The tier a unit has to reach: `[gate] require` in the target config, or a `gate` key in
+	the `[variants.*]` table, else `semantic` (Docs/byte-cleanup-plan.md, Phase 2).
+
+	Returns (require, where_it_came_from). One target relaxes it where no tier can honestly be
+	claimed - an LTCG MSVC image, a toolchain this machine cannot reproduce - and says so in the
+	file rather than in the tool. `percent` is the pre-Phase-2 rule (threshold, no opcode or
+	relocation differences); `none` turns the gate off.
+	"""
+	from .diff import GATE_DEFAULT, GATE_MODES  # local: keep this module import-light
+	table = config["raw"].get("gate") or {}
+	value, where = None, ""
+	if isinstance(table, dict) and table.get("require"):
+		value, where = str(table["require"]), "[gate] require in %s" % config["path"]
+	if variant and variant.get("gate"):
+		value, where = str(variant["gate"]), "the variant's gate key in %s" % config["path"]
+	if value is None:
+		return GATE_DEFAULT, "the default (no [gate] require in %s)" % config["path"]
+	if value not in GATE_MODES:
+		raise ConfigError("%s: %s is not a gate - use one of %s"
+			% (config["path"], value, ", ".join(GATE_MODES)))
+	return value, where
+
+
 def include_dirs(config: dict, variant: dict | None = None) -> list[Path]:
 	"""Directories the candidate may include from - `[include_dirs]` in the target config, or
 	the same key inside a `[variants.*]` table. Relative paths are relative to the config

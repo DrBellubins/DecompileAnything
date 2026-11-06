@@ -932,11 +932,16 @@ def find(
 
 def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	fn: str | None = None, variant: str | None = None, includes: list[str] | None = None,
-	size: int = 0, register_abstract: bool = False, object_dir: Path | None = None) -> dict:
+	size: int = 0, register_abstract: bool = False, object_dir: Path | None = None,
+	gate: str | None = None) -> dict:
 	"""Compile a candidate and score it against one cached function.
 
 	Everything `decomp try` does, in one call, so the benchmark check in
 	`Tests/tools/check_phase2_try.py` exercises this same path.
+
+	The gate is the tier in `[gate] require` (`--gate` overrides it). `register_abstract` is
+	accepted and ignored: folding registers is no longer a mode, it is one of the two
+	comparisons every verdict is scored by (`decomp/diff.py`).
 	"""
 	name, body = config.variant(cfg, variant or meta.get("variant"))
 	flags = toolchain.build_flags(body)
@@ -944,9 +949,13 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	result = compile.build(sources, object_path, compiler=body.get("compiler", "g++"),
 		flags=flags, includes=[*config.include_dirs(cfg, body),
 			*[Path(item) for item in (includes or [])]])
+	if gate and gate not in diff.GATE_MODES:
+		raise config.ConfigError("--gate %s: not a gate - use one of %s"
+			% (gate, ", ".join(diff.GATE_MODES)))
+	require, gate_from = (gate, "--gate") if gate else config.gate(cfg, body)
 	outcome = {"variant": name, "flags": flags, "build": result, "object": object_path,
 		"warnings": [], "error": None, "error_code": EXIT_FAIL, "verdict": None,
-		"original": None, "candidate": None}
+		"gate": require, "gate_from": gate_from, "original": None, "candidate": None}
 	if result.failed:
 		outcome["error"] = "the candidate did not compile"
 		return outcome
@@ -1012,13 +1021,13 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 
 	vocabulary = normalize.Vocabulary()
 	tokens_original = normalize.normalize_function(vocabulary, "original", instructions_original,
-		bind_original, original.address, original.size, register_abstract, original.extents)
+		bind_original, original.address, original.size, False, original.extents)
 	tokens_candidate = normalize.normalize_function(vocabulary, "candidate", instructions_candidate,
-		object_file.bindings(candidate)[0], candidate.address, candidate.size, register_abstract,
+		object_file.bindings(candidate)[0], candidate.address, candidate.size, False,
 		candidate.extents)
 	outcome["verdict"] = diff.compare(tokens_original, tokens_candidate, vocabulary,
-		threshold=config.threshold(cfg), original_bytes=original.bytes, candidate_bytes=candidate.bytes)
-	outcome["verdict"].register_abstract = bool(register_abstract)
+		threshold=config.threshold(cfg), original_bytes=original.bytes, candidate_bytes=candidate.bytes,
+		require=require)
 	return outcome
 
 
@@ -1038,17 +1047,22 @@ def try_cmd(
 		"(use the compiler's symbol size where the analysis' own range differs, e.g. at -O2; a "
 		"PE's own .pdata unit is already used without this)"),
 	register_abstract: bool = typer.Option(False, "--register-abstract",
-		help="treat a different register choice as a match (Phase 5; reported separately today)"),
+		help="accepted for compatibility and ignored: the register-folded comparison now runs on "
+			"every try and is part of the tier (decomp/diff.py)"),
+	gate: str = typer.Option("", "--gate",
+		help="override the tier this unit has to reach: %s (default: [gate] require in the "
+			"target config, else semantic)" % ", ".join(diff.GATE_MODES)),
 	max_diff: int = typer.Option(16, "--max-diff"),
 	max_symbols: int = typer.Option(12, "--max-symbols"),
 	as_json: bool = typer.Option(False, "--json"),
 	keep: bool = typer.Option(True, "--keep/--no-keep", help="keep the candidate object file"),
 ) -> None:
-	"""Compile a candidate and diff it against the original: match %, size delta, and only
-	the differing instructions, categorised.
+	"""Compile a candidate and diff it against the original: the tier it reaches, the match %
+	as a progress indicator, and only the differing instructions, categorised.
 
 	The candidate is built with the target's own variant flags, so it is compared at the same
-	-O and the same arch. The tool never edits source - it reports.
+	-O and the same arch. The tool never edits source - it reports. The exit code is the tier:
+	0 when the unit reaches the tier `[gate] require` asks for, non-zero when it does not.
 	"""
 	cfg = load_config(config_file)
 	store = cache.Cache(config.cache_dir(cfg))
@@ -1076,7 +1090,7 @@ def try_cmd(
 		try:
 			outcome = score_candidate(cfg, conn, meta, row, [Path(item) for item in source], fn=fn,
 				variant=variant, includes=list(include), size=size,
-				register_abstract=register_abstract, object_dir=store.root / "candidates")
+				register_abstract=register_abstract, object_dir=store.root / "candidates", gate=gate)
 		except config.ConfigError as exc:
 			raise Stop(EXIT_USAGE, "%s" % exc)
 		except NotImplementedError as exc:
@@ -1094,6 +1108,7 @@ def try_cmd(
 			"target": values.get("target_path"), "function": row["name"],
 			"entry": _hex(row["entry"]), "size": row["size"], "kind": row["kind"],
 			"variant": outcome["variant"], "flags": outcome["flags"],
+			"gate": outcome["gate"], "gate_from": outcome["gate_from"],
 			"object": str(build.object_path), "build_ok": build.ok,
 			"diagnostics": build.diagnostics, "warnings": outcome["warnings"],
 			"error": outcome["error"],
@@ -1104,7 +1119,10 @@ def try_cmd(
 				"name": outcome["candidate"].display, "section": outcome["candidate"].section,
 				"size": outcome["candidate"].size},
 			"result": None if verdict is None else {
-				"passed": verdict.passed, "threshold": verdict.threshold,
+				"tier": verdict.tier, "require": verdict.require, "passed": verdict.passed,
+				"gaps_to_gate": verdict.gaps(verdict.require),
+				"abstract_categories": verdict.abstract_categories,
+				"threshold": verdict.threshold,
 				"match_percent": verdict.match_percent, "categories": verdict.categories,
 				"identical": verdict.identical, "bytes_equal": verdict.bytes_equal,
 				"original_instructions": verdict.original_instructions,
@@ -1120,6 +1138,7 @@ def try_cmd(
 
 	echo("target %s  (key %s, variant %s: %s)" % (values.get("target_path"),
 		values.get("target_key"), outcome["variant"], " ".join(outcome["flags"])))
+	echo("gate: %s (%s)" % (outcome["gate"], outcome["gate_from"]))
 	for line in compile.describe(build):
 		echo(line)
 	for warning in outcome["warnings"]:

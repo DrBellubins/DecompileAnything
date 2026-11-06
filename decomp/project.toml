@@ -3,12 +3,22 @@
 # (Docs/Setup.md §3, same shape as Tests/project.toml).
 
 std = "c++17"
-threshold = 97.0          # ...and only counts as done when the opcode stream matches too
+threshold = 97.0          # a progress indicator only: the [gate] tier below is what gates a unit
 cppflags = []
 linkflags = []
 # Directories a candidate may include from, added as -I by `decomp try` (relative to this
 # file). Phase 4's shared types.h header will live in one of these.
 include_dirs = []
+
+# What a unit has to reach to count as done (Docs/byte-cleanup-plan.md, Phase 2). The tiers:
+#   structural  same length, same operations, same targets
+#   semantic    + every operand right, and the stream identical once register names are folded
+#   exact       + the bytes equal (reachable when Phase 3's masked byte comparison lands)
+# `percent` is the pre-Phase-2 rule (threshold, with no opcode or relocation differences) and
+# `none` turns the gate off; both are escape hatches for a target where no tier can honestly
+# be claimed. A `[variants.<name>] gate = "..."` key relaxes it for one build flavour.
+[gate]
+require = "semantic"
 
 [ghidra]
 # install_dir is optional: GHIDRA_INSTALL_DIR, then this value, then /opt/ghidra, then

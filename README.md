@@ -15,7 +15,7 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 | 2 | `try`: compile -> extract -> normalise -> diff | **implemented** |
 | 3 | `detect`: compiler/object/flags from the file; `find`: xrefs, vtables, related functions | **implemented** |
 | 4 | `types`: vtables, RTTI, the shared header | **implemented** - see "The C++ underneath (`decomp types`)"; acceptance is `python Tests/tools/check_phase4_structures.py` for an ELF target and `python Tests/tools/check_msvc_structures.py` for a PE one |
-| 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | **implemented** for the unit extents and the diff - a `-O2` unit's extent now comes from the file's own function table (`.eh_frame` FDEs, `st_size` where symbols survive), so 89/89 units are compared over the compiler's own range and the `-O2` row is 99.91 % mean / 88 of 89 past the gate, above the harness's own 98.27 %/72; acceptance is `python Tests/tools/check_phase5_o2.py`. The Unicorn behaviour check and the `objdiff-cli` `.o` synthesis are not done - see [Docs/Design-Plan.md](Docs/Design-Plan.md) |
+| 5 | -O2 hardening, register-abstracted diff, Unicorn behaviour check | **implemented** for the unit extents and the diff - a `-O2` unit's extent now comes from the file's own function table (`.eh_frame` FDEs, `st_size` where symbols survive), so 89/89 units are compared over the compiler's own range and the `-O2` row is 99.91 % mean / 88 of 89 past the gate as it was measured then (86 of 89 since Phase 2's tier gate, which reads the three unnamed-callee operand differences the percentage used to absorb), above the harness's own 98.27 %/72; acceptance is `python Tests/tools/check_phase5_o2.py`. The Unicorn behaviour check and the `objdiff-cli` `.o` synthesis are not done - see [Docs/Design-Plan.md](Docs/Design-Plan.md) |
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
 | MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **done** - toolset v141 14.12 + Windows SDK 10.0.19041: `cl`/`link` build and run a PE under Wine, and the benchmark itself builds with `cl` at `/Od` and `/O2` with an 89/89 answer key (`python Tests/tools/check_msvc_toolchain.py`, exit 0) |
@@ -279,13 +279,16 @@ and diffs it against the cached original:
 $ .venv/bin/decomp try 0x2834 Tests/TestBinary/TestFunctions/math.cpp --fn AbsDiff \
       -C Tests/project.toml --bin Tests/build/gcc-o0/da_tests.stripped
 target .../Tests/build/gcc-o0/da_tests.stripped  (key 601677537ac2f6d3, variant gcc-o0: -std=c++17 -O0 -Wall -Wextra)
+gate: semantic ([gate] require in Tests/project.toml)
 build: ok (0.19s) -> cache/ghproj/candidates/candidate_math.o
 
-match 100.00% (threshold 97%) PASS
+tier exact  PASS   (gate: semantic)
+  the candidate assembles to the original bytes
+  match 100.00% - progress only, the tier is what gates (the old threshold was 97%)
   FUN_00102834 @ 0x102834  vs  CMathTests::AbsDiff (.text)
   bytes 33 vs 33 (+0)  IDENTICAL
   instructions 13 vs 13 (+0)  categories: opcode 0, operand 0, register 0, relocation 0, missing 0, extra 0
-  the candidate assembles to exactly the original bytes
+  with registers folded: identical
   no differing instructions
 ```
 
@@ -316,15 +319,27 @@ What makes the two sides comparable (`extract.py`, `normalize.py`, `diff.py`):
     SYM0   original: FUN_001068c0             candidate: ToLowerChar             ok
 ```
 
-A unit counts as done at `match >= threshold` **and** `opcode 0` **and** `relocation 0`
-(Design-Plan, Key Design Decisions): the ratio alone can be met by code that does something
-else. The counts behind those numbers add up: every line of either side is counted once, a
+A unit counts as done when it reaches the project's **gate tier** - `[gate] require` in
+`project.toml`, default `semantic`, overridable per variant with a `gate` key and per call with
+`--gate`. The tiers are properties of the verdict, lowest first: **structural** = same length,
+same operations, same targets (`opcode`, `relocation`, `missing`, `extra` all zero); **semantic**
+= that plus every operand right, plus the two streams identical once register names are folded;
+**exact** = that plus the bytes equal. `match` stays in the report and in `--json` as progress
+only: 97 % of a wrong function is a wrong function, and the ratio alone can be met by code that
+does something else (Design-Plan, Key Design Decisions). The report leads with
+`tier semantic PASS (gate: semantic)` and, when it fails, says which tier was reached, which was
+asked for, and what is missing. `percent` and `none` are the escape hatches for a target where no
+tier can honestly be claimed (`--gate percent` is the pre-Phase-2 rule: at or above `threshold`
+with no `opcode` or `relocation` difference); the tier is decided either way and printed.
+The counts behind those numbers add up: every line of either side is counted once, a
 differing pair on both sides, and where a replaced region is asymmetric the leftover lines are
 reported as `missing`/`extra` with their addresses. `diff.accounting()` states the identity
 (`matched + replaced + missing ==` the original's instruction count, the same on the candidate
 side, one report entry per counted line, `size delta == extra - missing`), and
-`python Tests/tools/check_diff_accounting.py` asserts it over the whole benchmark. `--json`, `--max-diff`, `--max-symbols`, `--size`, `--include`, `--fn` and
-`--register-abstract` are documented in `decomp try --help`.
+`python Tests/tools/check_diff_accounting.py` asserts it over the whole benchmark. `--json`, which
+carries `tier`, `require`, `gaps_to_gate` and `gaps_to_next_tier` next to the counts, plus
+`--max-diff`, `--max-symbols`, `--size`, `--include`, `--fn` and
+`--register-abstract` (accepted, ignored) are documented in `decomp try --help`.
 
 ## The C++ underneath (`decomp types`)
 
@@ -543,11 +558,16 @@ all three scripts print OK on this machine).
   entries either way), and a candidate call to a label inside another section resolves to a
   `<section>+<offset>` token, which can collapse several such calls to one name. That affects only
   functions with a `.cold` partition; no unit of this benchmark has one in its compared extent.
-* Masking register choice (`decomp try --register-abstract`) makes the same choice in different
-  registers compare equal - measured: `movl %eax, %ecx` vs `movl %r9d, %r8d` match only with it,
-  and a *different* choice (`addl %r8d, %r9d` vs `addl %edx, %ecx`) still does not. It changes no
-  score in this benchmark: the untouched source has zero register differences at every level, and
-  the 8 remaining `-m32` units and the one `-O2` unit are unchanged by it. So the remaining gaps
+* Register choice is compared twice, always: once with the names as written and once with each
+  register replaced by a position key (`normalize.abstract_registers`). A difference that exists
+  only in the first is reported as `register: n` with "allocation only" and never blocks the
+  `semantic` gate - measured: `movl %eax, %ecx` vs `movl %r9d, %r8d` is the same function in
+  other registers. A difference that survives the fold is an operand difference, and a same-name
+  reordering that changes which register ends up written (`subss %xmm1,%xmm0` vs
+  `subss %xmm0,%xmm1`) is one even in isolation, because folding alone would call it identical.
+  `--register-abstract` is accepted and ignored: the folded comparison is no longer optional, and
+  it changes no score in this benchmark - the untouched source has zero register differences at
+  every level, and the same units pass as before. So the remaining gaps
   are data-reference and naming differences, not register allocation. It is a first-appearance
   mapping per side, so it cannot tell `mov a, b` from `mov b, a` in isolation - the widths and the
   operand order still distinguish them in context.

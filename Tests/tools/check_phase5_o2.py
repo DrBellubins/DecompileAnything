@@ -15,10 +15,12 @@ Three things are judged here, none of them against this tool's own opinion:
    unit of the `-O2` build, as in Phase 2, and has to pass the gate. `Tests/eval.py self` (the
    binutils-only ceiling for the same source) is printed next to it.
 
-3. **Register abstraction.** `--register-abstract` replaces each side's register names with the
-   order they first appear in, so the same choice in different registers matches. Measured here:
-   a pair of streams that differ only in register choice matches with it and does not without it,
-   and the untouched source has no register differences to hide (so the gate is unaffected).
+3. **Register abstraction.** Each side's register names are replaced by the order they first
+   appear in, so the same choice in different registers compares equal. Since Phase 2 this runs on
+   every comparison, not only under `--register-abstract` (which is accepted and ignored): a pair
+   of streams that differ only in register choice compares equal and is reported as "allocation
+   only", a *different* choice still does not match, and the untouched source has no register
+   differences to hide (so the gate is unaffected).
 
 The `-O0` and `-m32` rows are not re-gated here - `check_phase2_try.py` gates those.
 """
@@ -39,8 +41,9 @@ from decomp import cache, cli, config, extract, normalize  # noqa: E402
 DEFAULT_VARIANTS = ["gcc-o2", "gcc-o0", "gcc-o0-x86"]
 
 # What the untouched source has to reach at -O2 through this tool's own path. Measured here:
-# 99.79% mean, 88 of 89 past the gate - above the independent harness's own 98.27% / 72, which
-# is the ceiling for any candidate. The one unit below it (STRUCT-24) is named in KNOWN_GAPS.
+# 99.91% mean, 86 of 89 past the tier gate (88 under the percentage rule that existed before
+# Phase 2) - above the independent harness's own 98.27% / 72, which is the ceiling for any
+# candidate. The three units below it are named in KNOWN_GAPS.
 MIN_MEAN = 99.0
 MIN_PAST_GATE = 85
 
@@ -51,7 +54,14 @@ KNOWN_GAPS = {
 		# (`FUN_00109ee0`); the candidate, whose layout differs, resolves both to the object that
 		# happens to cover those offsets in its own section. No name pairs them, and pretending one
 		# matches the other would be the invention the diff exists to catch.
+		# These three are the same reference. STRUCT-22 and STRUCT-23 used to pass, because the
+		# gate was a percentage (97.26 % / 98.28 % with `leaq SYM1(%rip)` vs `leaq SYM0(%rip)`
+		# counted as enough matching lines); the tier gate reads that as an operand difference and
+		# stops at `structural`. Pairing a callee by what it is rather than by the order the two
+		# sides first reached it is Docs/byte-cleanup-plan.md Phase 5.
 		"STRUCT-24": "a reference to an unnamed unit elsewhere in the binary - nothing to pair on",
+		"STRUCT-22": "same reference as STRUCT-24: the positional token pairs a different object",
+		"STRUCT-23": "same reference as STRUCT-24: the positional token pairs a different object",
 	},
 }
 

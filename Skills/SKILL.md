@@ -16,7 +16,7 @@ The user gives you a binary and a request that names a **feature or behaviour**,
 You produce **source code for exactly the code that implements that behaviour**, such that:
 
 1. **Scoped**: every function that implements the behaviour is found, or is explicitly listed as excluded or not found.
-2. **Matched**: each function, compiled with the binary's own compiler and flags, reproduces the original bytes to at least the **project's match threshold** (98%, 70%, or whatever the project or user sets), with no wrong operations or wrong callees hiding inside the percentage.
+2. **Matched**: each function, compiled with the binary's own compiler and flags, reaches the **project's gate tier** (`[gate] require`: same operations and targets, then every operand right, then the bytes equal). A percentage is never the claim - a wrong operation, a wrong immediate or a wrong callee has to be named, not averaged away.
 3. **Readable**: the result is a small codebase a human can read and extend (real types, grouped by class or module, comments with provenance), and it still scores the same after the readability pass.
 4. **Honest**: the report says what matched, what only partly matched, what was not attempted, and which claims are inferred.
 
@@ -118,18 +118,18 @@ In a stripped binary there are no names: start from a string or an address and l
 3. **Score it.** `decomp try <fn> cand.cpp --fn <Symbol>`. It builds with the target's own variant flags (same compiler, `-O`, `-std`, arch), so the comparison is like for like. Use `--include` for headers; put permanent ones in `[include_dirs]`. The printed object path lets you run `objdump -dr` on the candidate. `--fn` is needed unless the object defines exactly one function.
 4. **Read the diff and change the thing it names**, then go back to 3.
 
-**Done** (per function) when `match >= threshold` **and** `opcode: 0` **and** `relocation: 0`. A high percentage alone is not done: one wrong callee or table can hide inside it. `try` exits 0 only when the candidate passes.
+**Done** (per function) when it reaches the project's **gate tier** - `[gate] require` in `project.toml`, default `semantic`. Tiers, lowest first: **structural** = same length, same operations, same targets (`opcode`, `relocation`, `missing`, `extra` all 0); **semantic** = that plus every operand right, plus the two streams identical once register names are folded; **exact** = that plus the bytes equal. The match percentage is progress only - 97 % of a wrong function is still a wrong function, and one wrong callee or table hides inside it. `try` exits 0 only when the unit reaches the gate tier, and its report leads with `tier <name> PASS/FAIL (gate: <name>)` and names what is missing.
 
-**Stuck** (three tries with no change in the match or the categories): re-read the `show` assembly around the first differing instruction and change your hypothesis, not the syntax. If only `register:` differences remain, stop: they are not fixable from source. Otherwise record the best candidate with its remaining diff categories and move on. Do not loop on one function; the rest of the scope is waiting.
+**Stuck** (three tries with no change in the match or the categories): re-read the `show` assembly around the first differing instruction and change your hypothesis, not the syntax. If only `register:` differences remain and the report says "allocation only", stop: they are not fixable from source. Otherwise record the best candidate with its remaining diff categories and move on. Do not loop on one function; the rest of the scope is waiting.
 
 ### Reading a score
 
 | signal | meaning | do |
 |---|---|---|
 | `opcode: n` | wrong operation: cmov vs branch, imul vs shifts, signed vs unsigned load | fix the operation; `movzbl` vs `movsbl` and `idiv` vs `shrd` are the usual ones |
-| `operand: n` | right operation, wrong offset, constant or type | field offsets, struct layout, array element type, truncated buffer bound |
+| `operand: n` | right operation, wrong offset, constant, type, or a register pair swapped | field offsets, struct layout, array element type, truncated buffer bound. This is the category that stops `semantic`, so it is always yours |
 | `relocation: n` | same code shape reaching for something else: another callee, table, or different bytes in it | the `symbols` line names both sides; fix the callee or reproduce the data. Bytes are only compared when both sides know what object they are (an anonymous `.rodata` pool is laid out per build) |
-| `register: n` | register allocation only | not yours to fix. `--register-abstract` is reported separately today and does not change the score yet |
+| `register: n` | register allocation, if the report says "allocation only" (the two streams are identical with registers folded) | not yours to fix, and it does not stop `semantic`. If the report says the streams still differ once folded, the operands are paired differently - that one is yours |
 | `missing` / `extra` | control flow or size differs | loop form (counted vs conditional), hoisted invariant, inlined vs called helper, early return vs branch |
 | `size_delta` large, % high | something is inlined or vectorised that should not be, or the reverse | confirm you are comparing at the variant's own `-O`; never compare -O0 asm to -O2 asm |
 
@@ -174,10 +174,10 @@ End with a `MATCH_REPORT.md` and a short summary in your reply. Be plain about s
 | `Input::PollKeys` | 0x401230 | 100% | 0 | 0 | matched | |
 | `Input::Remap` | 0x401410 | 91% | 0 | 2 | partial | callee at 0x4020a0 unresolved |
 
-- **matched**: `try` passed at the stated threshold with `opcode: 0` and `relocation: 0`.
+- **matched**: `try` reached the project's gate tier (`[gate] require`, default `semantic`). Report the tier reached, not a percentage.
 - **partial**: best candidate kept, with the diff categories left.
 - **not attempted / not found / excluded**: say which, and why.
-- State the threshold, the variant (compiler and `-O`) and its `detect` confidence.
+- State the gate tier the project uses (`[gate] require`) and the tier each function reached; state the variant (compiler and `-O`) and its `detect` confidence.
 - Separate **seen** from **inferred** for names and for the claim that the scope list is complete. "I found no other callers" is **unknown** about code reached through function pointers or vtables you did not enumerate.
 - For security-oriented requests ("malicious file access"), describe what the recovered code does as observed in the static code, and say clearly that it was never executed.
 

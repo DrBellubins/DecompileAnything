@@ -48,8 +48,18 @@ KNOWN_GAPS = {
 	"gcc-o0-x86": {
 		# A 32-bit non-PIE object reaches its data through one shared section, so the reference
 		# names the section and an offset rather than an object; the linked image has a symbol
-		# there. Nothing honest pairs the two. (8 units, measured.)
+		# there. Nothing honest pairs the two. (12 units, measured: 8 where the reference names the
+		# section and an offset, 4 - MATH-11/19/24/32 - where the two sides just number the same
+		# object differently, which the percentage rule used to absorb.)
 		"MATH-13": "32-bit data reference through a shared section",
+		# Same family, one difference each, and only the tier gate sees them: the two sides number
+		# the same object differently (`fldt DAT1` vs `DAT0`, `flds DAT1(,%eax,4)` vs `DAT0`,
+		# `movzwl 0x80dd280(,%eax,2)` against an unrelocated symbol address in the .o). Measured
+		# at 97.30 / 98.18 / 98.85 / 97.83 %, which the percentage rule let through.
+		"MATH-11": "32-bit data reference through a shared section",
+		"MATH-19": "32-bit data reference through a shared section",
+		"MATH-24": "32-bit data reference through a shared section",
+		"MATH-32": "32-bit data reference through a shared section",
 		"MATH-20": "32-bit data reference through a shared section",
 		"MATH-22": "32-bit data reference through a shared section",
 		"MATH-23": "32-bit data reference through a shared section",
@@ -60,10 +70,17 @@ KNOWN_GAPS = {
 	},
 	"gcc-o2": {
 		# Not an extent problem - Tests/tools/check_phase5_o2.py requires the tool's extent to
-		# equal the compiler's for all 89 units of this build. What is left is one unit whose
-		# only differences are `leaq` of code the file names no unit for: nothing on either side
-		# can name it, so nothing pairs it.
+		# equal the compiler's for all 89 units of this build. What is left is `leaq` of code the
+		# file names no unit for: nothing on either side can name it, so nothing pairs it.
+		# STRUCT-22 and STRUCT-23 reach the same unnamed functions and used to pass, because the
+		# gate was a percentage: 97.26 % / 98.28 % with `leaq SYM1(%rip)` against `leaq
+		# SYM0(%rip)` - the positional token pairs a different object. The tier gate reads that as
+		# an operand difference and stops at `structural` (measured: 2 and 1). Pairing a callee by
+		# what it is rather than by the order the two sides first reached it is
+		# Docs/byte-cleanup-plan.md Phase 5.
 		"STRUCT-24": "a reference to an unnamed unit elsewhere in the binary",
+		"STRUCT-22": "same reference as STRUCT-24: the positional token pairs a different object",
+		"STRUCT-23": "same reference as STRUCT-24: the positional token pairs a different object",
 	},
 }
 

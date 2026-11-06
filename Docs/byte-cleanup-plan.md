@@ -35,7 +35,8 @@ with unchanged means (100.00 / 99.91 / 99.38) and the same 89/88/81 past the gat
 ## Phase 2: Make the gate mean something
 *Highest impact on trust. The 97% rule currently lets real errors pass.*
 
-- Define explicit tiers in `Verdict` instead of one `passed` flag:
+- Define explicit tiers in `Verdict` instead of one `passed` flag (implemented as `tier` /
+  `require`; `passed` stays as the property that reads them, so no caller had to change):
   - **structural:** `opcode == relocation == missing == extra == 0`
   - **semantic:** structural, plus `operand == 0` and register-abstract comparison clean
   - **exact:** semantic, plus masked bytes equal (Phase 3)
@@ -45,6 +46,34 @@ with unchanged means (100.00 / 99.91 / 99.38) and the same 89/88/81 past the gat
 - Update the `Skills/DecompileAnything.md` guidance so the LLM loop targets the tier, not the percent.
 
 **Acceptance:** a candidate with a swapped subtraction, a dropped `mulss`, or a wrong immediate no longer reaches "semantic". A pure register-allocation difference still does.
+
+**Done** (2026-11-06, `Tests/tools/check_gate_tiers.py`). `Verdict` carries `tier` and
+`require`; `passed` is "reaches the required tier" and is what the exit code and `report_lines`
+follow. The `[gate] require = "semantic"` table is in both project.toml files, `--gate` overrides
+it per call, `[variants.<name>] gate` per build flavour, and `percent` / `none` are the escape
+hatches for a target where no tier can honestly be claimed. Two things the plan did not know:
+
+* **First-appearance folding cannot see a bare swapped subtraction.** `subss %xmm1,%xmm0` and
+  `subss %xmm0,%xmm1` fold to the same line, because folding is a renaming and a swap *is* a
+  renaming in isolation. It is only caught once other instructions pin which register holds what
+  (in a longer body, the fold makes the two sides disagree). So the swap is named where it is
+  classified: a line pair whose register names are the same multiset in a different order, with
+  the register that ends up written changed, is an `operand` difference, not a `register` one.
+  A real allocation difference (different names, same positions) is unaffected. `leal
+  (%rax,%rcx),%edx` vs `leal (%rcx,%rax),%edx` stays a rename - the written register did not
+  change - so the rule does not cost real units.
+* **`exact` already fires without Phase 3**, on the units whose body carries no relocation
+  fields: the untouched source is byte-identical for 54 of 89 units at -O0, 55 at -O2, 58 at
+  -m32. So Phase 3 is not needed to make the tier reachable at all, only to make it reachable
+  for the bodies that do reference something. The report says the byte test is unmasked.
+
+Measured, untouched source through `decomp try`'s own path, gate `semantic`: **-O0 89/89 (was
+89), -O2 86/89 (was 88), -m32 77/89 (was 81)**. Nothing that was correct fell out; what fell out
+was 6 units the percentage rule was tolerating, all of them an operand difference on a data or
+callee reference the two sides cannot pair (`leaq SYM1(%rip)` vs `leaq SYM0(%rip)` at -O2,
+`fldt DAT1` vs `DAT0` and a 32-bit absolute array reference at -m32). They are now in
+`KNOWN_GAPS` with the reason, and Phase 5's ledger is what pairs them honestly. Match means are
+unchanged (100.00 / 99.91 / 99.38), and the three negative controls are unchanged.
 
 ## Phase 3: Relocation-masked byte comparison
 *Turns `bytes_equal` into something that can actually fire.*

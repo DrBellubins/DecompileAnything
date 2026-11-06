@@ -19,6 +19,15 @@ linkflags = []
 # that directory.
 include_dirs = ["TestBinary"]
 
+# What a unit has to reach to count as done (Docs/byte-cleanup-plan.md, Phase 2): `structural`
+# (same length, same operations, same targets), `semantic` (+ every operand right and the stream
+# identical once register names are folded) or `exact` (+ the bytes equal). `percent` is the
+# pre-Phase-2 rule and `none` turns the gate off. The benchmark is built by the same compilers
+# that are scored here, so `semantic` is the honest bar; `threshold` above stays a progress
+# indicator, and is also what the independent harness in Tests/eval.py reports.
+[gate]
+require = "semantic"
+
 # The analysis side, read by the `decomp` CLI (Docs/Setup.md §3). eval.py ignores this
 # table; both tools read the same file on purpose. cache_dir is relative to this file, so
 # the analysis cache stays in the repo's gitignored cache/ - which must not be a

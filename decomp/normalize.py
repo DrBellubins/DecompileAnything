@@ -600,11 +600,24 @@ def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruct
 				operands = operands[:start] + replacement + operands[start:]
 		text = format_instruction(instruction.mnemonic, operands.strip())
 		if register_abstract:
-			text = _REGISTER.sub(lambda match: "{" + vocab.register_name(side, match.group(0))
-				+ "}", text)
+			text = abstract_registers(text, vocab, side)
 		tokens.append(Token(text=text, mnemonic=instruction.mnemonic, address=instruction.address,
 			refs=refs))
 	return tokens
+
+
+def abstract_registers(text: str, vocab: Vocabulary, side: str) -> str:
+	"""One line with each register name replaced by this side's name for it (first appearance
+	wins): `movl %eax, %ecx` and `movl %r9d, %r8d` become the same line, `movl %eax, %edx`
+	does not. `diff.compare` runs a whole stream through this on every comparison, which is how
+	an allocation difference is told from a different pairing of operands."""
+	return _REGISTER.sub(lambda match: "{" + vocab.register_name(side, match.group(0)) + "}", text)
+
+
+def register_names(text: str) -> list[str]:
+	"""The register names in a line, in the order they appear - positionwise comparable, so a
+	line that pairs its registers up differently can be told from one that renamed them."""
+	return [match.group(0) for match in _REGISTER.finditer(text)]
 
 
 def mask_registers(text: str) -> str:

@@ -7,9 +7,26 @@ category of each difference: an `opcode` difference means the operation is wrong
 `relocation` difference means the same shape of code reaches for a different function or
 object, and `missing`/`extra` mean the control flow or size differs.
 
-A unit counts as done at `match >= threshold` **and** no `opcode` and no `relocation`
-differences (Docs/Design-Plan.md, Key Design Decisions): the ratio alone can be met by code
-that does something else.
+What gates a unit is the **tier** it reaches (Docs/byte-cleanup-plan.md, Phase 2), not the
+ratio. The ratio is a progress indicator: 97 % of a wrong function is still a wrong function.
+
+  none        the streams differ in shape or in operations
+  structural  same length, same operations, same targets
+              (`opcode == relocation == missing == extra == 0`)
+  semantic    structural, no operand is wrong, and the streams are identical once every register
+              name is folded to the order it first appears in
+  exact       semantic, and the bytes are equal (the masked byte comparison of Phase 3 is what
+              makes this reachable; today the byte test is unmasked)
+
+The register-abstract comparison runs on every `try`, not only with `--register-abstract`. That
+is what separates a register-allocation difference (`movl %eax,%ecx` vs `movl %r9d,%r8d`, not
+the model's fault) from a different operand pairing (`subss %xmm1,%xmm0` vs `subss %xmm0,%xmm1`,
+it is): folding both sides makes the first identical and leaves the second different. Remaining
+plain `register` differences are reported as "allocation only" when the abstracted streams are
+clean, and as a real difference when they are not.
+
+The tier a unit has to reach comes from `[gate] require` in the target's project.toml
+(`structural`, `semantic`, `exact`, or the older `percent` rule / `none` as escape hatches).
 
 The counts add up exactly (Docs/byte-cleanup-plan.md, Phase 1). Every line of either stream is
 either matched or appears in `diff` once: a replaced pair counts once as a difference and on
@@ -24,14 +41,37 @@ from __future__ import annotations
 import difflib
 from dataclasses import dataclass, field
 
-from .normalize import Ref, canonical_name, mask_registers
+from .normalize import (Ref, REGISTER_ALIASES, Token, abstract_registers, canonical_name,
+	mask_registers, register_names)
 
 CATEGORIES = ("opcode", "operand", "register", "relocation", "missing", "extra")
+# The categories that mean "this is not the same computation". None of them may be non-zero for
+# a unit to be more than `none`.
+SHAPE = ("opcode", "relocation", "missing", "extra")
+
+# Ordered, lowest first. `percent` and `none` are not tiers: they are the pre-Phase-2 gate and
+# no gate at all, kept as escape hatches for a target where no tier can honestly be claimed (an
+# LTCG MSVC image, a toolchain this machine cannot reproduce).
+TIERS = ("none", "structural", "semantic", "exact")
+GATE_MODES = ("none", "percent") + TIERS
+GATE_DEFAULT = "semantic"
+
+TIER_MEANING = {
+	"none": "the instruction stream is not the same shape or not the same operations",
+	"structural": "same length, same operations, same targets - the operands are not proven right",
+	"semantic": "same operations, operands and targets, in whatever registers - the bytes are not "
+		"proven equal",
+	"exact": "the candidate assembles to the original bytes",
+}
+
+
+def tier_rank(name: str) -> int:
+	return TIERS.index(name if name in TIERS else "none")
 
 
 @dataclass
 class Verdict:
-	passed: bool
+	require: str
 	threshold: float
 	match_percent: float
 	categories: dict[str, int]
@@ -49,8 +89,40 @@ class Verdict:
 	hidden_relocations: int = 0
 	identical: bool = False
 	bytes_equal: bool = False
-	register_abstract: bool = False
+	# the same comparison over streams with every register name folded to first-appearance
+	# order, kept so "allocation only" can be told from a different operand pairing
+	abstract_categories: dict[str, int] = field(default_factory=lambda: {n: 0 for n in CATEGORIES})
+	tier: str = "none"
 	warnings: list[str] = field(default_factory=list)
+
+	@property
+	def register_only(self) -> int:
+		"""`register` differences that are only register allocation: the abstracted streams are
+		clean, so the same operation happened in different registers."""
+		return 0 if not self.abstract_clean else self.categories["register"]
+
+	@property
+	def abstract_clean(self) -> bool:
+		return not any(self.abstract_categories.values())
+
+	@property
+	def tier_ok(self) -> bool:
+		"""Does this verdict reach the tier the gate asks for?"""
+		if self.require == "none":
+			return True
+		if self.require == "percent":
+			return (self.match_percent >= self.threshold and self.categories["opcode"] == 0
+				and self.categories["relocation"] == 0)
+		return tier_rank(self.tier) >= tier_rank(self.require)
+
+	@property
+	def passed(self) -> bool:
+		"""The gate, kept under its old name because every caller already reads it."""
+		return self.tier_ok
+
+	def gaps(self, want: str) -> list[str]:
+		"""What stands between this verdict and tier `want`, in the order to fix it."""
+		return tier_gaps(self.categories, self.abstract_categories, self.bytes_equal, want)
 
 	@property
 	def size_delta_instructions(self) -> int:
@@ -170,12 +242,28 @@ def _pair(vocab_side_original, vocab_side_candidate):
 	return pairs
 
 
+def _pair_registers(a, b) -> tuple[str, str]:
+	"""A line pair whose only difference is register names: a rename, or a different pairing?
+
+	`movl %eax, %ecx` vs `movl %r9d, %r8d` is the same operation on different registers - not
+	the model's doing. `subss %xmm1, %xmm0` vs `subss %xmm0, %xmm1` is not a rename: the same
+	registers appear in a different order, and the one that ends up written (the last operand in
+	AT&T) changes, which is a different computation. The first-appearance folding cannot tell
+	those apart on its own - a swap folds to the same line - so the swap is named here.
+	"""
+	left = [REGISTER_ALIASES.get(name, name) for name in register_names(a.text)]
+	right = [REGISTER_ALIASES.get(name, name) for name in register_names(b.text)]
+	if left != right and sorted(left) == sorted(right) and left[-1:] != right[-1:]:
+		return "operand", "the same registers in a different order: %s vs %s" % (a.text, b.text)
+	return "register", "same operation, different registers"
+
+
 def _difference(a, b) -> tuple[str, str]:
 	"""The category of one differing line pair, and why."""
 	if a.mnemonic != b.mnemonic:
 		return "opcode", "%s vs %s" % (a.mnemonic, b.mnemonic)
 	if mask_registers(a.text) == mask_registers(b.text):
-		return "register", "same operation, different registers"
+		return _pair_registers(a, b)
 	paired = list(zip(a.refs, b.refs))
 	if paired:
 		for left, right in paired:
@@ -185,16 +273,59 @@ def _difference(a, b) -> tuple[str, str]:
 	return "operand", "operands differ"
 
 
-def compare(original: list, candidate: list, vocabulary, *, threshold: float,
-	original_bytes: bytes = b"", candidate_bytes: bytes = b"") -> Verdict:
-	"""Score a candidate against the original."""
+# --------------------------------------------------------------------------------------
+# the tiers, and what a verdict is missing
+
+
+def tier_for(categories: dict, abstract: dict, bytes_equal: bool) -> str:
+	"""The tier a pair of comparisons reaches - see the module docstring."""
+	if any(categories[name] for name in SHAPE):
+		return "none"
+	if categories["operand"] or any(abstract.values()):
+		return "structural"
+	return "exact" if bytes_equal else "semantic"
+
+
+def _say(categories: dict, names: tuple[str, ...] = CATEGORIES) -> str:
+	return ", ".join("%s %d" % (name, categories[name]) for name in names if categories[name])
+
+
+def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str) -> list[str]:
+	"""What stands between a verdict and tier `want`, in the order the loop should fix it.
+
+	Shape first (an operation, a target, or a whole line is wrong), then operands, then the
+	thing only the abstracted comparison can see: a stream that still differs once registers are
+	renamed is a different pairing of operands, not a register allocation.
+	"""
+	gaps: list[str] = []
+	if tier_rank(want) < tier_rank("structural"):
+		return gaps
+	for name in SHAPE:
+		if categories[name]:
+			gaps.append("%d %s differences" % (categories[name], name))
+	if tier_rank(want) >= tier_rank("semantic"):
+		if categories["operand"]:
+			gaps.append("%d operand differences" % categories["operand"])
+		if any(abstract.values()):
+			gaps.append("the stream still differs once registers are renamed (%s)" % _say(abstract))
+	if tier_rank(want) >= tier_rank("exact") and not bytes_equal:
+		gaps.append("the bytes are not equal (the byte test is unmasked until Phase 3)")
+	return gaps
+
+
+# --------------------------------------------------------------------------------------
+# the two comparisons
+
+
+def _align(original: list, candidate: list) -> dict:
+	"""Align two token streams and categorise every difference.
+
+	Run twice by `compare`: once on the tokens as written, once with the registers folded. Only
+	the strict pass feeds `diff` and the counts that `accounting()` checks.
+	"""
 	left = [token.text for token in original]
 	right = [token.text for token in candidate]
 	matcher = difflib.SequenceMatcher(None, left, right, autojunk=False)
-	matched = sum(block.size for block in matcher.get_matching_blocks())
-	denominator = max(len(left), len(right), 1)
-	percent = round(100.0 * matched / denominator, 2)
-
 	categories = {name: 0 for name in CATEGORIES}
 	diff: list[dict] = []
 	replaced = 0
@@ -247,7 +378,42 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 						"original_address": a.address, "candidate_address": b.address,
 						"why": "the lines match but not what they reach: " + why, "hidden": True})
 	categories["relocation"] += hidden
-	hidden_relocations = hidden
+	return {"matched": sum(block.size for block in matcher.get_matching_blocks()),
+		"replaced": replaced, "hidden": hidden, "categories": categories, "diff": diff,
+		"original_instructions": len(left), "candidate_instructions": len(right)}
+
+
+def _fold_registers(tokens: list, side: str, vocabulary) -> list[Token]:
+	"""The same stream with each side's registers named by order of first appearance, so
+	`%rax` on one side and `%r9` on the other are both that side's `r0`.
+
+	Symbol tokens, data tokens and unit-relative labels are untouched: this only folds register
+	*names*, so a different pairing of operands still shows.
+	"""
+	return [Token(text=abstract_registers(token.text, vocabulary, side), mnemonic=token.mnemonic,
+		address=token.address, refs=token.refs) for token in tokens]
+
+
+def compare(original: list, candidate: list, vocabulary, *, threshold: float,
+		original_bytes: bytes = b"", candidate_bytes: bytes = b"",
+		require: str = GATE_DEFAULT) -> Verdict:
+	"""Score a candidate against the original and name the tier it reaches.
+
+	`require` is the gate from the target's `[gate]` table; `verdict.passed` is "this reaches
+	it". The tokens have to be the un-folded ones: the register-abstract comparison happens
+	here, on every call, so a verdict always knows whether its register differences are
+	allocation or a different operand pairing.
+	"""
+	strict = _align(original, candidate)
+	abstract = _align(_fold_registers(original, "original", vocabulary),
+		_fold_registers(candidate, "candidate", vocabulary))
+	left = [token.text for token in original]
+	right = [token.text for token in candidate]
+	denominator = max(len(left), len(right), 1)
+	percent = round(100.0 * strict["matched"] / denominator, 2)
+	categories = strict["categories"]
+	diff = strict["diff"]
+	hidden_relocations = strict["hidden"]
 
 	symbols = []
 	for token, left_ref, right_ref in _pair(vocabulary.entries["original"], vocabulary.entries["candidate"]):
@@ -263,14 +429,18 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 			symbols.append({"token": token, "ok": False, "why": "the original never reaches it",
 				"original": None, "candidate": _describe(ref)})
 
+	require = require if require in GATE_MODES else GATE_DEFAULT
 	verdict = Verdict(
-		passed=percent >= threshold and categories["opcode"] == 0 and categories["relocation"] == 0,
-		threshold=float(threshold), match_percent=percent, categories=categories, diff=diff,
-		symbols=symbols, original_instructions=len(left), candidate_instructions=len(right),
-		original_bytes=len(original_bytes), candidate_bytes=len(candidate_bytes),
-		identical=left == right, bytes_equal=bool(original_bytes) and original_bytes == candidate_bytes,
+		require=require, threshold=float(threshold), match_percent=percent, categories=categories,
+		diff=diff, symbols=symbols, original_instructions=len(left),
+		candidate_instructions=len(right), original_bytes=len(original_bytes),
+		candidate_bytes=len(candidate_bytes), abstract_categories=abstract["categories"],
+		identical=left == right,
+		bytes_equal=bool(original_bytes) and original_bytes == candidate_bytes,
 	)
-	verdict.matched, verdict.replaced, verdict.hidden_relocations = matched, replaced, hidden_relocations
+	verdict.matched, verdict.replaced, verdict.hidden_relocations = (
+		strict["matched"], strict["replaced"], strict["hidden"])
+	verdict.tier = tier_for(categories, abstract["categories"], verdict.bytes_equal)
 	# Falling short of the threshold always has a categorised difference now, so the only way to
 	# fail with nothing categorised is a count that went wrong here.
 	problems = accounting_problems(verdict)
@@ -292,18 +462,28 @@ def _describe(ref: Ref) -> dict:
 
 def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 	max_diff: int = 16, max_symbols: int = 12, with_symbols: bool = True) -> list[str]:
-	lines = ["match %.2f%% (threshold %.0f%%) %s" % (verdict.match_percent, verdict.threshold,
-		"PASS" if verdict.passed else "FAIL")]
+	gate = verdict.require
+	lines = ["tier %s  %s   (gate: %s)" % (verdict.tier, "PASS" if verdict.passed else "FAIL",
+		gate)]
+	lines.append("  %s" % TIER_MEANING.get(verdict.tier, ""))
+	lines.append("  match %.2f%% - progress only, the tier is what gates (the old threshold was "
+		"%.0f%%)" % (verdict.match_percent, verdict.threshold))
 	lines.append("  %s  vs  %s" % (original_name, candidate_name))
 	lines.append("  bytes %d vs %d (%+d)%s" % (verdict.original_bytes, verdict.candidate_bytes,
 		verdict.size_delta_bytes, "  IDENTICAL" if verdict.bytes_equal else ""))
 	lines.append("  instructions %d vs %d (%+d)  categories: %s" % (
 		verdict.original_instructions, verdict.candidate_instructions, verdict.size_delta_instructions,
 		", ".join("%s %d" % (name, verdict.categories[name]) for name in CATEGORIES)))
-	if verdict.register_abstract:
-		lines.append("  register-abstracted: every register name on a side is replaced by the order "
-		"it first appears in, so the same choice in different registers matches and a different "
-		"choice still does not - a unit is gated on the strict comparison, not this one")
+	if verdict.register_only:
+		lines.append("  %d register differences are allocation only: with every register name "
+			"folded to the order it first appears in, the two streams are identical, so the same "
+			"operation happened in different registers" % verdict.register_only)
+	elif verdict.categories["register"]:
+		lines.append("  %d register differences are not allocation only: the streams still differ "
+			"with registers folded, so the operands are paired differently" % verdict.categories[
+				"register"])
+	lines.append("  with registers folded: %s" % ("identical" if verdict.abstract_clean
+		else _say(verdict.abstract_categories)))
 	if verdict.bytes_equal and verdict.match_percent == 100.0:
 		lines.append("  the candidate assembles to exactly the original bytes")
 	if with_symbols and verdict.symbols:
@@ -339,9 +519,14 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 	if verdict.warnings:
 		lines += ["  note: %s" % warning for warning in verdict.warnings]
 	if not verdict.passed:
-		lines.append("  next: fix the %s differences above; a unit is done at >= %.0f%% with "
-			"opcode 0 and relocation 0 (the categories and what they mean are in "
-			"Skills/DecompileAnything.md)" % (verdict.worst or "size", verdict.threshold))
+		gaps = verdict.gaps(verdict.require)
+		lines.append("  next: this unit reaches %s and the gate asks for %s - %s. (the categories "
+			"and what they mean are in Skills/DecompileAnything.md; the percent is not what you are "
+			"aiming at)" % (verdict.tier, verdict.require,
+				"; ".join(gaps) if gaps else "nothing is categorised, so see the symbols above"))
+	elif verdict.tier != "exact":
+		lines.append("  next tier: %s - %s" % (TIERS[tier_rank(verdict.tier) + 1],
+			"; ".join(verdict.gaps(TIERS[tier_rank(verdict.tier) + 1])) or "nothing"))
 	return lines
 
 

@@ -46,8 +46,9 @@ It feeds the untouched original source through `decomp try`'s code path for ever
 compares with what `eval.py self` reports (100.00% mean, 89/89 pass at gcc-o0 vs the
 harness's own 99.53%, 83/89), then re-scores the deliberately wrong candidates in
 `Tests/examples/candidate_math_bad.cpp` and requires the report to name the kind of problem
-they are. Every variant is gated against its own `KNOWN_GAPS` list: none at -O0, eight
-32-bit data references at `-m32`, one unnamed-unit reference at `-O2`. For the -O2 row it also
+they are. Every variant is gated against its own `KNOWN_GAPS` list, and the gate itself is the
+`[gate] require` tier from `project.toml` (`semantic`): 0 known gaps at -O0 (89/89), 3 unnamed-unit
+references at -O2 (86/89), 12 32-bit data references at `-m32` (77/89). For the -O2 row it also
 re-scores each unit whose *analysis* size differs from the answer key's over the answer key's
 range, which is the cross-check that the extent the tool derives is the compiler's.
 
@@ -55,6 +56,7 @@ To check that the scorer's own counts add up (Docs/byte-cleanup-plan.md, Phase 1
 
 ```sh
 .venv/bin/python Tests/tools/check_diff_accounting.py
+.venv/bin/python Tests/tools/check_gate_tiers.py
 ```
 
 A `replace` region whose two sides are different lengths used to be zipped, so the leftover
@@ -67,6 +69,23 @@ can produce (each unit of all three ELF variants, the wrong candidates, and trun
 285 verdicts, 32 with a difference, 17 whose length differs). A verdict that reports different
 instruction counts with nothing in `missing`/`extra` fails the group by name.
 
+**What the gate is** (Phase 2, `Docs/byte-cleanup-plan.md`). `Tests/project.toml` and
+`decomp/project.toml` carry `[gate] require = "semantic"`, and `check_phase2_try.py` /
+`check_phase5_o2.py` gate on the tier the target config states, so the pass counts in this file are
+tier counts. Measured with it, on the untouched source: **-O0 89/89, -O2 86/89, -m32 77/89**, means
+unchanged (100.00 / 99.91 / 99.38) - six units out, all six an operand difference on a reference
+the two sides cannot pair (`leaq SYM1(%rip)` against `leaq SYM0(%rip)` at -O2, an object named
+`DAT1` against `DAT0` at -m32), all six named in `KNOWN_GAPS` with the reason. The tiers, lowest
+first: `structural` (same length, operations and targets), `semantic` (+ every operand right, +
+streams identical once registers are folded), `exact` (+ bytes equal); `percent` and `none` are the
+escape hatches, and `--gate` overrides per call.
+
+`check_gate_tiers.py` is the acceptance for the tiers themselves: a swapped `subss`, a dropped
+`mulss`, a wrong immediate and a different callee never reach `semantic`; a pure register-allocation
+difference does (reported "allocation only", folded streams identical); `movl %eax,%ecx` vs
+`movq %rax,%rcx` stays an opcode difference; and it prints the tier histogram of every variant
+(-O0: exact 54, semantic 35 - the 54 are byte-identical, which is what Phase 3 is about).
+
 To check the `-O2` work itself (Phase 5):
 
 ```sh
@@ -77,11 +96,11 @@ Three claims, none of them this tool's own opinion. **The extent:** for every un
 ELF builds, the `(address, size)` that `extract` settles on equals the answer key's - which comes
 from the *unstripped* build's symbol table, while the tool is only allowed the stripped file
 (89/89 on each). **The loop:** the untouched source at `-O2` through `decomp try`'s own path must
-hold (measured 99.91% mean, 88/89 past the gate, against the harness's 98.27%/72). **The two
+hold (measured 99.91% mean, 86/89 past the tier gate, against the harness's 98.27%/72). **The two
 mechanisms that make a split body comparable:** a unit whose bytes sit at 0x1000 and 0x9000
 tokenises as one stream with unit-relative labels (`jmp L6`/`jmp L0` - positions, not addresses),
-and `--register-abstract` makes `movl %eax, %ecx` and `movl %r9d, %r8d` the same token while a
-*different* choice stays different.
+and the register-folded comparison (`normalize.abstract_registers`, run on every score) makes
+`movl %eax, %ecx` and `movl %r9d, %r8d` the same token while a *different* choice stays different.
 
 To check the tool's own discovery and toolchain detection (Phase 3):
 
