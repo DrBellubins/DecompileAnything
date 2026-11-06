@@ -265,6 +265,13 @@ the target without one.
 
 **Acceptance:** a fully matched benchmark program relinks to a byte-identical `.text`, or the report names exactly the first function that differs.
 
+**Done 2026-11-06.** `decomp link` (`decomp/relink.py`) and `Tests/tools/check_phase6_link.py` (43 checks).
+
+* Measured on the benchmark as it stands: `decomp link` over the program's own sources with the `gcc-o0` flags reports `program IDENTICAL`, `16 sections compared: 16 identical`, `.text` `49969` bytes identical, exit `0`. That is the acceptance case, and it is the whole point of the phase: every function that `decomp try` scored exact, plus the CRT and libc the loop never reproduced, rebuild the same bytes.
+* With one `if` added to `CMathTests::SolveQuadraticRoot`, the same command reports the layout moving where that body grew, labels the bodies after it (`36` of the `143` compared pairs are `differ only in what the link wrote` - a consequence, not a second problem), and names the changed function among the extents with no pair. The one `if` also shows what the comparison does *not* claim: a body's operand addresses are compared only after the layout, and a difference in a data value that equals a known layout shift is called a pointer to moved code, not a data difference.
+* The link is the target's own or the tool says so: `config.link_flags` returns what the config records (MS-2 `gcc-o0-x86` → `-no-pie -static`) and for `gcc-o0` it reports that nothing is recorded and plain `cc` is used. The driver form follows `Tests/eval.py` (`/Fe:` + `/link` for `cl`, `-o` for the rest), so `decomp link` on an MSVC variant will invoke `cl` the same way the harness does.
+* Not done, deliberately: PE and Mach-O report "the relink comparison reads ELF sections for now" instead of being compared wrongly (Phase 7 brings MSVC `link`). A partially reproduced program needs `--partial` (`-Wl,--unresolved-symbols=ignore-all`), and that program is compared at a different layout, which the report says. Naming each body is limited by the two tables it joins: this target's analysis splits and merges some functions differently from the symbol table, so some extents stay unpaired - what turns an extent into a name is a ledger anchor (Phase 5), which is why `pair_extents` takes `ledger` and treats it as the only evidence that outranks layout.
+
 ## Phase 7: Build fidelity
 *Matters whenever the gate passes but the bytes won't match.*
 

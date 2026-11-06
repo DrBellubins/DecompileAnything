@@ -99,6 +99,8 @@ CREATE TABLE IF NOT EXISTS matches (
 	tier TEXT,                       -- the tier of the unit that proved it
 	unit TEXT,                       -- that unit's name
 	unit_entry INTEGER,              -- ... and its address
+	source TEXT,                    -- the candidate source that reproduced it, so `decomp link`
+	                                  -- can rebuild the program from what passed (Phase 6)
 	at TEXT,                         -- the date it was recorded
 	PRIMARY KEY (variant, entry, candidate));
 """
@@ -672,6 +674,18 @@ def ensure_matches(conn: sqlite3.Connection) -> None:
 	answer 'nothing' when the table is absent."""
 	conn.executescript(MATCHES_DDL)
 	conn.execute(MATCHES_INDEX)
+	# A ledger written before the source path existed still holds every pair; it just cannot say
+	# which file proved them. Add the column rather than throw the ledger away.
+	if "source" not in {row[1] for row in conn.execute("PRAGMA table_info(matches)")}:
+		conn.execute("ALTER TABLE matches ADD COLUMN source TEXT")
+
+
+def ledger_columns(conn: sqlite3.Connection) -> list[str]:
+	"""The ledger's columns as this particular cache has them, oldest first. A cache opened
+	read-only cannot be migrated, so a read names the columns it asked for."""
+	have = {row[1] for row in conn.execute("PRAGMA table_info(matches)")}
+	return [name for name in ("variant", "entry", "kind", "candidate", "evidence", "tier", "unit",
+		"unit_entry", "source", "at") if name in have]
 
 
 def match_rows(conn: sqlite3.Connection, variant: str = "", entry: int | None = None,
@@ -682,8 +696,7 @@ def match_rows(conn: sqlite3.Connection, variant: str = "", entry: int | None = 
 	is not a promise about what `-O2` calls it. `entry` narrows it to one entity."""
 	if not has_table(conn, "matches"):
 		return []
-	sql = ("SELECT variant, entry, kind, candidate, evidence, tier, unit, unit_entry, at"
-		" FROM matches")
+	sql = "SELECT %s FROM matches" % ", ".join(ledger_columns(conn))
 	values: list = []
 	if variant:
 		sql += " WHERE variant = ?"
@@ -713,10 +726,11 @@ def record_matches(conn: sqlite3.Connection, entries: list[dict]) -> int:
 				continue
 			conn.execute(
 				"INSERT OR REPLACE INTO matches (variant, entry, kind, candidate, evidence, tier,"
-				" unit, unit_entry, at) VALUES (?,?,?,?,?,?,?,?,?)", (
+				" unit, unit_entry, source, at) VALUES (?,?,?,?,?,?,?,?,?,?)", (
 					item.get("variant", ""), int(item["entry"]), item.get("kind", ""),
 					item["candidate"], item.get("evidence", ""), item.get("tier", ""),
-					item.get("unit", ""), item.get("unit_entry"), item.get("at", "")))
+					item.get("unit", ""), item.get("unit_entry"), item.get("source", ""),
+					item.get("at", "")))
 			count += 1
 	return count
 

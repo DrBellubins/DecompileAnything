@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, field
 from pathlib import Path
 
 # Suffixes the compiler picks the language from itself. Anything else is compiled as C++
@@ -84,15 +84,85 @@ def build(sources: list[Path], object_path: Path, *, compiler: str, flags: list[
 		stderr_lines=len(lines))
 
 
-def describe(build: Build) -> list[str]:
-	"""The build result as lines a reader can act on."""
-	if build.ok:
-		return ["build: ok (%.2fs) -> %s" % (build.seconds, build.object_path)] + (
+@dataclass
+class Link:
+	"""A link, in the same shape as a `Build`, because the two failures are the same kind of
+	information: the command, whether it worked, and what the linker said."""
+
+	ok: bool
+	command: list[str]
+	output_path: Path
+	diagnostics: str = ""
+	seconds: float = 0.0
+
+	@property
+	def failed(self) -> bool:
+		return not self.ok
+
+
+def link(objects: list[Path], output_path: Path, *, compiler: str, flags: list[str],
+		linkflags: list[str] | None = None, extra: list[str] | None = None,
+		timeout: int = 180) -> Link:
+	"""Link objects into a program (Docs/byte-cleanup-plan.md, Phase 6). Never raises.
+
+	The objects are the loop's own; `flags` are the variant's build flags, which carry the arch, and
+	`linkflags` are the target's own (`config.link_flags`). `extra` is for the one thing only the
+	caller knows it needs - `--unresolved-symbols=ignore-all`, say, when a program is only
+	partially reproduced - and it is reported, never assumed.
+	"""
+	from . import toolchain
+
+	objects = [Path(item).expanduser() for item in objects]
+	output_path = Path(output_path)
+	missing = [str(item) for item in objects if not item.is_file()]
+	if missing:
+		return Link(ok=False, command=[compiler], output_path=output_path,
+			diagnostics="no such object file: %s" % ", ".join(missing))
+	command = toolchain.link_form(compiler, flags, objects, [*(linkflags or []), *(extra or [])],
+		output_path)
+	output_path.parent.mkdir(parents=True, exist_ok=True)
+	started = time.time()
+	try:
+		process = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+	except FileNotFoundError:
+		return Link(ok=False, command=command, output_path=output_path,
+			diagnostics="linker driver %r not found - set [variants.*] compiler in project.toml"
+			% compiler)
+	except subprocess.TimeoutExpired:
+		return Link(ok=False, command=command, output_path=output_path,
+			diagnostics="the linker did not finish in %ds" % timeout)
+	except OSError as exc:  # pragma: no cover
+		return Link(ok=False, command=command, output_path=output_path,
+			diagnostics="cannot run %s: %s" % (command[0], exc))
+	diagnostics = "\n".join(part for part in (process.stderr, process.stdout) if part).strip()
+	lines = diagnostics.splitlines()
+	if len(lines) > _MAX_DIAGNOSTICS:
+		lines = lines[:_MAX_DIAGNOSTICS] + [
+			"... %d more lines from the linker" % (len(lines) - _MAX_DIAGNOSTICS)]
+	return Link(ok=process.returncode == 0, command=command, output_path=output_path,
+		diagnostics="\n".join(lines), seconds=round(time.time() - started, 2))
+
+
+def describe(result) -> list[str]:
+	"""A build or a link result as lines a reader can act on."""
+	if isinstance(result, Link):
+		if result.ok:
+			lines = ["link: ok (%.2fs) -> %s" % (result.seconds, result.output_path)]
+			if result.diagnostics:
+				lines.append("  linker said:")
+				lines += ["    " + line for line in result.diagnostics.splitlines()[:20]]
+			return lines
+		lines = ["link: FAILED (%s)" % result.command[0]]
+		lines += ["  " + line for line in result.diagnostics.splitlines()[:40]] or [
+			"  the linker produced no output"]
+		return lines
+	if result.ok:
+		return ["build: ok (%.2fs) -> %s" % (result.seconds, result.object_path)] + (
 			["  compiler said:%s" % ("\n" + "\n".join("  " + line for line in
-				build.diagnostics.splitlines()[:20]))] if build.diagnostics else [])
-	lines = ["build: FAILED (%s)" % build.command[0]]
-	if build.diagnostics:
-		lines += ["  " + line for line in build.diagnostics.splitlines()[:40]]
+				result.diagnostics.splitlines()[:20]))] if result.diagnostics else [])
+	lines = ["build: FAILED (%s)" % result.command[0]]
+	if result.diagnostics:
+		lines += ["  " + line for line in result.diagnostics.splitlines()[:40]]
 	else:
 		lines.append("  the compiler produced no output")
 	return lines

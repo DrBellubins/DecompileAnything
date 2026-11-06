@@ -244,6 +244,25 @@ def gate_waivers(config: dict, variant: dict | None = None) -> tuple[list[str], 
 	return out, where
 
 
+def link_flags(config: dict, variant: dict | None = None) -> tuple[list[str], str]:
+	"""The link flags the target's own build used: a `linkflags` key in the `[variants.*]` table,
+	or the top-level `[linkflags]`, else nothing. Returns (flags, where_from).
+
+	`decomp link` (Docs/byte-cleanup-plan.md, Phase 6) has to link the way the target was linked,
+	or its section layout means nothing. The tool adds no flags of its own: a link it chose is not
+	the target's link. Where none were recorded it says so, because that is a real limit on the
+	claim - `-static`, a version script, `-Wl,--build-id=none` or `/ORDER` all move bytes around.
+	"""
+	variant_values = [str(item) for item in ((variant or {}).get("linkflags") or [])]
+	top = [str(item) for item in (config["raw"].get("linkflags") or [])]
+	if variant_values:
+		return variant_values, "the variant's linkflags in %s" % config["path"]
+	if top:
+		return top, "[linkflags] in %s" % config["path"]
+	return [], ("nothing - no linkflags are recorded in %s, so the link is the compiler's "
+		"default" % config["path"])
+
+
 def include_dirs(config: dict, variant: dict | None = None) -> list[Path]:
 	"""Directories the candidate may include from - `[include_dirs]` in the target config, or
 	the same key inside a `[variants.*]` table. Relative paths are relative to the config

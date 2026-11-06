@@ -144,6 +144,30 @@ def driver_form(compiler: str, flags: list[str], sources: list[Path], object_pat
 
 
 # --------------------------------------------------------------------------------------
+# linking a program from candidate objects
+
+
+def link_form(compiler: str, flags: list[str], objects: list[Path], linkflags: list[str],
+		override: Path) -> list[str]:
+	"""The command line that links objects into a program, in this driver's own form.
+
+	The compile flags are repeated on the link line on purpose: they carry `-m32` and `-no-pie`,
+	and a driver that compiles 32-bit code but links 64-bit produces a program that cannot be
+	compared to anything. `linkflags` come from the target's own `[variants.*] linkflags` - the
+	tool does not invent any (`config.link_flags`), because a link the tool chose is not the
+	target's link.
+
+	`cl` names its output with `/Fe:` and passes everything after `/link` straight to `link.exe`
+	(Tests/eval.py's own `link_binary` does the same, which is what built the reference binary).
+	"""
+	if msvc(compiler):
+		return [compiler, *flags, *[str(item) for item in objects], "/Fe:%s" % override, "/link",
+			*(linkflags or [])]
+	return [compiler, *flags, *[str(item) for item in objects], *(linkflags or []), "-o",
+		str(override)]
+
+
+# --------------------------------------------------------------------------------------
 # what the file says about how it was built
 
 

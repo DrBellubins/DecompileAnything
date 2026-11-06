@@ -20,7 +20,7 @@ from typing import Optional
 import typer
 
 from . import (__version__, cache, check, compile, config, discover, diff, extract,
-	ghidra, normalize, structures, symbols, toolchain)
+	ghidra, normalize, relink, structures, symbols, toolchain)
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_FOUND = 0, 1, 2, 3
 
@@ -1153,7 +1153,7 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	return outcome
 
 
-def _learn(db: Path, row, variant: str, verdict, candidate) -> dict:
+def _learn(db: Path, row, variant: str, verdict, candidate, sources: list = ()) -> dict:
 	"""Write down what a unit that reached the gate proved about the target (Phase 5).
 
 	Two things a scored unit proves, and they are different things.
@@ -1181,7 +1181,10 @@ def _learn(db: Path, row, variant: str, verdict, candidate) -> dict:
 		# object carries, which is this spelling - mangled and all
 		entries.append({"variant": variant, "entry": row["entry"], "kind": row["kind"] or "function",
 			"candidate": candidate.raw_name, "evidence": "unit", "tier": verdict.tier,
-			"unit": row["name"], "unit_entry": row["entry"], "at": time.strftime("%Y-%m-%d")})
+			"unit": row["name"], "unit_entry": row["entry"],
+			# which file this came from, so `decomp link` (Phase 6) can put the whole program back
+			# together out of what passed without being told the sources again
+			"source": str(sources[0]) if sources else "", "at": time.strftime("%Y-%m-%d")})
 	for item in verdict.symbols:
 		original, candidate = item.get("original") or {}, item.get("candidate") or {}
 		if not item.get("ok") or item.get("evidence") not in diff.PROVEN_EVIDENCE:
@@ -1272,7 +1275,7 @@ def try_cmd(
 			verdict = outcome["verdict"]
 			if learn and verdict is not None and verdict.passed:
 				outcome["learned"] = _learn(Path(values["db"]), row, outcome["variant"], verdict,
-					outcome["candidate"])
+					outcome["candidate"], [Path(item) for item in source])
 		except config.ConfigError as exc:
 			raise Stop(EXIT_USAGE, "%s" % exc)
 		except NotImplementedError as exc:
@@ -1350,6 +1353,188 @@ def try_cmd(
 			"way; see them with: decomp ledger" % (learned["written"],
 				"s" if learned["written"] != 1 else ""))
 	raise typer.Exit(EXIT_OK if verdict.passed else EXIT_FAIL)
+
+
+# --------------------------------------------------------------------------------------
+# link: the whole program (Docs/byte-cleanup-plan.md, Phase 6)
+
+
+def _link_sources(conn, variant: str, explicit: list[Path]) -> tuple[list[Path], str]:
+	"""Where the candidate sources come from.
+
+	What the caller names, or what the match ledger says reproduced something: the ledger has the
+	source every passing unit was compiled from (Phase 5 added the column), which is what makes
+	"relink what the loop has actually reproduced" work without the caller re-listing files. A
+	ledger written before that column is honest about it and asks for the paths.
+	"""
+	if explicit:
+		return [Path(item).expanduser() for item in explicit], "named on the command line"
+	paths: list[Path] = []
+	blind = 0
+	for row in cache.match_rows(conn, variant=variant):
+		value = str(dict(row).get("source") or "")
+		if not value:
+			blind += 1
+			continue
+		path = Path(value)
+		if path.is_file() and path not in paths:
+			paths.append(path)
+	why = ("the match ledger for variant %s: the source every unit that reached the gate was built "
+		"from" % variant)
+	if blind:
+		why += " (%d pairs were recorded before the source was kept, and cannot name a file)" % blind
+	return paths, why
+
+
+@app.command("link")
+def link_cmd(
+	source: list[Path] = typer.Argument(None,
+		help="candidate source file(s); default: the ones the match ledger says reproduced something"),
+	object_: list[Path] = typer.Option([], "--object",
+		help="link these object files instead of compiling sources"),
+	output: Optional[Path] = typer.Option(None, "--output",
+		help="where to write the linked program (default: under the tool's cache)"),
+	binary: Optional[Path] = typer.Option(None, "--bin"),
+	key: Optional[str] = typer.Option(None, "--key"),
+	config_file: Optional[str] = typer.Option(None, "--config", "-C"),
+	variant: Optional[str] = typer.Option(None, "--variant", "-v",
+		help="default: the variant the analysis was run with"),
+	section: list[str] = typer.Option([], "--section",
+		help="compare only these sections (repeatable); default: every section the program is made of"),
+	include: list[str] = typer.Option([], "--include", "-I",
+		help="an extra include directory for the candidate sources (the variant's are always used)"),
+	link_flag: list[str] = typer.Option([], "--link-flag",
+		help="an extra link flag, for a target whose own link flags were never recorded - it is reported, never assumed"),
+	partial: bool = typer.Option(False, "--partial",
+		help="the sources do not cover the whole program: link anyway, with unresolved symbols allowed"),
+	max_units: int = typer.Option(12, "--max-units", help="how many differing functions to name"),
+	max_rows: int = typer.Option(8, "--max-rows", help="how many differing rows per section to name"),
+	as_json: bool = typer.Option(False, "--json"),
+) -> None:
+	"""Rebuild the program from what the loop reproduced, and compare it to the target whole.
+
+	`decomp try` proves one function against the bytes at one address. That is enough to work on,
+	and not enough to claim: a program can be made of functions that each match and still not be
+	the program - a function that was never reproduced, a helper inlined one way and not the
+	other, a data object placed differently, a link flag nobody recorded. This compiles the
+	candidate sources with the target's own variant flags, links them with the target's own
+	`linkflags`, and compares the result section by section at the addresses the link gave them,
+	then names the first place they part.
+
+	Read it by the first difference. Everything in the report after it that differs *only in what
+	the link wrote* (an operand address, a displacement) is a consequence of that one place, not a
+	new problem: the bytes of that body are the same, they are just sitting somewhere else. A body
+	that differs in an instruction is the next thing to work on.
+
+	ELF/static for now; a PE or Mach-O target says so rather than being compared with the wrong
+	assumptions. Sources come from the match ledger unless named.
+"""
+	cfg = load_config(config_file)
+	store = cache.Cache(config.cache_dir(cfg))
+	conn, values = open_analysis(store, binary, key)
+	try:
+		meta = cache.meta(conn)
+		recorded = str(meta.get("config_path") or "")
+		if not config_file and recorded and Path(recorded).is_file() and Path(recorded) != cfg["path"]:
+			cfg = load_config(recorded)
+		name, body = config.variant(cfg, variant or str(meta.get("variant") or ""))
+		flags = toolchain.build_flags(body)
+		linkflags, flags_from = config.link_flags(cfg, body)
+		sources, sources_from = _link_sources(conn, name, [Path(item) for item in (source or [])])
+		units = [dict(row) for row in conn.execute(
+			"SELECT entry, name, size, section, kind FROM functions ORDER BY entry")]
+		anchors = {}
+		for row in cache.match_rows(conn, variant=name):
+			anchors[int(row["entry"])] = row["candidate"]
+	finally:
+		conn.close()
+
+	target_path = Path(str(meta.get("target_path") or ""))
+	offset = int(str(meta.get("address_offset") or "0") or 0)
+	language = str(meta.get("language_id") or "")
+	compiler = body.get("compiler") or "g++"
+	if not object_ and not sources:
+		raise Stop(EXIT_USAGE, "nothing to link",
+			"pass the candidate sources: decomp link <file.cpp> ... --bin %s" % target_path,
+			"or reproduce functions first: `decomp try` records which source proved what, and "
+			"`decomp link` reads that back (%s)" % sources_from)
+	missing = [str(item) for item in [*sources, *object_] if not Path(item).is_file()]
+	if missing:
+		raise Stop(EXIT_USAGE, "no such file: %s" % ", ".join(missing))
+
+	out_dir = Path(output).parent if output else (config.cache_dir(cfg) / "links"
+		/ ("%s-%s" % (values.get("target_key"), name)))
+	out_path = Path(output) if output else out_dir / str(Path(str(meta.get("target_path") or
+		"program")).name)
+	objects = [Path(item) for item in object_]
+	built: list = []
+	if sources:
+		for item in sources:
+			result = compile.build([Path(item)], (out_dir / "objects"
+				/ compile.object_name([Path(item)])), compiler=compiler, flags=flags,
+				includes=[*[Path(part) for part in config.include_dirs(cfg, body)],
+					*[Path(part) for part in (include or [])]])
+			built.append(result)
+			if result.failed:
+				break
+			objects.append(result.object_path)
+		bad = [item for item in built if item.failed]
+		if bad:
+			for line in compile.describe(bad[0]):
+				echo(line)
+			raise Stop(EXIT_FAIL, "%d of %d candidate sources did not compile: the program cannot "
+				"be linked from them" % (len(bad), len(sources)))
+
+	link = compile.link(objects, out_path, compiler=compiler, flags=flags, linkflags=linkflags,
+		extra=[*(link_flag or ()), *(["-Wl,--unresolved-symbols=ignore-all"] if partial else [])])
+	for line in compile.describe(link):
+		echo(line)
+	if link.failed:
+		echo("the link is: %s" % " ".join(link.command))
+		echo("  a program that is only partly reproduced needs `--partial`; an undefined symbol can "
+			"also mean a function the loop has not reproduced yet (`decomp ledger` names the ones "
+			"it has)")
+		raise typer.Exit(EXIT_FAIL)
+
+	echo("target   %s (key %s)" % (target_path, values.get("target_key")))
+	echo("built by %s: %s" % (name, " ".join(flags)))
+	echo("linked by %s" % " ".join(link.command))
+	echo("link flags from %s" % flags_from)
+	echo("sources from %s" % (sources_from if sources else
+		"not used: --object named the files to link"))
+	target = relink.Program(target_path, bias=offset)
+	candidate = relink.Program(out_path)
+	if target.error:
+		raise Stop(EXIT_USAGE, target.error)
+	if candidate.error:
+		raise Stop(EXIT_USAGE, candidate.error)
+	named = [{"address": item.address, "size": item.size, "name": item.name,
+		"section": target._section_of(item.address)} for item in target.symbols
+		if item.kind == "object" and item.size]
+	warnings = []
+	if not named:
+		warnings.append("no data object is named on the target side (a stripped ELF carries no "
+			"object symbols), so data is compared as whole sections and through the runtime "
+			"relocations, not object by object")
+	if not anchors:
+		warnings.append("the match ledger names no candidate symbol for this variant, so functions "
+			"are paired by layout and length, which cannot prove identity - the pairing says so "
+			"wherever it applies (`decomp ledger` shows what has been proven)")
+	if units:
+		warnings.append("%d functions of the target are being paired; the candidate program's own "
+			"symbol table is what they are matched against" % len(units))
+	result = relink.compare_program(target, candidate, units=units, anchors=anchors,
+		language=language, objects=named, only=[item for item in section if item])
+	result["warnings"] = warnings + list(result.get("warnings", []))
+	result["link"] = {"command": link.command, "output": str(out_path),
+		"linkflags_from": flags_from, "sources_from": sources_from,
+		"objects": [str(item) for item in objects]}
+	if as_json:
+		echo(json.dumps(result, indent=1, default=str))
+		raise typer.Exit(EXIT_OK if result["identical"] else EXIT_FAIL)
+	for line in relink.report_lines(result, max_units=max_units, max_rows=max_rows):
+		echo(line)
+	raise typer.Exit(EXIT_OK if result["identical"] else EXIT_FAIL)
 
 
 def _structures_for(recovered, row) -> dict:

@@ -437,6 +437,33 @@ Unit sizes: 13.6 KB of unit code at -O0, median 123 bytes, 15 units 32-63 B, 14 
 what `calib` measured on deadrising2.exe (median function gap 160 B, 18% under 64 B), so
 per-function difficulty is representative.
 
+### Phase 6: `check_phase6_link.py`
+
+The capstone the plan was for: take the functions the loop reproduced, compile them with the
+variant's own flags, link them into a program with the variant's own link flags, and ask whether
+that is the original program. `decomp link` answers it section by section and function by function
+at the addresses the linker chose.
+
+Two claims carry the report. A link is the target's or the tool says so: the variant's `linkflags`
+come from the config (`-no-pie -static` for the MS-2 stand-in; "nothing is recorded" for `gcc-o0`),
+and the driver form follows `eval.py`, so an MSVC variant would be linked the way the harness links
+it. And a difference that follows the layout is a consequence, not a second problem: once one body
+is a different length, every address after it moves, so the report names where the layout moved,
+labels the bodies whose only difference is an operand the link rewrote, and calls a data value that
+differs by exactly a known shift a pointer to moved code. `pair_extents` keeps the discipline the
+rest of the project has: a matching length is not evidence, so a length difference the layout does
+not confirm is reported as two extents with no pair rather than as a changed function - and an
+anchor from the match ledger is the one thing that outranks layout, because it says what a body
+*is*, whatever its length.
+
+Measured here: the benchmark program, built from its own sources under `gcc-o0`, relinks with
+`16 sections compared: 16 identical`, `.text` identical at 49969 bytes, exit `0`. Add one `if` to
+`CMathTests::SolveQuadraticRoot` and the same command exits `1`, names the changed function, names
+where the layout moved, and shows 36 of the 143 compared pairs as operands the link rewrote rather
+than source differences. Reading a program is LIEF on both sides, so this is ELF only: PE and
+Mach-O say so instead of being compared wrongly (Phase 7 of the cleanup plan brings MSVC `link`).
+
+
 ## Known gaps
 
 * **Same-size callees are capped until they are decompiled** (since `Docs/byte-cleanup-plan.md`
@@ -470,6 +497,17 @@ per-function difficulty is representative.
   builtins (`sqrtf` inlined as `sqrtsd` in a `.o` but called through the PLT in the linked
   binary) and jump-table layout - the honest case for the optional behavioural check
   (goldens + Unicorn), which is not implemented.
+
+* **Named data is thin on a stripped target.** `decomp link` compares data sections whole and
+  compares the dynamic relocation tables, but it can only *name* a data object when the file's
+  symbol table names it - a stripped benchmark target has none, so vtables and static data are
+  reported at section level. The Phase 4 structure recovery knows those shapes; wiring it in is the
+  obvious next step.
+* **The unit table and the symbol table are not the same table.** For this benchmark the analysis
+  splits and merges some functions differently from ELF symbols, so `decomp link` reports some
+  extents as having no pair instead of naming them. It does not claim a pairing it cannot support;
+  what improves it is more anchors (a populated ledger) and a better unit table (Phase 4 records),
+  not a guess from size.
 
 ## Adding or changing a unit
 
