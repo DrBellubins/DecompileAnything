@@ -459,7 +459,14 @@ _BRANCH = re.compile(r"^(j[a-z]{0,3}|loop[a-z]*|call[a-z]*|jmp|ret)$")
 
 
 def _slots(handle: Cs, instruction) -> list[Slot]:
-	"""Which operands carry an address, and what address they encode."""
+	"""Which operands carry an address, and what address they encode.
+
+	`enc_offset` is where the field is expected to sit, read from the instruction's length: the
+	last four bytes for a displacement or immediate, one past the opcode for a branch. That is a
+	convention, not a decoding - it is wrong for a `0f 8x` conditional jump and for an instruction
+	with an immediate after its displacement (`cmpb $0, x(%rip)`) - so `field_span` treats it as a
+	starting point and checks it against the bytes before anything is masked on its authority.
+	"""
 	slots: list[Slot] = []
 	if not handle.detail:  # the analysis export decodes without detail
 		return slots
@@ -604,6 +611,199 @@ def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruct
 		tokens.append(Token(text=text, mnemonic=instruction.mnemonic, address=instruction.address,
 			refs=refs))
 	return tokens
+
+
+# --------------------------------------------------------------------------------------
+# the fields an instruction leaves for the link
+#
+# A body's bytes are not all evidence about the source. The bytes of a `call`, a pc-relative
+# load or a 32-bit absolute address are whatever the *link* decided: in a `.o` they are
+# placeholders a relocation record describes, in a linked file they are final displacements that
+# depend on where everything was placed. Zeroing exactly those fields on both sides is what
+# makes "the candidate assembles to the original bytes" a claim that can be true (and only
+# those: a short jump and a rel32 jump say the same thing symbolically and are different bytes,
+# and that difference belongs to the candidate).
+
+_FIELD_WIDTHS = (1, 2, 4, 8)
+
+
+def body_blocks(extents: list[tuple[int, int]] | None, base: int, size: int) -> list[tuple[int, int, int]]:
+	"""(start, length, offset in the concatenated body) for each block of a body.
+
+	The same split `decode_function` and `normalize_function` walk, in one place: the entry block
+	first, then a -O2 cold partition. An address outside every block belongs to no body.
+	"""
+	blocks: list[tuple[int, int, int]] = []
+	cursor = 0
+	for start, length in (extents or [(base, size)]):
+		blocks.append((int(start), int(length), cursor))
+		cursor += int(length)
+	return blocks
+
+
+def block_of(blocks: list[tuple[int, int, int]], address: int):
+	"""The block an address falls in, or None."""
+	for block in blocks:
+		if block[0] <= int(address) < block[0] + block[1]:
+			return block
+	return None
+
+
+def _encodes(field: bytes, expected: int, width: int | None = None) -> bool:
+	"""Do these bytes say this number? (two's complement, little endian)
+
+	`width` is the field's width in bytes; without it the bytes handed in are taken to be exactly
+	the field. Pass it when looking for a field inside a longer run of bytes.
+	"""
+	if not field:
+		return False
+	if width is not None:
+		if len(field) < width:
+			return False
+		field = field[:width]
+	mask = (1 << (8 * len(field))) - 1
+	return (int.from_bytes(field, "little") & mask) == (int(expected) & mask)
+
+
+def field_span(instruction, slot) -> tuple[int, int] | None:
+	"""Where in an instruction the address an operand carries sits, and how wide it is.
+
+	`Slot.enc_offset` is where that field was read from, and is the starting point. It is a
+	convention though, not a fact about the encoding: `_slots` uses offset 1 for a branch or call,
+	which is right for `e8`/`e9` and wrong for a `0f 8x` conditional jump, whose rel32 starts two
+	bytes in. So the recorded offset is *checked* by decoding the bytes it points at against the
+	address the slot recorded, and the field is located by decoding instead when it does not
+	reproduce it (the rel8/rel16/rel32 of a branch is always the trailing bytes).
+	"""
+	data = bytes(instruction.bytes or b"")
+	length = int(instruction.length or len(data))
+	if not data or len(data) != length or slot.value is None:
+		return None            # no bytes to mask: a stream built from text alone
+	# What the field has to contain. A pc-relative or branch operand says how far away the target
+	# is, measured from the end of the instruction; an absolute or immediate one says the address.
+	if slot.kind in ("rip", "call", "branch"):
+		expected = int(slot.value) - (int(instruction.address) + length)
+	else:
+		expected = int(slot.value)
+	# the recorded offset first, then the widest trailing field (an unrelocated `call 0` in a `.o`
+	# also "matches" as a one-byte zero if the short forms are tried first), then any other field
+	# of the width that form always has
+	order = [(slot.enc_offset, length - slot.enc_offset)]
+	if slot.kind in ("rip", "abs"):
+		# a pc-relative or absolute displacement is a fixed 4-byte field wherever the encoding puts
+		# it: `cmpb $0, x(%rip)` is `80 3d disp32 00`, with the immediate after the displacement,
+		# so the trailing-bytes rule would miss it
+		order += [(offset, 4) for offset in range(1, length - 3)]
+	else:
+		order += sorted([(length - width, width) for width in _FIELD_WIDTHS
+			if 0 < length - width < length])
+		order += [(offset, width) for width in _FIELD_WIDTHS
+			for offset in range(1, length - width + 1) if 0 < offset]
+	for offset, width in order:
+		if offset <= 0 or width not in _FIELD_WIDTHS or offset + width > length:
+			continue
+		if _encodes(data[offset:], expected, width):
+			return offset, width
+	return None
+
+
+def position_dependent(instruction, slot, ref, block) -> bool:
+	"""Does this operand's field depend on where things were linked, i.e. must both sides hide it?
+
+	The rule is the same on both sides, so a field is only hidden when *both* would have written
+	something different there. It is symmetric by construction: a `.o` leaves a field for the link
+	exactly when the operand reaches outside the body it sits in, and a linked file has the value
+	the linker chose there. The one case that is not visible from the bytes alone is a call to a
+	function - including a self-recursive one - whose entry happens to be inside the body: the
+	object file still relocates it, so what the analysis called the target decides (a reference to
+	a function or an import is a symbol; a jump to an interior label of this body is not).
+	"""
+	if slot.kind in ("rip", "abs"):
+		# a pc-relative or absolute address is the linker's choice wherever it appears
+		return True
+	if slot.kind == "imm":
+		# an immediate is a constant unless something resolves it to an object: in a non-PIE
+		# 32-bit object `pushl $_ZTI14CVehicleEntity` is an R_386_32 sitting on an immediate
+		return ref is not None
+	start, length, _cursor = block
+	target = ref.address if (ref is not None and ref.address is not None) else slot.value
+	if target is None:
+		return True
+	if not (start <= int(target) < start + length):
+		return True            # another function, an object, or the other half of this body
+	return bool(ref is not None and ref.kind in ("function", "external"))
+
+
+def address_fields(blocks: list[tuple[int, int, int]], instructions: list, bind) -> list[tuple[int, int]]:
+	"""The (offset, width) pairs of a concatenated body where an operand leaves an address.
+
+	`bind` is the same function the tokeniser is given, so a field is hidden on exactly the
+	operands that were tokenised as references. Offsets are in the concatenated body, per extent,
+	which is what `Function.bytes` is indexed by.
+	"""
+	fields: list[tuple[int, int]] = []
+	for instruction in instructions:
+		block = block_of(blocks, instruction.address)
+		if block is None:
+			continue
+		bound = bind(instruction) or {}
+		for slot in instruction.slots:
+			ref = bound.get(slot.operand)
+			if not position_dependent(instruction, slot, ref, block):
+				continue
+			span = field_span(instruction, slot)
+			if span is None:
+				continue
+			offset, width = span
+			fields.append((block[2] + (int(instruction.address) - block[0]) + offset, width))
+	return sorted(fields)
+
+
+def merge_fields(primary, *more) -> list[tuple[int, int]]:
+	"""One sorted, non-overlapping field list out of several. Earlier groups win: a byte an
+	earlier group already covers is not extended by a later one.
+
+	For a candidate that is the relocation table first (it states the exact offset and width), and
+	the decoder's fields second - which is what adds the calls to a helper in the same section that
+	a `.o` resolves without a relocation record.
+	"""
+	spans: list[tuple[int, int]] = []
+	covered: set[int] = set()
+	for group in (primary, *more):
+		for offset, width in sorted((item for item in group if int(item[1]) > 0)):
+			if any(step in covered for step in range(int(offset), int(offset) + int(width))):
+				continue
+			covered.update(range(int(offset), int(offset) + int(width)))
+			spans.append((int(offset), int(width)))
+	return sorted(spans)
+
+
+def mask_body(data: bytes, fields: list[tuple[int, int]]) -> bytes:
+	"""A body with the given (offset, width) ranges set to zero."""
+	out = bytearray(data)
+	for offset, width in fields:
+		for step in range(int(width)):
+			if 0 <= offset + step < len(out):
+				out[offset + step] = 0
+	return bytes(out)
+
+
+def body_index(blocks: list[tuple[int, int, int]], instructions: list, tokens: list) -> dict[int, str]:
+	"""Every byte offset of a body -> the instruction it falls in, for byte-level reports."""
+	by_address = {int(token.address): token for token in tokens}
+	out: dict[int, str] = {}
+	for instruction in instructions:
+		block = block_of(blocks, instruction.address)
+		if block is None:
+			continue
+		token = by_address.get(int(instruction.address))
+		text = (token.text if token is not None else format_instruction(
+			instruction.mnemonic, instruction.operands))
+		label = "0x%x  %s" % (int(instruction.address), text)
+		start = block[2] + (int(instruction.address) - block[0])
+		for step in range(int(instruction.length)):
+			out[start + step] = label
+	return out
 
 
 def abstract_registers(text: str, vocab: Vocabulary, side: str) -> str:

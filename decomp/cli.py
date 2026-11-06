@@ -1020,13 +1020,30 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		return outcome
 
 	vocabulary = normalize.Vocabulary()
+	bind_candidate = object_file.bindings(candidate)[0]
 	tokens_original = normalize.normalize_function(vocabulary, "original", instructions_original,
 		bind_original, original.address, original.size, False, original.extents)
 	tokens_candidate = normalize.normalize_function(vocabulary, "candidate", instructions_candidate,
-		object_file.bindings(candidate)[0], candidate.address, candidate.size, False,
-		candidate.extents)
+		bind_candidate, candidate.address, candidate.size, False, candidate.extents)
+	# The byte comparison of Phase 3 needs the fields of each body that the link writes. The
+	# candidate's come from its own relocation table - authoritative, and the widths come from the
+	# relocation type. The original's come from the address-carrying operands of its instructions,
+	# because a linked file has no relocations left in it; for the candidate the decoder's view is
+	# added second and only where there is no record, which is what covers a call to a helper in the same section (no relocation in a `.o`, the link
+	# fills the displacement in anyway). Offsets are per extent, in the order the blocks are compared.
+	blocks_original = normalize.body_blocks(original.extents, original.address, original.size)
+	blocks_candidate = normalize.body_blocks(candidate.extents, candidate.address, candidate.size)
+	fields_original = normalize.merge_fields(
+		normalize.address_fields(blocks_original, instructions_original, bind_original))
+	fields_candidate = normalize.merge_fields(
+		object_file.relocation_fields(candidate),
+		normalize.address_fields(blocks_candidate, instructions_candidate, bind_candidate))
+	outcome["masked_fields"] = {"original": fields_original, "candidate": fields_candidate}
 	outcome["verdict"] = diff.compare(tokens_original, tokens_candidate, vocabulary,
 		threshold=config.threshold(cfg), original_bytes=original.bytes, candidate_bytes=candidate.bytes,
+		original_fields=fields_original, candidate_fields=fields_candidate,
+		original_at=normalize.body_index(blocks_original, instructions_original, tokens_original),
+		candidate_at=normalize.body_index(blocks_candidate, instructions_candidate, tokens_candidate),
 		require=require)
 	return outcome
 
@@ -1125,6 +1142,11 @@ def try_cmd(
 				"threshold": verdict.threshold,
 				"match_percent": verdict.match_percent, "categories": verdict.categories,
 				"identical": verdict.identical, "bytes_equal": verdict.bytes_equal,
+				"bytes_equal_masked": verdict.bytes_equal_masked,
+				"bytes_masked": verdict.bytes_masked,
+				"masked_byte_fields": verdict.masked_byte_fields,
+				"masked_first_difference": verdict.masked_first_difference,
+				"masked_offsets": outcome.get("masked_fields", {}),
 				"original_instructions": verdict.original_instructions,
 				"candidate_instructions": verdict.candidate_instructions,
 				"original_bytes": verdict.original_bytes, "candidate_bytes": verdict.candidate_bytes,

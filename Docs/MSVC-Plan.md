@@ -494,11 +494,16 @@ What the format actually is, measured on the benchmark's own `Tests/build/msvc-o
 * `--fn` accepts the identifier part of a decorated name (`?AbsDiff@CMathTests@@SAHHH@Z` is found
   by `AbsDiff`), which is what a model reading a source file knows. The decorated form stays the
   comparison key: `c++filt` cannot read MSVC names (§8).
-* **Byte-identity is still 54 of 89, and that is the honest number.** A `.o` keeps a
-  `00 00 00 00` displacement where the link writes the final one, so a unit that reaches anything
-  outside itself cannot be byte-equal to the linked image - at any `-O`, for either format. The
-  instruction stream and the symbol tokens are what is compared; `bytes_equal` is reported, not
-  required.
+* **A `.o` is not byte-equal to the linked image, and never was: 54 of 89 at `cl /Od`.** A `.o`
+  keeps a `00 00 00 00` displacement where the link writes the final one, so a unit that reaches
+  anything outside itself cannot be byte-equal to the linked image - at any `-O`, for either
+  format. The instruction stream and the symbol tokens are what is compared; `bytes_equal` is
+  reported, not required.
+* **Since the relocation-masked byte comparison (Phase 3 of `Docs/byte-cleanup-plan.md`,
+  2026-11-06) that no longer caps the tier.** Those placeholder displacements are exactly the
+  fields the COFF relocation table names, and the original's operands give the same fields on its
+  side, so all 89 units of the `cl /Od` benchmark reach `exact` - the same 89 that pass the gate -
+  while 54 are literally identical. `check_coff_candidate.py` prints both counts.
 
 STRUCT-24 is the one unit the untouched source does not pass, and it is MS-5's job: the `.obj`
 names all three type descriptors by symbol (`??_R0?AVCVehicleEntity@`, `??_R0?AVCEntityBase@`,

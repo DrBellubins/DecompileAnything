@@ -195,9 +195,14 @@ def the_loop(cfg: dict, store: cache.Cache, answer: dict, limit: int, failures: 
 		failures.append("nothing scored (%d problems)" % len(broken))
 		return
 	percent = [item.match_percent for item in scores]
-	print("   %d/%d units scored, mean %.2f%%, byte-identical %d, pass the gate %d"
+	tiers: dict[str, int] = {}
+	for item in scores:
+		tiers[item.tier] = tiers.get(item.tier, 0) + 1
+	print("   %d/%d units scored, mean %.2f%%, byte-identical %d, bytes equal with the fields the "
+		"link writes zeroed %d, tiers %s, pass the gate %d"
 		% (len(scores), len(units), sum(percent) / len(percent),
 			sum(1 for item in scores if item.bytes_equal),
+			sum(1 for item in scores if item.bytes_equal_masked), tiers,
 			sum(1 for item in scores if item.passed)))
 	for item in broken[:8]:
 		print("   BROKEN %s" % item)

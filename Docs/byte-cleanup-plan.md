@@ -85,6 +85,62 @@ unchanged (100.00 / 99.91 / 99.38), and the three negative controls are unchange
 
 **Acceptance:** a function containing calls and rip-relative loads that you've matched by eye reports masked-identical. Changing one encoding choice (for example `lea` vs `mov`) is caught at the byte level even if the text compares close.
 
+**Done** (2026-11-06, `Tests/tools/check_masked_bytes.py`). `diff.compare_bytes` zeroes each
+side's fields and reports the first differing offset; `Verdict.bytes_equal_masked` is what gates
+`exact` (`tier_for` takes the masked comparison, `tier_gaps`/`Verdict.gaps` quote the offset and
+the instruction it falls in). The report prints the masked comparison under the raw byte line,
+and `--json` carries `bytes_equal_masked`, `masked_byte_fields`, `masked_offsets` and
+`masked_first_difference`. Fields are per extent (`normalize.body_blocks` carries the cursors
+through `address_fields`, `relocation_fields` and `body_index`), so a `-O2` cold partition is
+masked at its offset in the concatenated body.
+
+Two things the plan did not know:
+
+* **`Slot.enc_offset` is a convention, not a decoding.** It says "one byte past the opcode" for a
+  branch - right for `e8`/`e9`, wrong for a `0f 8x` conditional jump, whose rel32 starts two
+  bytes in - and "length minus four" for a displacement, which is wrong when an immediate follows
+  it (`cmpb $0, x(%rip)` is `80 3d disp32 01`). Masking on the convention hides the wrong bytes.
+  `normalize.field_span` therefore *checks* the recorded offset by decoding it against the address
+  the slot recorded, and falls back to the encoding's real shape: a pc-relative or absolute field
+  is 4 bytes wherever it sits, a branch's displacement is always the trailing bytes (so a rel8 is
+  1 byte, not 4). An unrelocated `call 0` in a `.o` is still found as a 4-byte field, because the
+  widths are tried widest first.
+* **"Zero the same fields on both sides" cannot be one shared list.** A `.o` relocates a call to a
+  helper in the same section and a self-recursive call whose entry sits inside the body, while a
+  jump to an interior label of the body is resolved by the assembler and relocates nothing. So
+  both sides run the same `position_dependent()` test over their own operands - pc-relative and
+  absolute always, an immediate only when something resolves it, a call or a cross-body branch
+  always, an in-body branch never - and the candidate masks every field its relocation table
+  states as well, which is authoritative and gives the width from the relocation type. A field
+  only one side has is compared against the other side's bytes, never hidden.
+
+Measured, untouched source through `decomp try`'s own path, gate `semantic`, all three ELF
+variants (identical bytes without masking, then with the fields the link writes zeroed):
+
+| variant | raw byte test | masked byte test | below the gate |
+| --- | --- | --- | --- |
+| `-O0` | 54/89 | **89/89** `exact` (516 bytes of fields) | none |
+| `-O2` | 55/89 | **86/89** `exact`, 3 `structural` (470 bytes) | STRUCT-22/23/24 |
+| `-O0 -m32` | 58/89 | **77/89** `exact`, 11 `structural`, 1 `none` (348 bytes) | the 12 known gaps |
+
+Every unit that reaches the gate now also proves its bytes: nothing is left between `semantic`
+and `exact` on any variant, and the units below the gate are exactly Phase 2's `KNOWN_GAPS`,
+unchanged. Two `-O2` units (`STR-04`, `STR-11`) mask a one-byte branch field on the original
+side that the candidate's object file resolved without a relocation - a hot-to-cold `jmp` that
+crosses extents in the linked file but not in the object. Their bytes are identical either way,
+so the claim is unaffected, and the field counts on both sides are printed in the report so this
+case stays visible.
+
+One pre-existing bug was fixed on the way, because it blocked the CLI path this phase exists for:
+`cache.status()` read the `meta` table of any directory under the cache root, and `try` writes
+candidate objects plus a scratch `analysis.db` into `candidates*/`, so `cache.targets()` raised
+`no such table: meta` and `decomp try <addr> <src>` failed before it reached the comparison (the
+same cause as the `decomp status` crash recorded on 2026-11-05). Such a directory now reports
+`{"complete": 0, "reason": "not an analysis database"}`; the acceptance tool asserts
+`cache.targets()` still lists the benchmark target. The COFF path gained the same treatment:
+`decomp try` on the `cl /Od` PE target now reports 54 units with literally identical bytes and
+**89 of 89 `exact`** with the link's fields zeroed (`check_coff_candidate.py` prints both).
+
 ## Phase 4: Verify constants and rodata
 *This is where DSP coefficients and string literals escape today.*
 

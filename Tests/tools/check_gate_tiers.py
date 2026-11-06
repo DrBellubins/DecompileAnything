@@ -62,16 +62,25 @@ def stream(lines: list[str]) -> list[normalize.Token]:
 		for index, text in enumerate(lines)]
 
 
+# What the tool has to say when `exact` is asked for and the bytes do not speak for it. With no
+# bytes at all the test could not run; with bytes and no field lists it ran on every byte, which
+# is the pre-Phase-3 rule and only honest for a body that references nothing.
+NO_BYTES = "the bytes cannot be compared (one of the two bodies is missing)"
+UNMASKED = ("the bytes are not equal, and no relocation fields were given, so this byte test is "
+	"unmasked")
+
+
 def score(original_lines: list[str], candidate_lines: list[str], *,
 		refs: list[tuple[normalize.Ref, normalize.Ref]] | None = None,
 		original_bytes: bytes = b"", candidate_bytes: bytes = b"",
-		require: str = diff.GATE_DEFAULT):
+		original_fields=None, candidate_fields=None, require: str = diff.GATE_DEFAULT):
 	left, right = stream(original_lines), stream(candidate_lines)
 	for index, (a, b) in enumerate(refs or []):
 		left[index].refs.append(a)
 		right[index].refs.append(b)
 	return diff.compare(left, right, normalize.Vocabulary(), threshold=97.0,
-		original_bytes=original_bytes, candidate_bytes=candidate_bytes, require=require)
+		original_bytes=original_bytes, candidate_bytes=candidate_bytes,
+		original_fields=original_fields, candidate_fields=candidate_fields, require=require)
 
 
 def expect(label: str, verdict, tier: str, categories: dict) -> None:
@@ -138,15 +147,15 @@ def negative_controls() -> int:
 
 def allocations() -> int:
 	renamed = score(["movl %eax, %ecx", "addl %ecx, %eax"],
-		["movl %r9d, %r8d", "addl %r8d, %r9d"])
+		["movl %r9d, %r8d", "addl %r8d, %r9d"],
+		original_bytes=b"\x89\xc1\x01\xc8", candidate_bytes=b"\x41\x89\xc8\x41\x01\xc1")
 	expect("register allocation", renamed, "semantic", {"register": 2})
 	check("register allocation: reported as allocation only", renamed.register_only, 2)
 	check("register allocation: the folded streams are identical", renamed.abstract_clean, True)
 	check("register allocation: nothing stands between it and the gate",
 		renamed.gaps("semantic"), [])
 	check("register allocation: it still says what is missing for exact",
-		renamed.gaps("exact"), ["the bytes are not equal (the byte test is unmasked until "
-			"Phase 3)"])
+		renamed.gaps("exact"), [UNMASKED])
 
 	# the same width-changing pattern must not hide behind the aliases: %eax and %rax are one
 	# register, so `movl` vs `movq` is an opcode difference, not a rename
@@ -166,8 +175,7 @@ def allocations() -> int:
 	expect("equal bytes", same, "exact", {})
 	unproven = score(["ret"], ["ret"])
 	expect("bytes unproven", unproven, "semantic", {})
-	check("exact is the top tier, so nothing is asked for", unproven.gaps("exact"),
-		["the bytes are not equal (the byte test is unmasked until Phase 3)"])
+	check("exact is the top tier, so nothing is asked for", unproven.gaps("exact"), [NO_BYTES])
 	return 0
 
 

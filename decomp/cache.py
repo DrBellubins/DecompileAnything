@@ -128,7 +128,13 @@ class Cache:
 		except sqlite3.Error:
 			return {"complete": 0, "db": str(path)}
 		try:
-			values = meta(conn)
+			try:
+				values = meta(conn)
+			except sqlite3.Error:
+				# not every directory under the cache root is an analysis: `try` writes candidate
+				# objects (and a scratch database) into candidates/, and a directory holding one is
+				# not a target. Report it as unusable rather than raising through `targets()`.
+				return {"complete": 0, "db": str(path), "reason": "not an analysis database"}
 			if values.get("cache_version") != str(CACHE_VERSION):
 				return {"complete": 0, "db": str(path), "reason": "written by an older cache version"}
 			values["complete"] = int(values.get("complete") == "1")

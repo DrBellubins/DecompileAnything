@@ -44,7 +44,37 @@ _COFF_FIELD_WIDTH = {
 	"ABSOLUTE": 0, "ADDR32": 4, "ADDR32NB": 4, "HIGH": 2, "HIGHADJ": 2, "INSTANCE_OFFSET": 4,
 	"SECTION_OFFSET": 2, "REL32": 4, "DIR64": 8, "REL64": 8, "IMM16": 2, "SEGOFST": 2,
 	"SREL32": 4, "PAIR": 0, "FRACTL": 0, "SECREL": 4,
+	# how LIEF spells the same types
+	"AMD64_REL32": 4, "AMD64_ADDR32NB": 4, "AMD64_ADDR32": 4, "AMD64_REL64": 8,
+	"AMD64_DIR64": 8, "AMD64_IMMGREL32": 4, "AMD64_SECREL": 4,
 }
+
+# The same for ELF (R_*): the type says the width of the field it fixes. LIEF spells these
+# `TYPE.X86_64_PC32`, so the key is the part after the last dot, as for COFF.
+_ELF_FIELD_WIDTH = {
+	"X86_64_PC32": 4, "X86_64_32": 4, "X86_64_32S": 4, "X86_64_PLT32": 4, "X86_64_64": 8,
+	"X86_64_GOTPCREL": 4, "X86_64_GOTPCRELX": 4, "X86_64_REX_GOTPCRELX": 4,
+	"X86_64_GOT32": 4, "X86_64_GOT64": 8, "X86_64_PC64": 8,
+	"X86_32": 4, "X86_PC32": 4, "X86_GOT32": 4, "X86_GOTOFF": 4, "X86_PLT32": 4,
+	"X86_PC16": 2, "X86_16": 2, "X86_8": 1, "NONE": 0, "NUM": 0,
+}
+
+
+def relocation_width(kind) -> int:
+	"""How many bytes a relocation rewrites (0 = unknown, or a record that fixes nothing).
+
+	Phase 3's byte comparison needs this on the candidate side: the bytes a relocation covers are
+	the link's choice, not the candidate's, so they are the only ones the two bodies are allowed to
+	disagree in.
+	"""
+	text = str(kind or "")
+	key = text.rsplit(".", 1)[-1].strip()
+	key = key[2:] if key.startswith("R_") else key
+	for table in (_ELF_FIELD_WIDTH, _COFF_FIELD_WIDTH):
+		if key in table:
+			return table[key]
+	return 0
+
 
 # What `cl` fills the space between functions with, and what a linker pads an aligned section
 # with. Decoding to these and no further is how a COFF candidate's extent is found (MS-3).
@@ -1202,7 +1232,7 @@ class CandidateObject:
 				width = int(getattr(item, "size", 0) or 0)
 				if width not in (1, 2, 4, 8):
 					# LIEF does not always fill it; the type says how wide the field is.
-					width = _COFF_FIELD_WIDTH.get(str(item.type).rsplit(".", 1)[-1], 0)
+					width = relocation_width(item.type)
 				addend = 0
 				if width and offset + width <= len(data):
 					addend = int.from_bytes(data[offset:offset + width], "little", signed=True)
@@ -1381,6 +1411,37 @@ class CandidateObject:
 			return chosen
 
 		return bind, used
+
+	def relocation_fields(self, function: Function) -> list[tuple[int, int]]:
+		"""The (offset, width) pairs of `function.bytes` that the link rewrites.
+
+		Every relocation whose field falls inside one of the function's extents, translated from
+		section offsets to offsets in the concatenated body (per extent, before concatenation - a
+		-O2 candidate's `.text.unlikely` block is a different section and its own address domain).
+		This is the authoritative list for the candidate side of the byte comparison: a field a
+		relocation covers is a value the link chooses, so it is not evidence about the source.
+		A record whose type gives no width is skipped and said so in the function's warnings.
+		"""
+		fields: list[tuple[int, int]] = []
+		unknown = 0
+		cursor = 0
+		for section, where, length in (self._extent_sections
+				or [(function.section, function.address, function.size)]):
+			for item in self._relocs.get(section, []):
+				offset = int(item[0])
+				if not where <= offset < where + length:
+					continue
+				width = relocation_width(item[1])
+				if not width:
+					unknown += 1
+					continue
+				fields.append((cursor + (offset - where), width))
+			cursor += length
+		if unknown:
+			function.warnings.append("%d relocation(s) in this function have a type this tool does "
+				"not know a field width for, so their bytes are compared rather than masked"
+				% unknown)
+		return sorted(fields)
 
 	def _target(self, symbol_name: str, addend: int, symbol_section: str = "") -> dict:
 		"""What a relocation names: kind, address, section, size, comparable content, display.

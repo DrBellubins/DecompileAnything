@@ -57,6 +57,7 @@ To check that the scorer's own counts add up (Docs/byte-cleanup-plan.md, Phase 1
 ```sh
 .venv/bin/python Tests/tools/check_diff_accounting.py
 .venv/bin/python Tests/tools/check_gate_tiers.py
+.venv/bin/python Tests/tools/check_masked_bytes.py
 ```
 
 A `replace` region whose two sides are different lengths used to be zipped, so the leftover
@@ -77,14 +78,34 @@ unchanged (100.00 / 99.91 / 99.38) - six units out, all six an operand differenc
 the two sides cannot pair (`leaq SYM1(%rip)` against `leaq SYM0(%rip)` at -O2, an object named
 `DAT1` against `DAT0` at -m32), all six named in `KNOWN_GAPS` with the reason. The tiers, lowest
 first: `structural` (same length, operations and targets), `semantic` (+ every operand right, +
-streams identical once registers are folded), `exact` (+ bytes equal); `percent` and `none` are the
-escape hatches, and `--gate` overrides per call.
+streams identical once registers are folded), `exact` (+ the bytes are equal once the fields the
+link writes are zeroed on both sides); `percent` and `none` are the escape hatches, and `--gate`
+overrides per call.
 
 `check_gate_tiers.py` is the acceptance for the tiers themselves: a swapped `subss`, a dropped
 `mulss`, a wrong immediate and a different callee never reach `semantic`; a pure register-allocation
 difference does (reported "allocation only", folded streams identical); `movl %eax,%ecx` vs
 `movq %rax,%rcx` stays an opcode difference; and it prints the tier histogram of every variant
-(-O0: exact 54, semantic 35 - the 54 are byte-identical, which is what Phase 3 is about).
+(-O0: exact 89, -O2: exact 86 + structural 3, -m32: exact 77 + structural 11 + none 1).
+
+**What `exact` means** (Phase 3, `Docs/byte-cleanup-plan.md`). Two bodies that reach the same
+things in the same order still differ in the bytes the link writes - a call's displacement, a
+pc-relative offset, the address of a global - so comparing those bytes compared nothing. The
+masked byte comparison zeroes exactly those fields on each side: the candidate's come from its own
+relocation table, the original's from the address-carrying operands of its decoded instructions
+(including the calls an object file resolves in-section). Everything else is compared, including
+the length of each encoding.
+
+`check_masked_bytes.py` is the acceptance for that. It checks where the field actually sits on real
+encodings (a `0f 8x` rel32 starts two bytes in, not one; in `cmpb $0, x(%rip)` the displacement is
+at offset 2, not length-minus-four; an immediate is not a field unless something resolves it, and in
+a non-PIE 32-bit object `pushl $_ZTI...` is), that a call-and-globals body whose only difference is
+the link's addresses masks to equal, that a `jmp short` against a `jmp rel32` to the same function
+is caught at the byte level and named with its offset and instruction, that a field only one side
+has is not hidden, and that a cold partition is masked at its offset in the concatenated body.
+Measured on the untouched source, identical bytes without masking versus with it: **-O0 54 → 89 of
+89, -O2 55 → 86, -m32 58 → 77** - every unit that reaches the gate also proves its bytes, and the
+units below it are exactly the `KNOWN_GAPS` above.
 
 To check the `-O2` work itself (Phase 5):
 

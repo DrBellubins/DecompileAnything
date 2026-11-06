@@ -19,7 +19,7 @@ DecompileAnything is a set of tools that let LLMs decompile binaries into human-
 | MS-0 | read a PE target: sections, imports, debug records, `find`/`show`/`detect` | **implemented** (`python Tests/tools/check_pe_target.py`) |
 | MS-1 | `.pdata`: the file's own function table, kept, preferred, disagreement reported | **implemented** (same script) |
 | MS-2 | `cl` on the machine, `decomp check` identification, PE variants in the benchmark | **done** - toolset v141 14.12 + Windows SDK 10.0.19041: `cl`/`link` build and run a PE under Wine, and the benchmark itself builds with `cl` at `/Od` and `/O2` with an 89/89 answer key (`python Tests/tools/check_msvc_toolchain.py`, exit 0) |
-| MS-3 | COFF candidates: `try` on a PE target, candidate extents from the object | **implemented** - the untouched source through `decomp try` at `cl /Od` is **100.00 % mean, 89 of 89 past the gate** (54 byte-identical: a `.o` keeps placeholder displacements, so bytes are reported, not required), and the extent the tool derives from the `.obj` equals the compiler's for **all 89 units**. Acceptance is `python Tests/tools/check_coff_candidate.py`; the one unit that did not pass was MSVC RTTI, and MS-5 closed it |
+| MS-3 | COFF candidates: `try` on a PE target, candidate extents from the object | **implemented** - the untouched source through `decomp try` at `cl /Od` is **100.00 % mean, 89 of 89 past the gate** (54 with literally identical bytes - a `.o` keeps placeholder displacements - and **89 of 89 `exact`** once the fields the link writes are zeroed, see *How a candidate is judged*), and the extent the tool derives from the `.obj` equals the compiler's for **all 89 units**. Acceptance is `python Tests/tools/check_coff_candidate.py`; the one unit that did not pass was MSVC RTTI, and MS-5 closed it |
 | MS-4 | what an MSVC build *is*: toolset (Rich + linker version, read twice and compared), `/Od` vs `/O1|/O2`, `/GL`, `/std:`, `/MT`, C++/CRT from names | **implemented** - the Rich product ids are named and the toolset is read from link.exe's own record (whose build number *is* its version: measured against the installed toolchain) and cross-checked against the optional header; the per-front-end compiland counts confirm `/GL` and the C/C++/asm mix; language comes from decorated names and the CRT family from the imports (`/MT` = no CRT DLL); `build_flags` carries `/Od|/O1|/O2`, `/MT|/MD`, `/GS-`, `/GL`+`/LTCG`, `/std:`; an MSVC set of shape features separates `/Od` from `/O1|/O2` (reported as a class - no shape tells those two apart) and the shape sample now walks `.pdata` units. Acceptance is `python Tests/tools/check_msvc_detect.py` |
 | MS-5 | MSVC C++ structure (`.?AV…` RTTI, `RTTICompleteObjectLocator`) | **implemented** - a second model next to Phase 4's, chosen from the target's build note: the `.?AVX@@` string → type descriptor → complete object locator → class hierarchy descriptor → base-class descriptors → vftable (whose slot before the methods holds the locator), in both RVA- and absolute-address form. Names, bases, 3-slot vftables, constructors/destructors (incl. the deleting form) and member offsets, at `/Od` and on a shipped 32-bit game (769 classes); one descriptor gets the same name on both sides of the loop, which is what makes `check_coff_candidate.py` gate 89/89. Acceptance is `python Tests/tools/check_msvc_structures.py` |
 
@@ -283,13 +283,32 @@ gate: semantic ([gate] require in Tests/project.toml)
 build: ok (0.19s) -> cache/ghproj/candidates/candidate_math.o
 
 tier exact  PASS   (gate: semantic)
-  the candidate assembles to the original bytes
+  the candidate assembles to the original bytes, with the fields the link writes left out
   match 100.00% - progress only, the tier is what gates (the old threshold was 97%)
   FUN_00102834 @ 0x102834  vs  CMathTests::AbsDiff (.text)
   bytes 33 vs 33 (+0)  IDENTICAL
   instructions 13 vs 13 (+0)  categories: opcode 0, operand 0, register 0, relocation 0, missing 0, extra 0
   with registers folded: identical
+  the candidate assembles to exactly the original bytes
   no differing instructions
+```
+
+The same thing at `-O2`, where the bytes are *not* equal outright: five of the fields in this
+body are displacements the link fills in (a call, a cold-partition jump, three pc-relative
+addresses), so 20 bytes are the link's choice and the other 334 are the candidate's.
+
+```
+$ .venv/bin/decomp try 0x103950 Tests/TestBinary/TestFunctions/math.cpp --fn Crc32OfBuffer \
+      -C Tests/project.toml --bin Tests/build/gcc-o2/da_tests.stripped
+tier exact  PASS   (gate: semantic)
+  the candidate assembles to the original bytes, with the fields the link writes left out
+  match 100.00% - progress only, the tier is what gates (the old threshold was 97%)
+  FUN_00103950 @ 0x103950  vs  CMathTests::Crc32OfBuffer (.text)
+  bytes 354 vs 354 (+0)
+  bytes with the fields the link writes zeroed on both sides (5 in the original, 5 in the candidate: calls, jumps out of the body, pc-relative and absolute addresses): IDENTICAL
+  instructions 89 vs 89 (+0)  categories: opcode 0, operand 0, register 0, relocation 0, missing 0, extra 0
+  with registers folded: identical
+  the candidate assembles to the original bytes: every byte but the 20 the link fills in matches
 ```
 
 What makes the two sides comparable (`extract.py`, `normalize.py`, `diff.py`):
@@ -324,7 +343,13 @@ A unit counts as done when it reaches the project's **gate tier** - `[gate] requ
 `--gate`. The tiers are properties of the verdict, lowest first: **structural** = same length,
 same operations, same targets (`opcode`, `relocation`, `missing`, `extra` all zero); **semantic**
 = that plus every operand right, plus the two streams identical once register names are folded;
-**exact** = that plus the bytes equal. `match` stays in the report and in `--json` as progress
+**exact** = that plus the bytes equal, with the fields the link writes zeroed on both sides: a
+candidate's come from its own relocation table, the original's from the address-carrying operands
+of its instructions (a call, a jump out of the body, a pc-relative or absolute address), and
+everything else - opcodes, immediates, displacements inside the body, the length of each encoding -
+is compared. On the benchmark's own untouched source that claim holds for 89 of 89 units at -O0, 86
+at -O2 and 77 at -O0 -m32; the units short of it are the operand differences listed in
+`Tests/README.md`, and `python Tests/tools/check_masked_bytes.py` is the acceptance. `match` stays in the report and in `--json` as progress
 only: 97 % of a wrong function is a wrong function, and the ratio alone can be met by code that
 does something else (Design-Plan, Key Design Decisions). The report leads with
 `tier semantic PASS (gate: semantic)` and, when it fails, says which tier was reached, which was
@@ -338,6 +363,8 @@ reported as `missing`/`extra` with their addresses. `diff.accounting()` states t
 side, one report entry per counted line, `size delta == extra - missing`), and
 `python Tests/tools/check_diff_accounting.py` asserts it over the whole benchmark. `--json`, which
 carries `tier`, `require`, `gaps_to_gate` and `gaps_to_next_tier` next to the counts, plus
+`bytes_equal`, `bytes_equal_masked`, `masked_byte_fields`, `masked_offsets` and
+`masked_first_difference`, plus
 `--max-diff`, `--max-symbols`, `--size`, `--include`, `--fn` and
 `--register-abstract` (accepted, ignored) are documented in `decomp try --help`.
 

@@ -15,8 +15,12 @@ ratio. The ratio is a progress indicator: 97 % of a wrong function is still a wr
               (`opcode == relocation == missing == extra == 0`)
   semantic    structural, no operand is wrong, and the streams are identical once every register
               name is folded to the order it first appears in
-  exact       semantic, and the bytes are equal (the masked byte comparison of Phase 3 is what
-              makes this reachable; today the byte test is unmasked)
+  exact       semantic, and the bytes are equal once the fields the link chooses are zeroed on
+              both sides (Phase 3). What is masked is exactly the bytes a relocation in the
+              candidate covers, plus the operands that reach an address on the original side:
+              calls, jumps out of the body, pc-relative and absolute addresses. Everything else -
+              opcodes, immediates, displacements inside the body, the length of each encoding - is
+              compared.
 
 The register-abstract comparison runs on every `try`, not only with `--register-abstract`. That
 is what separates a register-allocation difference (`movl %eax,%ecx` vs `movl %r9d,%r8d`, not
@@ -42,7 +46,7 @@ import difflib
 from dataclasses import dataclass, field
 
 from .normalize import (Ref, REGISTER_ALIASES, Token, abstract_registers, canonical_name,
-	mask_registers, register_names)
+	mask_body, mask_registers, register_names)
 
 CATEGORIES = ("opcode", "operand", "register", "relocation", "missing", "extra")
 # The categories that mean "this is not the same computation". None of them may be non-zero for
@@ -61,7 +65,8 @@ TIER_MEANING = {
 	"structural": "same length, same operations, same targets - the operands are not proven right",
 	"semantic": "same operations, operands and targets, in whatever registers - the bytes are not "
 		"proven equal",
-	"exact": "the candidate assembles to the original bytes",
+	"exact": "the candidate assembles to the original bytes, with the fields the link writes left "
+		"out",
 }
 
 
@@ -89,6 +94,14 @@ class Verdict:
 	hidden_relocations: int = 0
 	identical: bool = False
 	bytes_equal: bool = False
+	# the same comparison with the fields the link chooses zeroed on both sides (Phase 3). This is
+	# what gates `exact`: two bodies that reach the same things in the same order differ in those
+	# bytes whatever the source said, because the link wrote them.
+	bytes_equal_masked: bool = False
+	bytes_comparable: bool = False   # both bodies are known, so the byte test can be run at all
+	bytes_masked: bool = False       # False = no field lists were given, so the test is unmasked
+	masked_byte_fields: dict = field(default_factory=dict)
+	masked_first_difference: dict = field(default_factory=dict)
 	# the same comparison over streams with every register name folded to first-appearance
 	# order, kept so "allocation only" can be told from a different operand pairing
 	abstract_categories: dict[str, int] = field(default_factory=lambda: {n: 0 for n in CATEGORIES})
@@ -122,7 +135,27 @@ class Verdict:
 
 	def gaps(self, want: str) -> list[str]:
 		"""What stands between this verdict and tier `want`, in the order to fix it."""
-		return tier_gaps(self.categories, self.abstract_categories, self.bytes_equal, want)
+		return tier_gaps(self.categories, self.abstract_categories, self.bytes_equal_masked, want,
+			self.byte_gap)
+
+	@property
+	def byte_gap(self) -> str:
+		"""Why the bytes are not proven equal, in the form the loop can act on."""
+		if not self.bytes_comparable:
+			return "the bytes cannot be compared (one of the two bodies is missing)"
+		if not self.bytes_masked:
+			return ("the bytes are not equal, and no relocation fields were given, so this byte "
+				"test is unmasked")
+		if not (self.masked_byte_fields.get("original") or self.masked_byte_fields.get(
+				"candidate")):
+			return ("no field of either body belongs to the link, so every byte of it is "
+				"compared")
+		first = self.masked_first_difference or {}
+		if first.get("offset") is None:
+			return "the two bodies are different lengths (%d vs %d bytes)" % (self.original_bytes,
+				self.candidate_bytes)
+		return "at byte offset 0x%x the encodings differ (%s / %s)" % (int(first["offset"]),
+			first.get("original") or "nothing there", first.get("candidate") or "nothing there")
 
 	@property
 	def size_delta_instructions(self) -> int:
@@ -278,7 +311,11 @@ def _difference(a, b) -> tuple[str, str]:
 
 
 def tier_for(categories: dict, abstract: dict, bytes_equal: bool) -> str:
-	"""The tier a pair of comparisons reaches - see the module docstring."""
+	"""The tier a pair of comparisons reaches - see the module docstring.
+
+	`bytes_equal` is the *masked* byte comparison (`compare_bytes`): the raw one only fires for a
+	body that references nothing, which is most of why `exact` was out of reach before Phase 3.
+	"""
 	if any(categories[name] for name in SHAPE):
 		return "none"
 	if categories["operand"] or any(abstract.values()):
@@ -290,7 +327,49 @@ def _say(categories: dict, names: tuple[str, ...] = CATEGORIES) -> str:
 	return ", ".join("%s %d" % (name, categories[name]) for name in names if categories[name])
 
 
-def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str) -> list[str]:
+def compare_bytes(original: bytes, original_fields, candidate: bytes, candidate_fields,
+		original_at: dict | None = None, candidate_at: dict | None = None) -> dict:
+	"""Compare two bodies with the fields the link chose zeroed on each side.
+
+	Each side's fields come from its own evidence: for a candidate `.o`, its relocation table (the
+	width from the relocation type); for the original, the address-carrying operands of its own
+	decoded instructions (`normalize.address_fields`), including the calls that need no relocation
+	in an object file but whose displacement the link fills in anyway. A field is only zeroed on
+	the side that has it, which makes this stricter than one shared list, never looser: if one
+	side reaches something the other does not, the bytes there are compared against zero and the
+	report says where.
+	"""
+	original_fields, candidate_fields = (None if original_fields is None else list(original_fields),
+		None if candidate_fields is None else list(candidate_fields))
+	# `None` means the caller has no field lists at all, so the test runs on every byte; an empty
+	# list means it looked and found none, which is a different thing to say
+	given = original_fields is not None or candidate_fields is not None
+	original_fields, candidate_fields = original_fields or [], candidate_fields or []
+	left = mask_body(original, original_fields) if given else bytes(original or b"")
+	right = mask_body(candidate, candidate_fields) if given else bytes(candidate or b"")
+
+	def width_of(items):
+		return sum(int(width) for _offset, width in items)
+
+	out = {
+		"given": given,
+		"fields": {"original": len(original_fields), "candidate": len(candidate_fields),
+			"original_bytes": width_of(original_fields), "candidate_bytes": width_of(candidate_fields)},
+		"equal": bool(original) and left == right,
+		"first": {},
+	}
+	if out["equal"]:
+		return out
+	common = min(len(left), len(right))
+	offset = next((index for index in range(common) if left[index] != right[index]), common)
+	out["first"] = {"offset": offset, "original_length": len(left), "candidate_length": len(right),
+		"original": (original_at or {}).get(offset, ""),
+		"candidate": (candidate_at or {}).get(offset, "")}
+	return out
+
+
+def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str,
+		byte_gap: str = "") -> list[str]:
 	"""What stands between a verdict and tier `want`, in the order the loop should fix it.
 
 	Shape first (an operation, a target, or a whole line is wrong), then operands, then the
@@ -309,7 +388,7 @@ def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str) ->
 		if any(abstract.values()):
 			gaps.append("the stream still differs once registers are renamed (%s)" % _say(abstract))
 	if tier_rank(want) >= tier_rank("exact") and not bytes_equal:
-		gaps.append("the bytes are not equal (the byte test is unmasked until Phase 3)")
+		gaps.append(byte_gap or "the bytes are not equal")
 	return gaps
 
 
@@ -396,13 +475,20 @@ def _fold_registers(tokens: list, side: str, vocabulary) -> list[Token]:
 
 def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 		original_bytes: bytes = b"", candidate_bytes: bytes = b"",
-		require: str = GATE_DEFAULT) -> Verdict:
+		original_fields=None, candidate_fields=None, original_at: dict | None = None,
+		candidate_at: dict | None = None, require: str = GATE_DEFAULT) -> Verdict:
 	"""Score a candidate against the original and name the tier it reaches.
 
 	`require` is the gate from the target's `[gate]` table; `verdict.passed` is "this reaches
 	it". The tokens have to be the un-folded ones: the register-abstract comparison happens
 	here, on every call, so a verdict always knows whether its register differences are
 	allocation or a different operand pairing.
+
+	`original_fields` / `candidate_fields` are the (offset, width) pairs of each body the link
+	writes (`normalize.address_fields`, `extract.CandidateObject.relocation_fields`), and
+	`original_at` / `candidate_at` map a body offset to the instruction it falls in, so a byte
+	difference can be named. Leave them `None` and the byte test runs unmasked, which is what the
+	synthetic callers do; pass empty lists to say "looked, there are none in this body".
 	"""
 	strict = _align(original, candidate)
 	abstract = _align(_fold_registers(original, "original", vocabulary),
@@ -440,7 +526,17 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 	)
 	verdict.matched, verdict.replaced, verdict.hidden_relocations = (
 		strict["matched"], strict["replaced"], strict["hidden"])
-	verdict.tier = tier_for(categories, abstract["categories"], verdict.bytes_equal)
+	byte_check = compare_bytes(original_bytes, original_fields, candidate_bytes, candidate_fields,
+		original_at, candidate_at)
+	verdict.bytes_comparable = bool(original_bytes) and bool(candidate_bytes)
+	verdict.bytes_masked = byte_check["given"]
+	verdict.masked_byte_fields = byte_check["fields"]
+	verdict.masked_first_difference = byte_check["first"]
+	# "the candidate assembles to the original bytes, apart from what the link wrote" is the claim
+	# `exact` makes; bytes equal outright imply it
+	verdict.bytes_equal_masked = bool(original_bytes) and (
+		verdict.bytes_equal or byte_check["equal"])
+	verdict.tier = tier_for(categories, abstract["categories"], verdict.bytes_equal_masked)
 	# Falling short of the threshold always has a categorised difference now, so the only way to
 	# fail with nothing categorised is a count that went wrong here.
 	problems = accounting_problems(verdict)
@@ -471,6 +567,21 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 	lines.append("  %s  vs  %s" % (original_name, candidate_name))
 	lines.append("  bytes %d vs %d (%+d)%s" % (verdict.original_bytes, verdict.candidate_bytes,
 		verdict.size_delta_bytes, "  IDENTICAL" if verdict.bytes_equal else ""))
+	fields = verdict.masked_byte_fields
+	if verdict.bytes_comparable and (not verdict.bytes_equal or fields.get("original")
+			or fields.get("candidate")):
+		if not verdict.bytes_masked:
+			lines.append("  bytes with the link-chosen fields zeroed: UNMASKED (no relocation "
+				"fields were given, so every byte is compared)")
+		elif not (fields.get("original") or fields.get("candidate")):
+			lines.append("  no field of either body belongs to the link: every byte of it was "
+				"compared")
+		else:
+			lines.append("  bytes with the fields the link writes zeroed on both sides (%d in the "
+				"original, %d in the candidate: calls, jumps out of the body, pc-relative and "
+				"absolute addresses): %s" % (fields.get("original", 0), fields.get("candidate", 0),
+					"IDENTICAL" if verdict.bytes_equal_masked else
+					"differ - " + verdict.byte_gap))
 	lines.append("  instructions %d vs %d (%+d)  categories: %s" % (
 		verdict.original_instructions, verdict.candidate_instructions, verdict.size_delta_instructions,
 		", ".join("%s %d" % (name, verdict.categories[name]) for name in CATEGORIES)))
@@ -486,6 +597,10 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 		else _say(verdict.abstract_categories)))
 	if verdict.bytes_equal and verdict.match_percent == 100.0:
 		lines.append("  the candidate assembles to exactly the original bytes")
+	elif verdict.bytes_equal_masked and verdict.match_percent == 100.0:
+		lines.append("  the candidate assembles to the original bytes: every byte but the %d the "
+			"link fills in matches"
+			% (verdict.masked_byte_fields.get("candidate_bytes", 0)))
 	if with_symbols and verdict.symbols:
 		bad = [item for item in verdict.symbols if not item["ok"]]
 		shown = bad[:max_symbols] + [item for item in verdict.symbols if item["ok"]][:
