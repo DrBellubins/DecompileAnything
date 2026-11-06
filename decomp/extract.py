@@ -14,6 +14,7 @@ which is exactly the other half of "both sides compare symbolically".
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import struct
 from dataclasses import dataclass, field
@@ -74,6 +75,31 @@ def relocation_width(kind) -> int:
 		if key in table:
 			return table[key]
 	return 0
+
+
+def pc_relative(kind) -> bool:
+	"""Does this relocation type resolve against the address *after* its own field?"""
+	name = str(kind or "").upper()
+	return "PC" in name or "PREL" in name or "PLT" in name
+
+
+def pc_bias(kind) -> int:
+	"""How far past its addend a PC-relative relocation actually points.
+
+	The assembler writes the addend as `target - width` (`R_X86_64_PC32 .rodata+0x280` where the
+	constant is at +0x284) because the field is resolved against the address after it, so the byte
+	the instruction reads is `addend + width`. A COFF relocation has no addend - the number in the
+	bytes is already relative to the field - and `REL32` does not match `pc_relative`.
+	"""
+	if not pc_relative(kind):
+		return 0
+	width = relocation_width(kind)
+	if width:
+		return width
+	# A PC-relative type the width tables do not know: the number in its own name is its field
+	# size (`R_AARCH64_PREL32`), which is what the assembler subtracted.
+	match = re.search(r"(\d+)$", str(kind or ""))
+	return int(match.group(1)) // 8 if match else 0
 
 
 # What `cl` fills the space between functions with, and what a linker pads an aligned section
@@ -246,6 +272,19 @@ def _read_encoded(data: bytes, position: int, encoding: int, *, at: int, pointer
 
 # How many bytes of a referenced object are compared when its size is not recorded.
 _PROBE = 16
+# How far to read for something that looks like a string literal: the comparison reads the
+# literal plus its terminator, so a 20-character string needs more than a probe window.
+_STRING_PROBE = 256
+
+
+def _looks_like_string(symbol_name: str, section: str) -> bool:
+	"""Does this object sit where compilers put string literals?
+
+	GCC and Clang: `.rodata.str1.1`, `.str1`, and the `.data.rel.ro`-style COMDATs named after a
+	`.LCn` label are not. MSVC: string literals are decorated `??_C@_0A@…`, whatever section they
+	land in. Used only to decide how far to read, never to claim what the bytes are.
+	"""
+	return ".str" in (section or "") or str(symbol_name or "").startswith("??_C@")
 _WINDOW = 64
 
 
@@ -877,7 +916,15 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		elif to_address is not None:
 			declared, _value = sizes.get(to_address, (0, ""))
 			ref.size = declared or None
-			ref.content = image.read(to_address, declared or _PROBE)
+			if declared:
+				# The analysis recognised a string here. Its length is the evidence that makes a
+				# literal comparable at all: it says how many bytes to read, and one past them is
+				# read as well, so a candidate whose literal is one character longer or shorter does
+				# not compare equal over the shared prefix (Phase 4).
+				ref.string = int(declared)
+				ref.content = image.read(to_address, int(declared) + 1)
+			else:
+				ref.content = image.read(to_address, _PROBE)
 		seen[key] = ref
 		used.append(ref)
 		return ref
@@ -888,6 +935,15 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 			return {}
 		chosen: dict[int, Ref] = {}
 		slots = list(instruction.slots)
+
+		def claim(slot, ref: Ref) -> Ref:
+			# how wide this access is, carried onto the reference: for a constant in a merged
+			# `.rodata.cst` pool that width is the only thing saying the two sides read the same
+			# object, so the bytes it reads have to be compared (Phase 4)
+			if slot.width and not ref.width:
+				ref.width = int(slot.width)
+			return ref
+
 		# exact first: the operand encodes the address this reference points at
 		for slot in slots:
 			if slot.value is None:
@@ -898,7 +954,7 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 				and int(item["to_address"]) == int(slot.value)),
 				key=lambda item: -ranked.get(item["to_kind"] or "address", 0))
 			if match:
-				chosen[slot.operand] = build(match[0])
+				chosen[slot.operand] = claim(slot, build(match[0]))
 		# then anything left over, only when the pairing is unambiguous
 		left = [item for item in here if item["to_address"] is not None and not any(
 			int(item["to_address"]) == slot.value for slot in slots if slot.value is not None)]
@@ -906,7 +962,7 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		if not free:
 			free = [slot for slot in slots if slot.operand not in chosen]
 		if left and len(left) == 1 and len(free) == 1:
-			chosen[free[0].operand] = build(left[0])
+			chosen[free[0].operand] = claim(free[0], build(left[0]))
 		return chosen
 
 	return bind, used
@@ -1345,11 +1401,15 @@ class CandidateObject:
 		seen: dict[str, Ref] = {}
 
 		def reference(offset: int, kind: str, symbol_name: str, addend: int,
-			symbol_section: str = "") -> Ref:
+			symbol_section: str = "", width: int = 0) -> Ref:
 			key = "%s:%s:%d" % (offset, symbol_name, addend)
 			if key in seen:
-				return seen[key]
-			target = self._target(symbol_name, addend, symbol_section)
+				existing = seen[key]
+				if width and not existing.width:
+					existing.width = int(width)
+				return existing
+			target = self._target(symbol_name, addend + (0 if self._coff else pc_bias(kind)),
+				symbol_section)
 			# a relocation against a section symbol names no object: the object defined at the
 			# addend's offset does, and `_target` looked it up
 			named = target.get("name") or symbol_name or target["display"]
@@ -1359,7 +1419,8 @@ class CandidateObject:
 				name=clean_symbol(named) if named else (
 					"%s+0x%x" % (target["section"], where) if where is not None else ""),
 				address=where, section=target["section"], size=target["size"],
-				content=target["content"])
+				content=target["content"], width=int(width) or None,
+				string=target.get("string") or None)
 			seen[key] = ref
 			used.append(ref)
 			return ref
@@ -1382,7 +1443,8 @@ class CandidateObject:
 						continue          # with no relocation to fix it up, an immediate is a constant
 					named = self._in_section(function, slot.value) if slot.value is not None else ""
 					if named:
-						chosen[slot.operand] = reference(slot.value, "in-section", named, 0)
+						chosen[slot.operand] = reference(slot.value, "in-section", named, 0,
+							width=slot.width)
 				return chosen
 			# An immediate is the least likely thing a relocation belongs to: pair the address
 			# operands first, and fall back to an immediate only when a relocation is left over
@@ -1394,20 +1456,20 @@ class CandidateObject:
 			if len(address_slots) == len(here):
 				# one relocation per remaining address operand, in the same order (usual case)
 				for slot, item in zip(address_slots, here):
-					chosen[slot.operand] = reference(*item)
+					chosen[slot.operand] = reference(*item, width=slot.width)
 					taken.append(item)
 			elif len(address_slots) == 1:
-				chosen[address_slots[0].operand] = reference(*here[0])
+				chosen[address_slots[0].operand] = reference(*here[0], width=address_slots[0].width)
 				taken.append(here[0])
 			else:
 				for slot in address_slots:
 					near = min(here, key=lambda item: abs(
 						item[0] - (instruction.address + slot.enc_offset)))
-					chosen[slot.operand] = reference(*near)
+					chosen[slot.operand] = reference(*near, width=slot.width)
 					taken.append(near)
 			left = [item for item in here if item not in taken]
 			if len(left) == 1 and len(immediates) == 1 and immediates[0].operand not in chosen:
-				chosen[immediates[0].operand] = reference(*left[0])
+				chosen[immediates[0].operand] = reference(*left[0], width=immediates[0].width)
 			return chosen
 
 		return bind, used
@@ -1476,7 +1538,7 @@ class CandidateObject:
 			# the object defined at that offset is what the instruction reads, so it is the name
 			# to compare - `.data.rel.ro+0x18` is a section, and the other side has no such thing
 			return {"kind": "data", "address": addend, "section": section_named, "size": None,
-				"content": self._read(section_named, addend, _PROBE), "display": display,
+				"content": self._read_data(section_named, addend, 0, display), "display": display,
 				"name": display,
 				# in an object file every section is addressed from 0, so an offset alone names
 				# nothing: `.rodata+0x18` and `.rodata.cst4+0x18` are different objects
@@ -1502,7 +1564,8 @@ class CandidateObject:
 		own = self._names_section(symbol_name, section)
 		where = value + addend
 		return {"kind": "data", "address": (None if own else where), "section": section,
-			"size": size or None, "content": self._read(section, where, size or _PROBE),
+			"size": size or None,
+			"content": self._read_data(section, where, size or 0, symbol_name),
 			"display": symbol_name,
 			"identity": ("symbol:%s" % symbol_name) if own else "%s+0x%x" % (section, where)}
 
@@ -1532,10 +1595,40 @@ class CandidateObject:
 				best = (value, symbol.mangled)
 		return best[1] if best else ""
 
+	def _relocated(self, section: str, offset: int, length: int) -> bool:
+		"""Does a relocation of this section rewrite a byte of this window?"""
+		start, stop = int(offset), int(offset) + max(int(length), 1)
+		for item in self._relocs.get(section, []):
+			where = int(item[0])
+			if where < stop and where + (relocation_width(item[1]) or 4) > start:
+				return True
+		return False
+
+	def _read_data(self, section: str, where: int, size: int, symbol_name: str = "") -> bytes | None:
+		"""The bytes of a data object, read far enough for the comparison to use.
+
+		A literal `size`-wide read is not enough for a string: the comparison reads a literal plus
+		its terminator (Phase 4), so for something that sits where string literals live the read goes
+		on to the NUL.
+		"""
+		data = self._read(section, where, max(int(size or 0), _PROBE))
+		if not _looks_like_string(symbol_name, section):
+			return data
+		wider = self._read(section, where, _STRING_PROBE)
+		if not wider:
+			return data
+		end = wider.find(b"\0")
+		return wider[:end + 1] if end >= 0 else wider
+
 	def _read(self, section: str, offset: int, length: int) -> bytes | None:
-		# a section that carries relocations has placeholders where the link will write
-		# values, so its bytes are not comparable with a linked image's
-		if section in self._writable or section in self._relocs or not section.startswith(_COMPARABLE):
+		# A section that carries relocations has placeholders where the link will write values, so
+		# the bytes *under one of them* are not comparable with a linked image's. It used to be the
+		# whole section that was refused on the strength of one record anywhere in it, which threw
+		# away every constant in a `.rodata.cst*` pool that shares its section with a pointer: what
+		# sits away from the relocations is final at assembly time (Phase 4).
+		if section in self._writable or not section.startswith(_COMPARABLE):
+			return None
+		if self._relocated(section, offset, length):
 			return None
 		data = self._sections.get(section)
 		if data is None:

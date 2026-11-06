@@ -246,6 +246,76 @@ def canonical_name(name: str) -> str:
 
 
 # --------------------------------------------------------------------------------------
+# how wide an access is, read off the instruction that makes it
+#
+# The size a memory operand is read at is the last piece of evidence available for a constant in
+# a merged `.rodata.cst*` pool: the pool's extent is the linker's arrangement of several values,
+# so two windows out of it are not the same object twice - but the four bytes `movss SYM(%rip)`
+# reads *are* that constant, and so is the eight of a `movsd`. Same for a jump-table slot
+# (`mov 0x0(,%rax,4),%eax` reads four bytes) and for a narrow field (`movzbl` reads one).
+
+# How wide one access is, from the mnemonic where the size is written in it.
+_SUFFIX_WIDTH = {"b": 1, "w": 2, "l": 4, "q": 8}
+
+
+def register_width(name: str) -> int:
+	"""`%rax`->8, `%eax`->4, `%ax`->2, `%al`->1, `%xmm0`->16. A bare `mov` says its size only
+	in the register it moves to."""
+	name = (name or "").lower()
+	if name.startswith(("xmm", "zmm")):
+		return 16
+	if name.startswith("ymm"):
+		return 32
+	if name.startswith("st"):
+		return 10
+	if re.fullmatch(r"r[abcd]x|r\d{1,2}[wbl]?|r(?:[sd][ip]|[b-s][p])l?", name):
+		return 8
+	if re.fullmatch(r"e[abcd][sd]x|e[ds][ip]|ebp|esp", name):
+		return 4
+	if re.fullmatch(r"[a-d][xl]p?|[ds]i|[b-s]p", name):
+		return 2
+	if re.fullmatch(r"[a-d]l|ah|bh|ch|dh|[sd]il|[b-s]pl", name):
+		return 1
+	return 0
+
+
+def access_width(mnemonic: str, operands, handle) -> int:
+	"""How many bytes this instruction touches, 0 when it does not say.
+
+	`structures` uses this to lay out a class's fields; the tokeniser records it on every address
+	operand so `diff` can compare the bytes an access actually reads (Phase 4).
+	"""
+	suffix = ""
+	for key in sorted(_SUFFIX_WIDTH, key=lambda k: -len(k)):
+		if mnemonic.endswith(key) and mnemonic != key:
+			suffix = key
+			break
+	if mnemonic.startswith(("movs", "movz")):
+		pair = [c for c in mnemonic[4:] if c in _SUFFIX_WIDTH]
+		if pair:
+			return min(_SUFFIX_WIDTH[c] for c in pair)
+	if suffix:
+		return _SUFFIX_WIDTH[suffix]
+	if mnemonic.endswith("ss"):
+		return 4
+	if mnemonic.endswith("sd"):
+		return 8
+	if mnemonic.startswith(("movaps", "movups", "movapd", "movupd")):
+		return 16
+	if mnemonic.startswith(("fld", "fst")):
+		# flds/fsts are the 32-bit x87 spellings of a float, fldl/fstl of a double
+		return 4 if mnemonic.endswith("s") else 8 if mnemonic.endswith("l") else 8
+	# a bare `mov`/`add`/... : the size is in the register on the other side
+	from capstone import CS_OP_REG
+	for operand in operands:
+		if operand.type == CS_OP_REG:
+			width = register_width(handle.reg_name(operand.reg))
+			if width:
+				return width
+	return 0
+
+
+# --------------------------------------------------------------------------------------
 # decoded instructions, symbol references, tokens
 
 
@@ -263,6 +333,15 @@ class Ref:
 	section: str = ""
 	size: int | None = None      # declared size in bytes when known
 	content: bytes | None = None  # the bytes there, when it is meaningful to compare them
+	# How wide the access this reference came out of is (`access_width`, from the mnemonic or the
+	# register it writes). For a constant in a `.rodata.cst` pool this is the only evidence that
+	# two sides read the same thing: the pool's extent is the linker's arrangement of several
+	# constants, but the four bytes *this* instruction reads are the constant (Phase 4).
+	width: int | None = None
+	# A string this side knows the length of, in bytes without the terminator: on the original
+	# side, the cached string record. It is what makes a string literal comparable at all - the
+	# length says how many bytes to read, and the candidate side reads to its NUL (Phase 4).
+	string: int | None = None
 
 	@property
 	def named(self) -> bool:
@@ -282,6 +361,7 @@ class Slot:
 	kind: str                    # call | branch | imm | rip | abs
 	value: int | None            # the address it encodes, when it can be computed
 	enc_offset: int              # where the encoded field sits (for relocation matching)
+	width: int = 0               # what the instruction touches there, 0 when it does not say
 
 
 @dataclass
@@ -473,16 +553,20 @@ def _slots(handle: Cs, instruction) -> list[Slot]:
 	mnemonic = instruction.mnemonic
 	control = bool(_BRANCH.match(mnemonic))
 	is_call = mnemonic.startswith("call") or mnemonic.startswith("jmp")
+	# How wide this instruction's access is, recorded on every slot so whichever side builds a `Ref`
+	# out of it can carry the width forward: the width of the read is what makes a pooled constant
+	# comparable (Phase 4).
+	touching = access_width(mnemonic, instruction.operands, handle)
 	for index, operand in enumerate(instruction.operands):
 		if operand.type == CS_OP_MEM:
 			mem = operand.mem
 			if mem.base == _RIP:
 				# capstone prints the raw displacement; the address it means is here:
 				value = instruction.address + instruction.size + mem.disp
-				slots.append(Slot(index, "rip", value, instruction.size - 4))
+				slots.append(Slot(index, "rip", value, instruction.size - 4, touching))
 			elif mem.base == 0 and (mem.index == 0 or mem.disp):
 				# absolute addressing (32-bit code) and `*table(, %rax, 4)` jump tables
-				slots.append(Slot(index, "abs", mem.disp, instruction.size - 4))
+				slots.append(Slot(index, "abs", mem.disp, instruction.size - 4, touching))
 		elif operand.type == CS_OP_IMM and control:
 			kind = "call" if is_call else "branch"
 			slots.append(Slot(index, kind, operand.imm, 1))

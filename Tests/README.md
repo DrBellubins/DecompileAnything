@@ -58,6 +58,7 @@ To check that the scorer's own counts add up (Docs/byte-cleanup-plan.md, Phase 1
 .venv/bin/python Tests/tools/check_diff_accounting.py
 .venv/bin/python Tests/tools/check_gate_tiers.py
 .venv/bin/python Tests/tools/check_masked_bytes.py
+.venv/bin/python Tests/tools/check_phase4_evidence.py
 ```
 
 A `replace` region whose two sides are different lengths used to be zipped, so the leftover
@@ -106,6 +107,24 @@ has is not hidden, and that a cold partition is masked at its offset in the conc
 Measured on the untouched source, identical bytes without masking versus with it: **-O0 54 → 89 of
 89, -O2 55 → 86, -m32 58 → 77** - every unit that reaches the gate also proves its bytes, and the
 units below it are exactly the `KNOWN_GAPS` above.
+
+Phase 4 asks the other question about a reference: *what is it, and how wide*. A `float` pool entry
+and the `double` next to it used to be interchangeable, because the tool only asked whether both
+sides could see a reference at all. The access width now comes from the instruction (`movss` reads 4
+bytes, `movzbl` 1), the bytes a reference names are compared at that width, a string is compared at
+the length the original cached plus its terminator against a candidate read that stops at its own
+NUL, and a match none of that can prove is counted as **`unverified`**, which caps the tier at
+`structural` unless the project says `[gate] waive = "unverified"`. Two things had to be true first:
+a RIP-relative relocation names the object at `addend + field width`, not at the addend (the
+candidate had been reading four bytes past every RIP-relative access), and a candidate section is
+refused only where a relocated *window* sits, not wholesale - every constant pool carries
+relocations. Measured afterwards on the untouched source, units reaching the gate: **-O0 89 → 87,
+-O2 86 → 84, -m32 77 → 63**. The first two rows' losses are MATH-13 and STRUCT-21, whose
+references are `.bss` data neither side can name; the m32 losses are the same rule applied to PLT
+thunks whose import the stripped binary does not name. What it bought: 351 float references now
+carry `bytes` evidence, 353 strings are compared as strings, and `check_phase4_evidence.py` proves
+the point - MATH-20's `360.0f`→`359.0f` and STR-15's `x%.1f`→`x%.2f` both fail the gate, naming
+the bytes and the instruction they are read at.
 
 To check the `-O2` work itself (Phase 5):
 

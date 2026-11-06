@@ -152,6 +152,53 @@ same cause as the `decomp status` crash recorded on 2026-11-05). Such a director
 
 **Acceptance:** changing one filter coefficient from `0.7071f` to `0.7072f` fails the gate, as does a one-character string change. `unverified` is reported in the output.
 
+### Done 2026-11-06 — the plan did not know three things
+
+**A PC-relative relocation does not point at the operand.** In a candidate's `.o`, a relocation
+against a section symbol carries an addend measured from the *end of the instruction's field* (the
+negative addend Ghidra prints), not the address: `R_X86_64_PC32` to `.LC0` names the object at
+`addend + 4`. The candidate had been resolving every RIP-relative access four bytes past what the
+instruction reads, and the pool comparisons that survived were surviving by accident, because both
+sides were anchored the same wrong way. `extract.pc_bias` fixes it — Phase 4's evidence is only
+meaningful on top of a read that names the right bytes.
+
+**`.rodata.cst*` was not readable in practice.** `CandidateObject._read` refused any section that
+carries relocations, and every constant pool does, so `content` was empty for exactly the sections
+this phase wants. It refuses a *window* that overlaps a relocated field now — the same bytes Phase 3
+masks at the byte level — which is what gave 351 float references their `bytes` evidence.
+
+**Widths were already being derived, in the wrong module.** `structures.py` needs the same
+mnemonic→width answer for its access map, so `access_width`/`register_width` live in `normalize` and
+both call it. `width` was already a field on `Ref` and `Instruction`; what was missing was that
+nothing set it.
+
+`ref_evidence` then asks, in order: is this a string (the original's cached length plus its
+terminator, against a candidate read that stops at its own NUL) → is it an object both sides can
+describe and read (`content` at the width either side knows) → do both sides read the same number of
+bytes (`width`). A match with no rung is counted in `Verdict.unverified`, which caps the tier at
+`structural` unless the project says otherwise with `[gate] waive = "unverified"` (or `--waive` for
+one command). `strings` and `layout` have their own truth tests, so a reference whose content comes
+from a reproduced string or struct is not asked to prove itself twice.
+
+Measured (untouched source, `decomp try`'s path, gate `semantic`):
+
+| variant | past the gate before | after | what moved |
+| --- | --- | --- | --- |
+| `-O0` | 89 | 87 | MATH-13, STRUCT-21 stop at `structural`: 2 and 1 references to `.bss` data neither side can describe |
+| `-O2` | 86 | 84 | the same two |
+| `-m32` | 77 | 63 | 12 more capped the same way (PLT thunks whose import the stripped binary does not name, anonymous globals); 30 float/`cst8` references and MATH-20/MATH-21/MATH-27 now verified by bytes |
+
+Nothing in the first two rows is a candidate problem, and saying so is the point: a reference to
+`DAT_080de6e0` means nothing to either side, so it was *assumed*, and `semantic` should not rest on
+that. The honest answer is the structures work (Docs/structures-plan.md) or the link-time tables
+(Phase 5), not a waiver — and the 32-bit rows show what an unnamed `strncpy` through a thunk costs.
+Two of the m32 regressions are a real bug this comparison exposed: at i386 a candidate's read window
+in a plain `.rodata` double pool is anchored on the nearest symbol instead of the offset the
+relocation addresses (MATH-21, MATH-27).
+
+Acceptance: `Tests/tools/check_phase4_evidence.py` — MATH-20's `360.0f`→`359.0f` and STR-15's
+`x%.1f`→`x%.2f` both fail the gate, naming the bytes and the instruction they are read at.
+
 ## Phase 5: Callee and global identity through a match ledger
 *Fixes the "equal size, different helper" and first-use-order problems.*
 

@@ -59,6 +59,9 @@ SHAPE = ("opcode", "relocation", "missing", "extra")
 TIERS = ("none", "structural", "semantic", "exact")
 GATE_MODES = ("none", "percent") + TIERS
 GATE_DEFAULT = "semantic"
+# What a project may choose to wave aside rather than have it cap every unit in the target. The
+# only one today is `unverified`: references neither side can name, bound or read (Phase 4).
+WAIVABLE = ("unverified",)
 
 TIER_MEANING = {
 	"none": "the instruction stream is not the same shape or not the same operations",
@@ -105,6 +108,13 @@ class Verdict:
 	# the same comparison over streams with every register name folded to first-appearance
 	# order, kept so "allocation only" can be told from a different operand pairing
 	abstract_categories: dict[str, int] = field(default_factory=lambda: {n: 0 for n in CATEGORIES})
+	# references both sides reach but neither side can say anything about - no name either side
+	# has, no size either side knows, no bytes either side read at a width the other agrees to.
+	# Accepted as a match (the two tokens are in the same order and both sides reach something),
+	# but not *verified*: the semantic tier does not rest on those (Phase 4).
+	unverified: int = 0
+	unverified_refs: list[dict] = field(default_factory=list)
+	waive: list[str] = field(default_factory=list)
 	tier: str = "none"
 	warnings: list[str] = field(default_factory=list)
 
@@ -136,7 +146,8 @@ class Verdict:
 	def gaps(self, want: str) -> list[str]:
 		"""What stands between this verdict and tier `want`, in the order to fix it."""
 		return tier_gaps(self.categories, self.abstract_categories, self.bytes_equal_masked, want,
-			self.byte_gap)
+			byte_gap=self.byte_gap, unverified=self.unverified, waive=self.waive,
+			unverified_refs=self.unverified_refs)
 
 	@property
 	def byte_gap(self) -> str:
@@ -230,37 +241,84 @@ def accounting_problems(verdict: Verdict) -> list[str]:
 # do two symbol tokens mean the same thing?
 
 
-def refs_compatible(a: Ref, b: Ref) -> tuple[bool, str]:
-	"""Conservative: a difference is only claimed when both sides have evidence.
+def content_window(a: Ref, b: Ref) -> tuple[int, str]:
+	"""How many bytes of content both sides can offer as evidence that they reach the same thing,
+	and what makes those two windows the same object.
 
-	A name only counts against a candidate when both sides know a real name (an import, or a
-	symbol of an unstripped target); bytes only count when both sides know what object they
-	are reading (a size on both, or a name on both); a size only counts when both sides know
-	one. Anything unknown stays an accepted match, and the symbol table says so, rather than
-	being guessed at.
+	Three rungs, strongest first:
+
+	* **a string one side knows the length of.** The original side's cached string record says how
+	  many bytes the literal is; the candidate's read of those bytes runs to its NUL. Comparing the
+	  string *plus the byte after it* is what catches a one-character change (the candidate's `on`,
+	  the original's `no\0`) and one that only added or dropped a character at the end.
+	* **an object both sides can bound or name** - a size on both, or a name on both. That is the
+	  old rule.
+	* **the bytes the access itself reads** (`Ref.width`, read off the mnemonic or the register).
+	  This is the rung that makes a pooled constant comparable: a `.rodata.cst` pool is laid out per
+	  build, so its extent is not evidence about the source, but the four bytes `movss SYM0(%rip)`
+	  reads are that float. Both sides have to state a width, and the narrower one is compared.
+
+	Anything else returns 0: two windows that nothing says are the same object are not evidence,
+	and the reference is counted `unverified` rather than quietly accepted (Phase 4).
+	"""
+	left, right = a.content or b"", b.content or b""
+	if not left or not right:
+		return 0, ""
+	known = max(int(a.string or 0), int(b.string or 0))
+	if known:
+		return max(1, min(known + 1, len(left), len(right))), "the %d-byte string there" % known
+	bounded = bool(a.size and b.size)
+	if bounded or (a.named and b.named):
+		return min(len(left), len(right), int(min(a.size, b.size)) if bounded else 1 << 30), \
+			"the object both sides can %s" % ("bound" if bounded else "name")
+	width = min(int(a.width or 0), int(b.width or 0))
+	if width:
+		return min(width, len(left), len(right)), "the %d bytes this instruction reads" % width
+	return 0, ""
+
+
+def ref_evidence(a: Ref, b: Ref) -> tuple[bool, str, str]:
+	"""Do these two references mean the same thing, why if not, and *what let us tell*.
+
+	`refs_compatible` is the answer; the third value names the evidence the answer rests on - "name",
+	"bytes", "string", "size", or "" when nothing on either side said anything about the object. The
+	last one is what `unverified` counts: a reference neither side can pin down is not proof that a
+	unit is right, and a tier that rests on one is not honest (Phase 4).
 	"""
 	if a.cls != b.cls:
-		return False, "%s on the original, %s in the candidate" % (a.kind, b.kind)
-	if a.named and b.named and canonical_name(a.name) != canonical_name(b.name):
-		return False, "reaches %s, the candidate reaches %s" % (a.name, b.name)
-	# Bytes only count when both sides are reading *the same kind of thing*: an object whose
-	# extent both sides know (a size on both), or one both sides name. A `.rodata` pool that
-	# neither side can bound is laid out per build - the same constants at different offsets -
-	# so two 16-byte windows out of it are not the same object twice, and a difference there
-	# would be the linker's layout, not the candidate's.
-	bounded = bool(a.size and b.size)
-	if a.content and b.content and (bounded or (a.named and b.named)):
-		shared = min(len(a.content), len(b.content), int(min(a.size, b.size)) if bounded else 1 << 30)
-		if shared and a.content[:shared] != b.content[:shared]:
-			return False, "the bytes there differ (%s vs %s)" % (
-				a.content[:shared].hex(), b.content[:shared].hex())
+		return False, "%s on the original, %s in the candidate" % (a.kind, b.kind), ""
+	evidence = ""
+	if a.named and b.named:
+		if canonical_name(a.name) != canonical_name(b.name):
+			return False, "reaches %s, the candidate reaches %s" % (a.name, b.name), ""
+		evidence = "name"
+	# Bytes only count when both sides are reading *the same kind of thing*, which is what
+	# `content_window` decides. A `.rodata` pool that neither side can bound is laid out per build
+	# - the same constants at different offsets - so two 16-byte windows out of it are not the same
+	# object twice, unless both sides say how wide the read is.
+	shared, why = content_window(a, b)
+	if shared and a.content[:shared] != b.content[:shared]:
+		return False, "the bytes there differ (%s vs %s), %s" % (
+			a.content[:shared].hex(), b.content[:shared].hex(), why), ""
+	if shared:
+		evidence = evidence or ("string" if (a.string or b.string) else "bytes")
 	# a size is only the same kind of quantity when both sides know the object by name, or
 	# when it is a function body: a `.rodata` object that holds several merged string
 	# literals is bigger than the one string Ghidra measured inside it
 	if a.size and b.size and a.size != b.size and (
 			a.kind == "function" or (a.named and b.named)):
-		return False, "%d bytes there, %d in the candidate" % (a.size, b.size)
-	return True, ""
+		return False, "%d bytes there, %d in the candidate" % (a.size, b.size), ""
+	if not evidence and a.size and b.size and a.kind in ("function", "external"):
+		# two function bodies of the same measured size: not a name, but the "equal size,
+		# different helper" case this comparison exists for, so it counts as evidence
+		evidence = "size"
+	return True, "", evidence
+
+
+def refs_compatible(a: Ref, b: Ref) -> tuple[bool, str]:
+	"""The two-value form of `ref_evidence`, for callers that only need the verdict."""
+	ok, why, _evidence = ref_evidence(a, b)
+	return ok, why
 
 
 def _pair(vocab_side_original, vocab_side_candidate):
@@ -310,15 +368,23 @@ def _difference(a, b) -> tuple[str, str]:
 # the tiers, and what a verdict is missing
 
 
-def tier_for(categories: dict, abstract: dict, bytes_equal: bool) -> str:
+def tier_for(categories: dict, abstract: dict, bytes_equal: bool, unverified: int = 0,
+		waive: tuple[str, ...] = ()) -> str:
 	"""The tier a pair of comparisons reaches - see the module docstring.
 
 	`bytes_equal` is the *masked* byte comparison (`compare_bytes`): the raw one only fires for a
 	body that references nothing, which is most of why `exact` was out of reach before Phase 3.
+
+	`unverified` references stop `semantic`: "same operations, operands and targets" is only true
+	of a unit whose references are known, and a pool constant neither side can bound or read is not
+	known. A target that cannot do better - a fully stripped binary whose data has no symbols at
+	all - says so with `[gate] waive = "unverified"` instead of getting a tier it cannot prove.
 	"""
 	if any(categories[name] for name in SHAPE):
 		return "none"
 	if categories["operand"] or any(abstract.values()):
+		return "structural"
+	if unverified and "unverified" not in waive:
 		return "structural"
 	return "exact" if bytes_equal else "semantic"
 
@@ -369,7 +435,8 @@ def compare_bytes(original: bytes, original_fields, candidate: bytes, candidate_
 
 
 def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str,
-		byte_gap: str = "") -> list[str]:
+		byte_gap: str = "", unverified: int = 0, waive: tuple[str, ...] = (),
+		unverified_refs: list[dict] | None = None) -> list[str]:
 	"""What stands between a verdict and tier `want`, in the order the loop should fix it.
 
 	Shape first (an operation, a target, or a whole line is wrong), then operands, then the
@@ -387,6 +454,11 @@ def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str,
 			gaps.append("%d operand differences" % categories["operand"])
 		if any(abstract.values()):
 			gaps.append("the stream still differs once registers are renamed (%s)" % _say(abstract))
+		if unverified and "unverified" not in waive:
+			what = ", ".join(sorted({item["token"] for item in unverified_refs or []}))
+			gaps.append("%d reference%s %s neither side can name, bound or read (%s) - reproduce the "
+				"object, or the tier cannot be claimed" % (unverified, "s" if unverified > 1 else "",
+					"stands" if unverified > 1 else "stands", what or "unnamed"))
 	if tier_rank(want) >= tier_rank("exact") and not bytes_equal:
 		gaps.append(byte_gap or "the bytes are not equal")
 	return gaps
@@ -476,7 +548,8 @@ def _fold_registers(tokens: list, side: str, vocabulary) -> list[Token]:
 def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 		original_bytes: bytes = b"", candidate_bytes: bytes = b"",
 		original_fields=None, candidate_fields=None, original_at: dict | None = None,
-		candidate_at: dict | None = None, require: str = GATE_DEFAULT) -> Verdict:
+		candidate_at: dict | None = None, require: str = GATE_DEFAULT,
+		waive: tuple[str, ...] = ()) -> Verdict:
 	"""Score a candidate against the original and name the tier it reaches.
 
 	`require` is the gate from the target's `[gate]` table; `verdict.passed` is "this reaches
@@ -502,17 +575,24 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 	hidden_relocations = strict["hidden"]
 
 	symbols = []
+	unverified: list[dict] = []
 	for token, left_ref, right_ref in _pair(vocabulary.entries["original"], vocabulary.entries["candidate"]):
-		ok, why = refs_compatible(left_ref, right_ref)
-		symbols.append({"token": token, "ok": ok, "why": why,
+		ok, why, evidence = ref_evidence(left_ref, right_ref)
+		symbols.append({"token": token, "ok": ok, "why": why, "evidence": evidence,
 			"original": _describe(left_ref), "candidate": _describe(right_ref)})
+		if ok and not evidence:
+			# both sides reach something, and nothing either side knows says what it is
+			unverified.append({"token": token, "original": _describe(left_ref),
+				"candidate": _describe(right_ref)})
 	for token, ref in vocabulary.entries["original"]:
 		if not any(item["token"] == token for item in symbols):
-			symbols.append({"token": token, "ok": False, "why": "the candidate never reaches it",
+			symbols.append({"token": token, "ok": False, "evidence": "",
+				"why": "the candidate never reaches it",
 				"original": _describe(ref), "candidate": None})
 	for token, ref in vocabulary.entries["candidate"]:
 		if not any(item["token"] == token for item in symbols):
-			symbols.append({"token": token, "ok": False, "why": "the original never reaches it",
+			symbols.append({"token": token, "ok": False, "evidence": "",
+				"why": "the original never reaches it",
 				"original": None, "candidate": _describe(ref)})
 
 	require = require if require in GATE_MODES else GATE_DEFAULT
@@ -536,7 +616,10 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 	# `exact` makes; bytes equal outright imply it
 	verdict.bytes_equal_masked = bool(original_bytes) and (
 		verdict.bytes_equal or byte_check["equal"])
-	verdict.tier = tier_for(categories, abstract["categories"], verdict.bytes_equal_masked)
+	verdict.unverified, verdict.unverified_refs = len(unverified), unverified
+	verdict.waive = [name for name in waive if name in WAIVABLE]
+	verdict.tier = tier_for(categories, abstract["categories"], verdict.bytes_equal_masked,
+		verdict.unverified, tuple(verdict.waive))
 	# Falling short of the threshold always has a categorised difference now, so the only way to
 	# fail with nothing categorised is a count that went wrong here.
 	problems = accounting_problems(verdict)
@@ -549,6 +632,9 @@ def _describe(ref: Ref) -> dict:
 	return {"kind": ref.kind, "name": ref.name or ref.raw or "?",
 		"section": ref.section, "size": ref.size,
 		"named": ref.named,
+		# what the access itself proves: how wide the read is, and a string length when this side
+		# knows the object is a string of one (Phase 4)
+		"width": ref.width or None, "string": ref.string,
 		"content": ref.content[:16].hex() if ref.content else None}
 
 
@@ -595,6 +681,13 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 				"register"])
 	lines.append("  with registers folded: %s" % ("identical" if verdict.abstract_clean
 		else _say(verdict.abstract_categories)))
+	if verdict.unverified:
+		lines.append("  %d reference%s %s neither side can verify: both reach it, but neither names "
+			"it, bounds it, or reads it at a width the other agrees to - so the match there is "
+			"assumed, not proven%s" % (verdict.unverified, "s" if verdict.unverified > 1 else "",
+				"stand" if verdict.unverified > 1 else "stands",
+				" (waived by [gate] waive, so it does not cap the tier)" if "unverified"
+				in verdict.waive else ", and it caps the tier at structural"))
 	if verdict.bytes_equal and verdict.match_percent == 100.0:
 		lines.append("  the candidate assembles to exactly the original bytes")
 	elif verdict.bytes_equal_masked and verdict.match_percent == 100.0:
@@ -610,8 +703,13 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 			for item in shown:
 				left = (item["original"] or {}).get("name", "-")
 				right = (item["candidate"] or {}).get("name", "-")
+				if item["ok"]:
+					status = "ok (%s)" % item.get("evidence") if item.get("evidence") else (
+						"UNVERIFIED - nothing either side knows says what this object is")
+				else:
+					status = "DIFFERS - " + item["why"]
 				lines.append("    %-6s %-34s %-34s %s" % (item["token"], "original: " + left,
-					"candidate: " + right, "ok" if item["ok"] else "DIFFERS - " + item["why"]))
+					"candidate: " + right, status))
 	hidden = sum(1 for item in verdict.diff if item.get("hidden"))
 	if hidden:
 		lines.append("  %d of those differences are only visible in what the lines reach, "

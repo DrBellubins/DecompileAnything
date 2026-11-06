@@ -212,6 +212,38 @@ def gate(config: dict, variant: dict | None = None) -> tuple[str, str]:
 	return value, where
 
 
+def gate_waivers(config: dict, variant: dict | None = None) -> tuple[list[str], str]:
+	"""What the gate is allowed to wave aside: `[gate] waive` in the target config, or a `waive`
+	key in a `[variants.*]` table (Docs/byte-cleanup-plan.md, Phase 4).
+
+	The one waiver today is `unverified`: references both sides reach but neither can name, bound
+	or read. They stop a unit claiming `semantic`, because "same operations, operands and targets"
+	is only true of a unit whose references are known. A target where no source can do better - a
+	stripped binary whose data has no symbols, where every `.rodata` object is anonymous - says so
+	here, in the file, rather than having the tool hand out a tier it cannot prove.
+	"""
+	from .diff import WAIVABLE  # local: keep this module import-light
+
+	def values(table) -> list[str]:
+		if not isinstance(table, dict):
+			return []
+		value = table.get("waive")
+		if isinstance(value, str):
+			value = value.replace(",", " ").split()
+		return [str(item).strip() for item in (value or []) if str(item).strip()]
+
+	out, where = values(config["raw"].get("gate")), ""
+	if out:
+		where = "[gate] waive in %s" % config["path"]
+	if variant and values(variant):
+		out, where = values(variant), "the variant's waive key in %s" % config["path"]
+	unknown = [item for item in out if item not in WAIVABLE]
+	if unknown:
+		raise ConfigError("%s: waive %s is not something this gate can wave aside - the options "
+		"are %s" % (config["path"], ", ".join(unknown), ", ".join(WAIVABLE)))
+	return out, where
+
+
 def include_dirs(config: dict, variant: dict | None = None) -> list[Path]:
 	"""Directories the candidate may include from - `[include_dirs]` in the target config, or
 	the same key inside a `[variants.*]` table. Relative paths are relative to the config

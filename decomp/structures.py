@@ -77,8 +77,6 @@ _MSVC_TYPE_STRING = re.compile(rb"\.?\?A[VUE][\x20-\x7e]{1,300}?@@")
 # The CRT's pure-virtual thunk: importable by name (/MD), unnamed once it is linked in.
 _MSVC_PURECALL = re.compile(r"^_?_?purecall$", re.IGNORECASE)
 
-# How wide one access is, from the mnemonic where the size is written in it.
-_SUFFIX_WIDTH = {"b": 1, "w": 2, "l": 4, "q": 8}
 # Mnemonics whose memory operand is the destination (AT&T writes them first, capstone lists
 # them last: its operand list is source-then-destination).
 _STORE_PREFIXES = ("mov", "fld", "fst", "add", "sub", "xor", "and", "or", "adc", "sbb",
@@ -118,57 +116,10 @@ def type_name(text: str) -> str:
 	return "::".join(parts)
 
 
-def _reg_width(name: str) -> int:
-	"""`%rax`->8, `%eax`->4, `%ax`->2, `%al`->1, `%xmm0`->16. A bare `mov` says its size only
-	in the register it moves to."""
-	name = (name or "").lower()
-	if name.startswith(("xmm", "zmm")):
-		return 16
-	if name.startswith("ymm"):
-		return 32
-	if name.startswith("st"):
-		return 10
-	if re.fullmatch(r"r[abcd]x|r\d{1,2}[wbl]?|r(?:[sd][ip]|[b-s][p])l?", name):
-		return 8
-	if re.fullmatch(r"e[abcd][sd]x|e[ds][ip]|ebp|esp", name):
-		return 4
-	if re.fullmatch(r"[a-d][xl]p?|[ds]i|[b-s]p", name):
-		return 2
-	if re.fullmatch(r"[a-d]l|ah|bh|ch|dh|[sd]il|[b-s]pl", name):
-		return 1
-	return 0
-
-
-def _width_of(mnemonic: str, operands, handle) -> int:
-	"""How many bytes this instruction touches, 0 when it does not say."""
-	suffix = ""
-	for key in sorted(_SUFFIX_WIDTH, key=lambda k: -len(k)):
-		if mnemonic.endswith(key) and mnemonic != key:
-			suffix = key
-			break
-	if mnemonic.startswith(("movs", "movz")):
-		pair = [c for c in mnemonic[4:] if c in _SUFFIX_WIDTH]
-		if pair:
-			return min(_SUFFIX_WIDTH[c] for c in pair)
-	if suffix:
-		return _SUFFIX_WIDTH[suffix]
-	if mnemonic.endswith("ss"):
-		return 4
-	if mnemonic.endswith("sd"):
-		return 8
-	if mnemonic.startswith(("movaps", "movups", "movapd", "movupd")):
-		return 16
-	if mnemonic.startswith(("fld", "fst")):
-		# flds/fsts are the 32-bit x87 spellings of a float, fldl/fstl of a double
-		return 4 if mnemonic.endswith("s") else 8 if mnemonic.endswith("l") else 8
-	# a bare `mov`/`add`/... : the size is in the register on the other side
-	from capstone import CS_OP_REG
-	for operand in operands:
-		if operand.type == CS_OP_REG:
-			width = _reg_width(handle.reg_name(operand.reg))
-			if width:
-				return width
-	return 0
+# The width an access makes lives in `normalize` now: it is the same question the tokeniser asks
+# when it records how wide a data reference is (Docs/byte-cleanup-plan.md, Phase 4).
+_reg_width = normalize.register_width
+_width_of = normalize.access_width
 
 
 def _kind_of(mnemonic: str) -> str:

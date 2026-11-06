@@ -43,9 +43,9 @@ DEFAULT_VARIANTS = ["gcc-o2", "gcc-o0", "gcc-o0-x86"]
 # What the untouched source has to reach at -O2 through this tool's own path. Measured here:
 # 99.91% mean, 86 of 89 past the tier gate (88 under the percentage rule that existed before
 # Phase 2) - above the independent harness's own 98.27% / 72, which is the ceiling for any
-# candidate. The three units below it are named in KNOWN_GAPS.
+# candidate. The five units below it are named in KNOWN_GAPS.
 MIN_MEAN = 99.0
-MIN_PAST_GATE = 85
+MIN_PAST_GATE = 83
 
 KNOWN_GAPS = {
 	"gcc-o2": {
@@ -62,6 +62,15 @@ KNOWN_GAPS = {
 		"STRUCT-24": "a reference to an unnamed unit elsewhere in the binary - nothing to pair on",
 		"STRUCT-22": "same reference as STRUCT-24: the positional token pairs a different object",
 		"STRUCT-23": "same reference as STRUCT-24: the positional token pairs a different object",
+		# Phase 4 (Docs/byte-cleanup-plan.md) asks what a reference *is*, and counts the ones
+		# neither side can name, bound or read. These two reach nothing but such objects: MATH-13
+		# a `.bss` CRC table and its ready-flag, STRUCT-21 the state machine's counters. Both sides
+		# reach them, both are anonymous in the stripped binary, and no source can change that -
+		# which is what `[gate] waive = "unverified"` is for, and what reproducing the object
+		# (Docs/structures-plan.md) would fix properly. They used to pass because a reference
+		# nothing could describe was accepted silently.
+		"MATH-13": "two anonymous `.bss` objects - counted unverified, so `semantic` is not claimed",
+		"STRUCT-21": "anonymous state-machine data - counted unverified, as above",
 	},
 }
 

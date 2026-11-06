@@ -549,6 +549,16 @@ all three scripts print OK on this machine).
 
 ## Known gaps
 
+* A reference both sides reach but neither can describe — an anonymous `.bss` global, a PLT thunk
+  whose import a stripped binary does not name — is counted as **`unverified`**, and the tier stops
+  at `structural` rather than claiming `semantic` on it. That costs two units of the untouched
+  benchmark at `-O0` and `-O2` (MATH-13, STRUCT-21) and twelve at `-m32`; it is not a candidate
+  problem and the tool says which it is. `[gate] waive = "unverified"` in `decomp.toml`, or
+  `--waive unverified` once, is how a target says it cannot do better; reproducing the object
+  (Docs/structures-plan.md) is how it does. Since Phase 4 of Docs/byte-cleanup-plan.md: a RIP-relative
+  read names the bytes the instruction reads (the field-width bias is part of the relocation), a
+  constant pool is readable beside a relocated word, and a changed `float` or one character of a
+  string literal fails the gate.
 * `-O1` vs `-O2` vs `-O3` is not distinguishable from prologue/epilogue shape; `detect` says
   "not -O0" firmly and the level weakly. Vectorisation, inlining depth and unrolling are the
   Phase 5 evidence for that.

@@ -933,7 +933,7 @@ def find(
 def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	fn: str | None = None, variant: str | None = None, includes: list[str] | None = None,
 	size: int = 0, register_abstract: bool = False, object_dir: Path | None = None,
-	gate: str | None = None) -> dict:
+	gate: str | None = None, waive: list[str] | None = None) -> dict:
 	"""Compile a candidate and score it against one cached function.
 
 	Everything `decomp try` does, in one call, so the benchmark check in
@@ -953,9 +953,18 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		raise config.ConfigError("--gate %s: not a gate - use one of %s"
 			% (gate, ", ".join(diff.GATE_MODES)))
 	require, gate_from = (gate, "--gate") if gate else config.gate(cfg, body)
+	if waive is None:
+		waiver, waiver_from = config.gate_waivers(cfg, body)
+	else:
+		waiver, waiver_from = [str(item) for item in waive], "--waive"
+	unknown = [item for item in waiver if item not in diff.WAIVABLE]
+	if unknown:
+		raise config.ConfigError("--waive %s: not something this gate can wave aside - the options "
+		"are %s" % (", ".join(unknown), ", ".join(diff.WAIVABLE)))
 	outcome = {"variant": name, "flags": flags, "build": result, "object": object_path,
 		"warnings": [], "error": None, "error_code": EXIT_FAIL, "verdict": None,
-		"gate": require, "gate_from": gate_from, "original": None, "candidate": None}
+		"gate": require, "gate_from": gate_from, "waive": waiver, "waive_from": waiver_from,
+		"original": None, "candidate": None}
 	if result.failed:
 		outcome["error"] = "the candidate did not compile"
 		return outcome
@@ -1044,7 +1053,7 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		original_fields=fields_original, candidate_fields=fields_candidate,
 		original_at=normalize.body_index(blocks_original, instructions_original, tokens_original),
 		candidate_at=normalize.body_index(blocks_candidate, instructions_candidate, tokens_candidate),
-		require=require)
+		require=require, waive=tuple(waiver))
 	return outcome
 
 
@@ -1069,6 +1078,9 @@ def try_cmd(
 	gate: str = typer.Option("", "--gate",
 		help="override the tier this unit has to reach: %s (default: [gate] require in the "
 			"target config, else semantic)" % ", ".join(diff.GATE_MODES)),
+	waive: str = typer.Option("", "--waive",
+		help="wave aside something the tier would otherwise insist on (%s); default: [gate] waive "
+		"in the target config" % ", ".join(diff.WAIVABLE)),
 	max_diff: int = typer.Option(16, "--max-diff"),
 	max_symbols: int = typer.Option(12, "--max-symbols"),
 	as_json: bool = typer.Option(False, "--json"),
@@ -1107,7 +1119,9 @@ def try_cmd(
 		try:
 			outcome = score_candidate(cfg, conn, meta, row, [Path(item) for item in source], fn=fn,
 				variant=variant, includes=list(include), size=size,
-				register_abstract=register_abstract, object_dir=store.root / "candidates", gate=gate)
+				register_abstract=register_abstract, object_dir=store.root / "candidates", gate=gate,
+				waive=([item.strip() for item in waive.replace(",", " ").split() if item.strip()]
+					if waive.strip() else None))
 		except config.ConfigError as exc:
 			raise Stop(EXIT_USAGE, "%s" % exc)
 		except NotImplementedError as exc:
@@ -1126,6 +1140,7 @@ def try_cmd(
 			"entry": _hex(row["entry"]), "size": row["size"], "kind": row["kind"],
 			"variant": outcome["variant"], "flags": outcome["flags"],
 			"gate": outcome["gate"], "gate_from": outcome["gate_from"],
+			"waive": outcome.get("waive", []), "waive_from": outcome.get("waive_from", ""),
 			"object": str(build.object_path), "build_ok": build.ok,
 			"diagnostics": build.diagnostics, "warnings": outcome["warnings"],
 			"error": outcome["error"],
@@ -1150,7 +1165,9 @@ def try_cmd(
 				"original_instructions": verdict.original_instructions,
 				"candidate_instructions": verdict.candidate_instructions,
 				"original_bytes": verdict.original_bytes, "candidate_bytes": verdict.candidate_bytes,
-				"diff": verdict.diff, "symbols": verdict.symbols},
+				"diff": verdict.diff, "symbols": verdict.symbols,
+				"unverified": verdict.unverified, "unverified_refs": verdict.unverified_refs,
+				"waived": verdict.waive},
 		}
 		echo(json.dumps(payload, indent=1))
 		if verdict is not None and verdict.passed:
@@ -1161,6 +1178,8 @@ def try_cmd(
 	echo("target %s  (key %s, variant %s: %s)" % (values.get("target_path"),
 		values.get("target_key"), outcome["variant"], " ".join(outcome["flags"])))
 	echo("gate: %s (%s)" % (outcome["gate"], outcome["gate_from"]))
+	if outcome.get("waive"):
+		echo("waived: %s (%s)" % (", ".join(outcome["waive"]), outcome.get("waive_from", "")))
 	for line in compile.describe(build):
 		echo(line)
 	for warning in outcome["warnings"]:
