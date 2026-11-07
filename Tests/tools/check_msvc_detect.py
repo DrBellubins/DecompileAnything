@@ -40,7 +40,6 @@ missing (nothing was judged, which is not the tool failing).
 
 from __future__ import annotations
 
-import subprocess
 import sys
 import tempfile
 import tomllib
@@ -50,7 +49,7 @@ TESTS = Path(__file__).resolve().parents[1]
 REPO = TESTS.parent
 sys.path.insert(0, str(REPO))
 
-from decomp import check, cli, config, extract, toolchain  # noqa: E402
+from decomp import check, cli, config, extract, spawn, toolchain  # noqa: E402
 
 TARGET = TESTS / "Proprietary" / "notepad.exe"
 GCC_STRIPPED = TESTS / "build" / "gcc-o0" / "da_tests.stripped"
@@ -61,6 +60,11 @@ LINKER_VERSION = "14.12"
 NOT_A_TOOL_BUILD = 30729  # id 147 (Implib900), the same in a file linked here today
 DECORATED = "?terminate@@YAXXZ"  # imported from msvcrt.dll: a C++ runtime function
 COMPILANDS = {"c": 23, "cpp": 5, "asm": 3, "ltcg-c": 25}
+
+# One probe program built by the installed `cl`, twice through the driver (compile and link).
+# A deadline, not an estimate: see `build_probe`.
+PROBE_BUILD_TIMEOUT = 300
+PROBE_FAILURE = ""  # why the last probe did not build, for whoever asks about it
 
 failures: list[str] = []
 
@@ -190,7 +194,12 @@ int main() { std::vector<int> v{1,2,3}; std::string s("x");
 def build_probe(source: str, name: str, override: dict | None = None) -> Path | None:
 	"""One PE built by the installed toolchain (the driver of `decomp`, not a hand-written
 	line). `override` replaces variant keys - which is how a /MD program is built here when the
-	benchmark's own MSVC variant is /MT on purpose."""
+	benchmark's own MSVC variant is /MT on purpose.
+
+	A probe that does not answer is reported, not waited for: the deadline is real because
+	`decomp.spawn` kills the whole wrapper process group (see its docstring), which is the only
+	way a `cl` under Wine with no Windows prefix ever stops.
+	"""
 	cfg = config.load(str(TESTS / "project.toml"))
 	try:
 		_name, variant = config.variant(cfg, "msvc-o0")
@@ -206,7 +215,13 @@ def build_probe(source: str, name: str, override: dict | None = None) -> Path | 
 	command = [variant["compiler"], "/Fe:%s" % exe, "/Fo%s" % (work / ("%s.obj" % name))] \
 		+ toolchain.build_flags(variant) + ["/Tp%s" % path, "/link",
 		*toolchain.link_flags(variant)]
-	if subprocess.run(command, capture_output=True, text=True, timeout=600).returncode:
+	finished = spawn.run(command, timeout=PROBE_BUILD_TIMEOUT)
+	if finished.returncode != 0:
+		global PROBE_FAILURE
+		PROBE_FAILURE = ("did not answer in %ds" % PROBE_BUILD_TIMEOUT if finished.timed_out
+			else (finished.output or "the compiler printed nothing").splitlines()[0])
+		if finished.note:
+			PROBE_FAILURE += " - " + finished.note
 		return None
 	return exe
 
@@ -232,8 +247,8 @@ def check_language(note: dict) -> None:
 		kind = name.split("_")[-1]
 		built = build_probe(CPP_SOURCE, name, override)
 		if built is None:
-			expect(False, "a /%s C++ probe could not be built to test this against"
-				% kind.upper())
+			expect(False, "a /%s C++ probe could not be built to test this against%s"
+				% (kind.upper(), ": " + PROBE_FAILURE if PROBE_FAILURE else ""))
 			continue
 		made = toolchain.build_note(built)
 		crt = made.get("crt") or {}

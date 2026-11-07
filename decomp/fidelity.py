@@ -28,9 +28,9 @@ shows, and the wording names which.
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import Path
 
+from . import spawn
 from . import toolchain
 
 # --------------------------------------------------------------------------------------
@@ -151,10 +151,10 @@ def _identify(name: str) -> dict:
 	if not path:
 		out["line"] = "%s is not on PATH" % name
 		return out
-	try:
-		finished = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=60)
-	except OSError as exc:  # pragma: no cover - `decomp check` reports this first
-		out["line"] = "cannot run %s: %s" % (path, exc)
+	finished = spawn.run([path, "--version"], timeout=spawn.BANNER_TIMEOUT)
+	if finished.timed_out or finished.returncode is None:
+		out["line"] = "%s did not answer --version in %ds%s" % (name, spawn.BANNER_TIMEOUT,
+			": " + (finished.note or finished.stderr) if (finished.note or finished.stderr) else "")
 		return out
 	first = ((finished.stdout or "") + (finished.stderr or "")).strip().splitlines()
 	out["line"] = first[0] if first else "%s printed nothing" % path

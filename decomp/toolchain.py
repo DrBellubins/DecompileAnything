@@ -21,9 +21,15 @@ apart the candidates are.
 from __future__ import annotations
 
 import re
-import subprocess
 import tempfile
 from pathlib import Path
+
+from . import spawn
+
+# One shape-probe compile per optimisation level. Generous for a native compiler and for `cl`
+# under Wine (measured: a few seconds); what matters is that it *ends*. A `subprocess.run`
+# timeout does not end a Wine wrapper - see decomp/spawn.py.
+PROBE_TIMEOUT = 180
 
 
 # --------------------------------------------------------------------------------------
@@ -1346,10 +1352,14 @@ def probe_signatures(compiler: str, bits: int, std: str = "c++17",
 		else:
 			command = [compiler, "-std=%s" % std] + (["-m32"] if bits == 32 else []) + [
 				"-O%d" % level, "-c", str(source), "-o", str(object_path)]
-		try:
-			finished = subprocess.run(command, capture_output=True, text=True, timeout=180)
-		except (OSError, subprocess.TimeoutExpired) as exc:
-			problems.append("%s -O%d: %s" % (compiler, level, exc))
+		finished = spawn.run(command, timeout=PROBE_TIMEOUT)
+		if finished.timed_out:
+			problems.append("%s -O%d: did not finish in %ds%s" % (compiler, level, PROBE_TIMEOUT,
+				" - " + finished.note if finished.note else ""))
+			continue
+		if finished.returncode is None:
+			problems.append("%s -O%d: %s" % (compiler, level,
+				finished.stderr or finished.note or "cannot be run"))
 			continue
 		if finished.returncode != 0:
 			problems.append("%s -O%d: %s" % (compiler, level,

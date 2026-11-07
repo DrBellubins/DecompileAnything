@@ -11,10 +11,11 @@ Nothing is hidden from the model: the compiler's own diagnostics are returned ve
 
 from __future__ import annotations
 
-import subprocess
 import time
-from dataclasses import dataclass, field, field
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import spawn
 
 # Suffixes the compiler picks the language from itself. Anything else is compiled as C++
 # (a candidate written to notes.txt or candidate.iii should still build).
@@ -63,17 +64,18 @@ def build(sources: list[Path], object_path: Path, *, compiler: str, flags: list[
 
 	object_path.parent.mkdir(parents=True, exist_ok=True)
 	started = time.time()
-	try:
-		process = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-	except FileNotFoundError:
+	finished = spawn.run(command, timeout=timeout)
+	if finished.returncode is None and not finished.timed_out:
 		return Build(ok=False, command=command, object_path=object_path,
-			diagnostics="compiler %r not found - set [variants.*] compiler in project.toml" % compiler)
-	except subprocess.TimeoutExpired:
+			diagnostics=("compiler %r not found - set [variants.*] compiler in project.toml" % compiler
+				if "No such file" in (finished.stderr or "") else
+				"cannot run %s: %s" % (compiler, finished.stderr or finished.note)))
+	if finished.timed_out:
 		return Build(ok=False, command=command, object_path=object_path,
-			diagnostics="the compiler did not finish in %ds" % timeout)
-	except OSError as exc:  # pragma: no cover
-		return Build(ok=False, command=command, object_path=object_path,
-			diagnostics="cannot run %s: %s" % (compiler, exc))
+			diagnostics="the compiler did not finish in %ds (%s)%s" % (timeout,
+				" ".join(command[:2]),
+				" - " + finished.note if finished.note else ""))
+	process = finished
 	diagnostics = "\n".join(part for part in (process.stderr, process.stdout) if part).strip()
 	lines = diagnostics.splitlines()
 	if len(lines) > _MAX_DIAGNOSTICS:
@@ -122,18 +124,16 @@ def link(objects: list[Path], output_path: Path, *, compiler: str, flags: list[s
 		output_path)
 	output_path.parent.mkdir(parents=True, exist_ok=True)
 	started = time.time()
-	try:
-		process = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
-	except FileNotFoundError:
+	process = spawn.run(command, timeout=timeout)
+	if process.returncode is None and not process.timed_out:
 		return Link(ok=False, command=command, output_path=output_path,
-			diagnostics="linker driver %r not found - set [variants.*] compiler in project.toml"
-			% compiler)
-	except subprocess.TimeoutExpired:
+			diagnostics=("linker driver %r not found - set [variants.*] compiler in project.toml"
+				% command[0] if "No such file" in (process.stderr or "") else
+				"cannot run %s: %s" % (command[0], process.stderr or process.note)))
+	if process.timed_out:
 		return Link(ok=False, command=command, output_path=output_path,
-			diagnostics="the linker did not finish in %ds" % timeout)
-	except OSError as exc:  # pragma: no cover
-		return Link(ok=False, command=command, output_path=output_path,
-			diagnostics="cannot run %s: %s" % (command[0], exc))
+			diagnostics="the linker did not finish in %ds (%s)%s" % (timeout,
+				" ".join(command[:2]), " - " + process.note if process.note else ""))
 	diagnostics = "\n".join(part for part in (process.stderr, process.stdout) if part).strip()
 	lines = diagnostics.splitlines()
 	if len(lines) > _MAX_DIAGNOSTICS:

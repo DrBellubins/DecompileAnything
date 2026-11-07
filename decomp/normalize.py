@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import re
 import shutil
-import subprocess
+
+from . import spawn
 from capstone import (
 	CS_ARCH_X86, CS_MODE_16, CS_MODE_32, CS_MODE_64, CS_OP_IMM, CS_OP_MEM,
 	CS_OPT_SYNTAX_ATT, Cs,
@@ -94,9 +95,10 @@ def demangle(names: list[str]) -> dict[str, str]:
 		return {}
 	if shutil.which("c++filt") is None:
 		return {name: name for name in need}
-	try:
-		proc = subprocess.run(["c++filt"], input="\n".join(need), capture_output=True, text=True)
-	except OSError:  # pragma: no cover
+	proc = spawn.run(["c++filt"], stdin="\n".join(need), timeout=30)
+	if proc.timed_out:
+		# A demangler that is not answering is not worth waiting for: the raw names are the
+		# fallback this function already has.
 		return {name: name for name in need}
 	lines = proc.stdout.splitlines()
 	if len(lines) != len(need):

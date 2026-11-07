@@ -1,9 +1,12 @@
 """Build, describe and score the TestBinary benchmark.
 
-This is the harness that judges the decompilation loop, so it deliberately does not
-depend on the decomp tool itself: everything here works with binutils + stdlib only.
-The normalise/diff half is written to be lifted into decomp/normalize.py + decomp/diff.py
-once those exist (see Docs/Design-Plan.md, Phase 2).
+This is the harness that judges the decompilation loop, so it deliberately does not depend on
+the decomp tool for anything about scoring: the normalise/diff half is its own, and works with
+binutils + stdlib only (see Docs/Design-Plan.md, Phase 2). The one thing it takes from the
+tool is how to run an external command with a deadline that holds - `decomp.spawn` - because a
+build that never returns is worse than a build that fails: `eval.py build --variant msvc-o0`
+runs 89 sources through `cl` under Wine, and with no Windows prefix in the environment the
+first one of them never comes back.
 
 Commands
   build      compile the benchmark, strip a copy, write answer_key/task_list/goldens
@@ -26,9 +29,12 @@ import os
 import re
 import shlex
 import struct
-import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from decomp import spawn  # noqa: E402  (the bounded runner only, see the docstring)
 
 TESTS_DIR = Path(__file__).resolve().parent
 SOURCE_DIR = TESTS_DIR / "TestBinary"
@@ -58,12 +64,26 @@ DEF_MEMBER = re.compile(r"^(?:[\w:<>,\*&\[\]\s]+?)?([A-Za-z_]\w*)::(~?[A-Za-z_]\
 DEF_FREE = re.compile(r"^(?:static\s+|inline\s+|template\s*<[^>]*>\s*)*[\w:<>,\*&\[\]]+[\s]+([A-Za-z_]\w*)\s*\(")
 
 
-def sh(args, cwd=None, binary=False):
-	proc = subprocess.run(args, cwd=cwd, capture_output=True)
-	out = proc.stdout.decode("utf-8", "replace") if binary else proc.stdout.decode(errors="replace")
-	err = proc.stderr.decode(errors="replace")
-	if proc.returncode != 0:
-		raise RuntimeError("command failed (%d): %s\n%s" % (proc.returncode, " ".join(map(str, args)), err or out))
+# A build or a link is bounded at BUILD_TIMEOUT; everything the harness asks a binutils tool or
+# the target binary for is bounded at TOOL_TIMEOUT. Both are far above anything measured here;
+# the number exists so that a tool which is never going to answer is reported instead of waited
+# for. `subprocess.run(timeout=)` is not that bound - see decomp/spawn.py.
+BUILD_TIMEOUT = 300
+TOOL_TIMEOUT = 120
+
+
+def sh(args, cwd=None, binary=False, timeout=TOOL_TIMEOUT):
+	finished = spawn.run(args, cwd=cwd, timeout=timeout)
+	out = finished.stdout if not binary else finished.stdout.encode()
+	if finished.timed_out:
+		raise RuntimeError("%s did not finish in %ds (its whole process group was stopped)%s" % (
+			" ".join(map(str, args)), timeout,
+			" - " + finished.note if finished.note else "; a compiler that never answers is usually "
+			"Wine with no WINEPREFIX (Docs/Setup.md §6)"))
+	if finished.returncode != 0:
+		raise RuntimeError("command failed (%s): %s\n%s" % (finished.returncode,
+			" ".join(map(str, args)), (finished.stderr or finished.stdout) or
+			"the command produced no output"))
 	return out
 
 
@@ -158,8 +178,7 @@ def msvc_simple_name(decorated):
 def demangle(names):
 	if not names:
 		return []
-	proc = subprocess.run(["c++filt"], input="\n".join(names), capture_output=True, text=True)
-	return proc.stdout.splitlines()
+	return spawn.run(["c++filt"], stdin="\n".join(names), timeout=30).stdout.splitlines()
 
 
 def symbols(binary):
@@ -783,9 +802,10 @@ def compile_source(compiler, flags, source, output):
 		# A bare `/home/…/x.cpp` reads as an option to cl, so the language is named (the same
 		# rule decomp.toolchain.driver_form follows).
 		sh([compiler] + flags + ["/c",
-			("/Tc" if str(source).endswith(".c") else "/Tp") + str(source), "/Fo%s" % output])
+			("/Tc" if str(source).endswith(".c") else "/Tp") + str(source), "/Fo%s" % output],
+			timeout=BUILD_TIMEOUT)
 		return
-	sh([compiler] + flags + ["-c", str(source), "-o", str(output)])
+	sh([compiler] + flags + ["-c", str(source), "-o", str(output)], timeout=BUILD_TIMEOUT)
 
 
 def include_flags(compiler, directories):
@@ -802,9 +822,10 @@ def link_binary(compiler, flags, objects, linkflags, binary):
 		# /MAP is not in the config on purpose: the answer key needs the map next to the
 		# binary it describes, and only this function knows where that is.
 		sh([compiler] + ["/Fe:%s" % binary] + [str(o) for o in objects] +
-			["/link", "/MAP:%s.map" % binary] + linkflags)
+			["/link", "/MAP:%s.map" % binary] + linkflags, timeout=BUILD_TIMEOUT)
 		return
-	sh([compiler] + flags + [str(o) for o in objects] + linkflags + ["-o", str(binary)])
+	sh([compiler] + flags + [str(o) for o in objects] + linkflags + ["-o", str(binary)],
+		timeout=BUILD_TIMEOUT)
 
 
 def cmd_build(config, variants, capture=True):

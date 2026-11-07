@@ -18,13 +18,13 @@ import glob
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import config
+from . import spawn
 from . import toolchain
 
 OK, FAIL, WARN = "ok", "fail", "warn"
@@ -79,10 +79,7 @@ def java_binary() -> str | None:
 
 
 def java_major(java_path: str) -> int | None:
-	try:
-		proc = subprocess.run([java_path, "-version"], capture_output=True, text=True, timeout=60)
-	except OSError:
-		return None
+	proc = spawn.run([java_path, "-version"], timeout=60)
 	text = (proc.stderr or "") + (proc.stdout or "")
 	match = re.search(r'version "(\d+)(?:\.(\d+))?', text)
 	if not match:
@@ -276,6 +273,17 @@ _MSVC_BANNER = re.compile(r"Microsoft \(R\)(?P<what>[^\n]*?)(?:Version|for x\d+)
 # impostors for an MSVC build, so the match is on "GNU", not on one package name.
 _IMPOSTOR_BANNER = re.compile(r"\bGNU\b|binutils|coreutils", re.I)
 
+# Path + arguments -> the run that produced its banner. See `_run`.
+_BANNER_CACHE: dict[tuple[str, tuple[str, ...]], spawn.Result] = {}
+
+
+def banner_note() -> str:
+	"""Anything the tool probes had to add to the environment to get an answer (Wine prefix)."""
+	for result in _BANNER_CACHE.values():
+		if result.note:
+			return result.note
+	return ""
+
 
 class Tool:
 	"""One MSVC-family tool as found on this machine, identified rather than assumed."""
@@ -373,11 +381,19 @@ def _first_line(text: str) -> str:
 
 
 def _run(path: str, arguments: list[str]) -> str:
-	try:
-		proc = subprocess.run([path, *arguments], capture_output=True, text=True, timeout=120)
-	except (OSError, subprocess.SubprocessError):
-		return ""
-	return ((proc.stdout or "") + (proc.stderr or "")).strip()
+	"""One banner. Bounded, and asked once per tool path per process.
+
+	The bound matters more here than anywhere else in the tool: a banner probe is the first thing
+	`decomp check` and every MSVC acceptance script do, there are up to fourteen of them, and a
+	Wine wrapper with no prefix configured never answers at all. `spawn.BANNER_TIMEOUT` is the
+	budget for one; the cache is what stops a script that asks about the same tool three times
+	from waiting out that budget three times.
+	"""
+	key = (path, tuple(arguments))
+	if key not in _BANNER_CACHE:
+		_BANNER_CACHE[key] = spawn.run([path, *arguments], timeout=spawn.BANNER_TIMEOUT)
+	result = _BANNER_CACHE[key]
+	return ((result.stdout or "") + (result.stderr or "")).strip()
 
 
 def msvc_tools() -> dict[str, Tool]:
@@ -744,11 +760,12 @@ def gcc_multilib(compiler: str, arch: str) -> tuple[bool, str]:
 		return True, "not asked"
 	try:
 		with tempfile.TemporaryDirectory(prefix="decomp-multilib-") as directory:
-			proc = subprocess.run([compiler, flag, "-x", "c", "-c", "-o",
-				str(Path(directory) / "probe.o"), "-"], input="", capture_output=True,
-				text=True, timeout=120)
-	except (OSError, subprocess.SubprocessError) as exc:
+			proc = spawn.run([compiler, flag, "-x", "c", "-c", "-o",
+				str(Path(directory) / "probe.o"), "-"], stdin="", timeout=120)
+	except OSError as exc:
 		return False, "%s could not be run (%s)" % (compiler, exc)
+	if proc.timed_out:
+		return False, "%s did not answer the %s probe in %ds" % (compiler, flag, 120)
 	if proc.returncode == 0:
 		return True, "%s accepts %s" % (compiler, flag)
 	detail = " ".join((proc.stderr or proc.stdout or "").split())[:200]
@@ -864,6 +881,24 @@ def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> 
 		report.add("wine", bool(wine), "%s (the cl wrapper shells out to it)" % (wine or "no wine/wine64 on PATH"),
 			"a 32-bit wine launcher is not enough - the wrappers use wine64 (Docs/Setup.md §1)",
 			fatal=fatal)
+		# A Windows tool with no Windows prefix is not slow, it is stuck: `wine` falls back to
+		# the desktop prefix, which is not one a build tool works in (Docs/Setup.md §6). This is
+		# the first thing to name when a `cl` call never comes back.
+		env_prefix = os.environ.get("WINEPREFIX", "")
+		if env_prefix:
+			report.add("wine prefix", (Path(env_prefix).expanduser() / "drive_c").is_dir(),
+				"WINEPREFIX=%s from the environment" % env_prefix,
+				"that prefix does not look initialised - wineboot it, or point it at one that is "
+				"(Docs/Setup.md §6.4)", fatal=False)
+			
+		else:
+			project = spawn.project_wine_prefix()
+			report.add("wine prefix", bool(project),
+				("WINEPREFIX is not set, so this tool uses its own prefix %s" % project) if project else
+				"WINEPREFIX is not set and there is no project prefix here: Wine falls back to "
+				"~/.wine, where a compiler call can hang forever", "export WINEPREFIX=$PWD/.wine "
+				"(Docs/Setup.md §6), or the tool will use its own prefix when one is initialised there",
+				fatal=False)
 	undname = tools["undname"]
 	if undname.found and undname.vendor == "msvc":
 		report.add("msvc undname", True, undname.describe() + " (display only - decorated names stay the key)")
@@ -954,9 +989,11 @@ def _compiler_problem(compiler: str) -> str:
 				"cannot be used to match an MSVC target" % path)
 		return "%s is not Microsoft's %s: %s" % (path, compiler, tool.describe())
 	try:
-		proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=60)
+		proc = spawn.run([path, "--version"], timeout=60)
 	except OSError as exc:
 		return "cannot run: %s" % exc
+	if proc.timed_out:
+		return "%s did not answer --version in 60s%s" % (path, ": " + proc.note if proc.note else "")
 	if proc.returncode != 0:
 		return "--version failed (%d)" % proc.returncode
 	first = (proc.stdout or proc.stderr).strip().splitlines()

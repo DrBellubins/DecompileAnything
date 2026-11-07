@@ -29,16 +29,16 @@ from __future__ import annotations
 
 import argparse
 import shutil
-import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parents[1]
 REPO = TESTS.parent
 sys.path.insert(0, str(REPO))
 
-from decomp import check, compile as build_, config, extract, toolchain  # noqa: E402
+from decomp import check, compile as build_, config, extract, spawn, toolchain  # noqa: E402
 
 PROBE = """
 int probe_abs(int a, int b) { int d = a - b; if (d < 0) d = -d; return d; }
@@ -49,6 +49,11 @@ MAIN = """
 int probe_abs(int, int);
 int main() { return probe_abs(3, 9) == 6 ? 0 : 1; }
 """
+
+# The benchmark build (`eval.py build`, every unit through `cl`) gets its own budget; each `cl`
+# call inside it is bounded separately in Tests/eval.py. These numbers are deadlines, not
+# estimates: with decomp.spawn they are the point after which the script says what is wrong.
+BENCHMARK_TIMEOUT = 900
 
 failures: list[str] = []
 
@@ -134,12 +139,14 @@ def probe_link(variant: dict, work: Path, objects: dict[int, Path]) -> None:
 		# cl takes everything after `/link` to the linker, so the objects and `/Fe:` come first.
 		command = [variant["compiler"], "/Fe:%s" % exe, str(obj), str(entry_object), "/link",
 			*toolchain.link_flags(variant)]
-		proc = subprocess.run(command, capture_output=True, text=True, timeout=300)
+		proc = spawn.run(command, timeout=300)
 		expect(proc.returncode == 0, "cl links /O%d -> PE (%s)" % (level, Path(exe).name))
-		if proc.returncode:
+		if proc.returncode != 0:
 			# Both streams: the msvc-wine wrappers put the banner on stderr and the diagnostics
 			# on stdout, and cl/link print the error last.
 			print("      " + " ".join(command))
+			if proc.timed_out:
+				print("      it did not finish in 300s%s" % ((": " + proc.note) if proc.note else ""))
 			for stream in (proc.stdout, proc.stderr):
 				for line in [x for x in stream.splitlines() if "Fontconfig" not in x][-8:]:
 					print("      " + line)
@@ -151,8 +158,8 @@ def probe_link(variant: dict, work: Path, objects: dict[int, Path]) -> None:
 		if not wine:
 			print("      no wine to run it with")
 			continue
-		run = subprocess.run([wine, str(exe)], capture_output=True, text=True, timeout=120)
-		expect(run.returncode == 0, "and it runs under Wine (exit %d)" % run.returncode)
+		run = spawn.run([wine, str(exe)], timeout=120)
+		expect(run.returncode == 0, "and it runs under Wine (exit %s)" % run.returncode)
 
 
 def benchmark(variant_name: str) -> None:
@@ -161,9 +168,16 @@ def benchmark(variant_name: str) -> None:
 		print("  skipped: the benchmark needs the Windows SDK headers and libraries")
 		return
 	for command in (["build", "--variant", variant_name], ["selfcheck", "--variant", variant_name]):
-		proc = subprocess.run([sys.executable, str(TESTS / "eval.py"), *command],
-			capture_output=True, text=True, timeout=1800)
-		expect(proc.returncode == 0, "eval.py %s" % " ".join(command))
+		# The slowest thing this script does: every unit of the benchmark through `cl`, then the
+		# reference binary's own expectations. Named before it starts so that a reader knows what
+		# they are waiting for, and bounded twice over: `eval.py` bounds each `cl` call itself
+		# (Tests/eval.py BUILD_TIMEOUT) and this bounds the whole run.
+		print("  eval.py %s ..." % " ".join(command), flush=True)
+		started = time.time()
+		proc = spawn.run([sys.executable, str(TESTS / "eval.py"), *command], timeout=BENCHMARK_TIMEOUT)
+		expect(proc.returncode == 0, "eval.py %s%s" % (" ".join(command),
+			"" if not proc.timed_out else " (no answer in %ds)" % BENCHMARK_TIMEOUT))
+		print("      %.0fs" % (time.time() - started))
 		tail = (proc.stdout or proc.stderr).strip().splitlines()[-4:]
 		for line in tail:
 			print("      " + line)

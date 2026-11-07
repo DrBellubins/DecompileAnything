@@ -30,8 +30,8 @@ Reading a 32-bit binary works. Matching one exists for GCC only. Per command, on
 | `analyze` / `find` / `show` / `status` | works (`x86:LE:32:default`, the ret-cut unit situation) | works — `deadrising2.exe` is analysed and listed |
 | `types` (structure recovery) | works (Design-Plan Phase 4; `this` from `8(%ebp)`) | works (MSVC-Plan MS-5: RTTI in absolute 4-byte addresses, `this` from `%ecx`, 769 classes in the game) |
 | `detect` | works | works **except** the `-O` inference: the x64 MSVC feature set reads zeros, and it refuses to probe ("cl is not installed here") |
-| `check` | the variant, its arch and the compiler agree | *was:* reports no `cl`, or the x64 one; `msvc_sdk()` called the SDK complete because it looked at x64 paths only. **Since X86-0 (2026-11-07):** an installed-but-off-PATH toolchain is found and named as that, `msvc target x64` / `msvc target x86` state the bitness each installed toolchain can produce, `msvc_sdk(arch=…)` answers per arch, and an `arch = "x86"` MSVC variant is named before any work starts. What is still missing is the compiler itself, which the report now says plainly |
-| `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **cannot reach a comparison** — no driver can produce 32-bit COFF, and the flag set it would use is wrong (§3) |
+| `check` | the variant, its arch and the compiler agree | *was:* reports no `cl`, or the x64 one; `msvc_sdk()` called the SDK complete because it looked at x64 paths only. **Since X86-0 (2026-11-07):** an installed-but-off-PATH toolchain is found and named as that, `msvc target x64` / `msvc target x86` state the bitness each installed toolchain can produce, `msvc_sdk(arch=…)` answers per arch, and an `arch = "x86"` MSVC variant is named before any work starts. **Since X86-1 (same day):** both rows say `ok can build x86 candidates` — the 32-bit target toolset is installed, so the report's remaining MSVC gap is tool-side, not machine-side |
+| `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **cannot reach a comparison** — the machine can produce 32-bit COFF since X86-1 (`bin/x86/cl`), but nothing resolves `arch = "x86"` to that driver, and the flag set it would use is wrong (§3, §4.2). X86-2 is what unblocks this row |
 | `link` (whole-program, Phase 6) | tested on 64-bit ELF only (`check_phase6_link.py` measures `gcc-o0`); a 32-bit ELF relink is untested | untested for a 32-bit PE: it needs the x86 link form, i386 relocation reading, and a link that can be run |
 
 The four "32-bit" things people mean, and their state:
@@ -93,7 +93,10 @@ symptom: nothing upstream was ever asked to produce 32-bit code.
 
 ## 4. The five causes, named
 
-1. **The machine has no 32-bit target toolset.** The installed v141 tree has
+1. **The machine had no 32-bit target toolset.** *(Closed by X86-1, 2026-11-07 — the tree now has
+   `bin/Hostx64/{x64,x86}` and `lib/{x64,x86}`, the installer takes `--architecture x86 x64`, and
+   `bin/x86/cl` exists. The paragraph is kept as the measurement the phase was written from.)*
+   The installed v141 tree has
    `VC/Tools/MSVC/14.12.25827/bin/Hostx64/x64` and `lib/{x64,onecore}` only, and the wrappers are
    `toolchains/msvc/bin/x64`. `toolchains/install_msvc.py` hard-wires `--host-arch x64
    --architecture x64` (line 196) and its `KEEP` (line 57) admits `crt.(headers|source|x64.*
@@ -229,6 +232,82 @@ belongs next to the `-m32` row (a 32-bit PE has no `.pdata` answer key).
   machine (Setup.md §6.7), not run.
 * Not claimed: what i386 `cl` emits. Nothing about flags or -O. This phase's only output is a
   compiler that can be asked.
+
+**Done 2026-11-07.** In `toolchains/install_msvc.py`: `--architecture` (`nargs="+"`, choices
+`x86`/`x64`, default `x64` — replacing the hard-wired `"--architecture", "x64"`), a `keep_pattern(
+arches)` built from the requested arches in place of the static `KEEP` regex whose CRT clause named
+only `x64\.…`, `fill_missing_libs` run per arch, and a final print that names each arch's wrapper
+directory. `SDK_KEEP` was not touched, and that is the point: the SDK's x86 import libraries were
+installed all along (§3), so the only keep-clause that was throwing anything away was the CRT one —
+`vsdownload --architecture x86 x64` had already admitted the toolset packages, and `KEEP` dropped them
+before a byte was downloaded.
+
+Measured on this machine against the saved `toolchains/15.9.84.manifest` and the existing
+cache, before and after the change:
+
+* Selection: upstream 363 → 373 packages; **pruned 11 / 513.1 MB → 15 / 580.8 MB**. The four added
+  packages are exactly `Microsoft.VisualC.14.12.Tools.HostX64.TargetX86` + `.Resources` (9.2 MB) and
+  `Microsoft.VisualC.14.12.CRT.x86.Desktop` / `.OneCore.Desktop` (33.1 + 25.4 MB): the two halves
+  X86-0 named, and nothing else. The x64-only selection still prints 11 / 513.1 MB.
+* Tree: `VC/Tools/MSVC/14.12.25827/bin/Hostx64/x86/{cl,c1,c2,link,lib,ml,dumpbin,editbin}.exe` and
+  `lib/x86` exist (21.5 MB and 129 MB); the prefix went 1.1 GB → 1.4 GB. `fill_missing_libs` linked
+  **23** names into `lib/x86` out of `lib/onecore/x86` in this run (the x64 install had needed the
+  same for 22 names, Setup.md §6.11; both desktop CRT packages ship 30 real files, while the OneCore
+  payload holds 40 names for x64 and 41 for x86). `install.sh` built
+  msvctricks and generated `bin/x86/{cl,link,lib,ml,…}` — so `bin/x86/cl` → `Hostx64/x86/cl.exe`, an
+  x64-hosted cross compiler, no 32-bit Wine anywhere in the path.
+* The §6.8 probe at both arches: `bin/x86/cl` answers `Version 19.12.25835 … **for x86**`, the same
+  version as `bin/x64/cl` (`for x64`) — one toolset, two targets, and `cl`'s own banner is what says
+  it. `#include <vector>` compiles at both, a `/MT` console program links at both, and
+  `extract.CandidateObject` reads the x86 `.obj` as `machine I386 / bits 32` with no error, the x64
+  one as `AMD64 / 64`. Neither command line contains a bitness flag (`build_flags` for a variant that
+  names no `arch`): the only difference is which `cl.exe` ran, which is §8's first trap under test
+  rather than in prose. The i386 `.exe` is asserted to be a 32-bit PE and **not run** (§6.7).
+* `decomp check` needed no change: `msvc target x86` moved from `warn … no 32-bit target from this
+  toolchain` to `ok can build x86 candidates`, naming `Hostx64/x86/cl.exe` and `lib/x86` +
+  `lib/onecore/x86`. The tree changed, and X86-0's report reads the tree.
+
+Acceptance: `Tests/tools/check_msvc_x86_install.py` (the §6.8 probe at both arches, plus the tree
+and the two banners): 25 checks, exit 0, run twice — default shell (`cl` off PATH) and the documented
+`PATH=$PWD/toolchains/msvc/bin/x64`. It exits 2 on a tree without an x86 half, so it is a check and
+not a record of today. `check_msvc_x86_toolchain.py` still exits 0 with the new tree — the "after
+X86-1" half of its contract is now the live one.
+
+Not moved (§7): `check_masked_bytes` (gcc-o0 79 exact / 10 structural, gcc-o2 78 / 11, **gcc-o0-x86
+59** = its floor), `check_gate_tiers` (gcc-o0-x86 `{exact: 59, structural: 19, none: 11}`),
+`check_diff_accounting` (285 verdicts / 36 with a difference / 17 with a differing length),
+`check_phase2_try`, `check_analysis_cache` — all exit 0 with unchanged numbers.
+
+**The two "slow" MSVC scripts: they were not slow, they were stalled (2026-11-07, same day).**
+`check_msvc_detect.py` and `check_msvc_toolchain.py` had been left out of the runs above because
+they "take many minutes each" and in practice never returned a status. Both causes were found and
+fixed; [Setup.md §6.12](Setup.md) is the write-up, `decomp/spawn.py` is the code.
+
+* Wine with no `WINEPREFIX` never answers: `cl /?` in the fallback `~/.wine` produced nothing at
+  100 s, the same call in this repository's own `.wine` takes **0.9 s**. `spawn.wine_environment()`
+  now supplies the project prefix for any command that goes through Wine (wrapper or `wine64`
+  directly) when the caller set none, and says so — `decomp check` has a `wine prefix` row.
+* `subprocess.run(timeout=n)` is not a deadline: CPython kills the direct child (the `bash` wrapper)
+  and then waits for pipe EOF that the wrapper's `sed` jobs / `wine64` / `wineserver` keep open.
+  `spawn.run()` reads both pipes in threads and `killpg`s the group at the deadline — measured:
+  a `cl /?` that will never answer comes back in exactly the deadline, labelled `timed_out`.
+  Every tool-side call site (`check`, `compile`, `toolchain.probe_signatures`, `fidelity`,
+  `normalize.demangle`) and `Tests/eval.py` now go through it; the banner probe is bounded at 20 s
+  and cached per tool path instead of fourteen nominal 120 s waits.
+
+Re-run after that, with `PATH=$PWD/toolchains/msvc/bin/x64` and **no `WINEPREFIX` exported** — the
+exact shell that used to hang — both scripts now run to completion in **~50 s each, exit 0**:
+`check_msvc_toolchain.py` all four groups (identity, probe compile at /Od and /O2 with different
+bytes, probe link + run under Wine, and `eval.py build` 2.5 s / `selfcheck` **89 cases, 0
+failures**), `check_msvc_detect.py` all six groups (Rich toolset anchor, language/runtime, std
+bounds, flags, the /Od-vs-/O1|/O2 shape probe with 3 levels measured with `cl`, the `.pdata` unit
+sample, and the unchanged ELF path). `check_msvc_x86_install.py` and `check_msvc_x86_toolchain.py`
+still exit 0, `check_coff_candidate.py` is unchanged (same 19-unit gate failure, and it no longer
+waits out one 120 s compiler timeout per unit).
+
+**X86-1 is therefore closed.** The machine has a 32-bit target toolset, the report says so, and the
+MSVC acceptance scripts are green against it in seconds rather than never. What is left is the tool
+side: X86-2.
 
 **X86-2: make `arch` choose the driver — once.** *The unblocking phase.*
 
