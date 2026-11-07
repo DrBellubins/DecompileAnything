@@ -565,7 +565,7 @@ def _parse_range(text: str) -> tuple[int, int] | None:
 
 
 def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=None,
-	levels: tuple[int, ...] = (0, 1, 2, 3), probe: bool = True) -> dict:
+	levels: tuple[int, ...] = (0, 1, 2, 3), probe: bool = True, cfg: dict | None = None) -> dict:
 	"""Everything `decomp detect` reports, in one call (the benchmark check uses it too).
 
 	No Ghidra: the facts come from the file's own headers, and the optimisation level comes
@@ -573,7 +573,8 @@ def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=
 	produce at each `-O`.
 	"""
 	out = {"target": str(target), "note": {}, "profile": {}, "signatures": [], "guess": None,
-		"ranked": [], "problems": [], "sample": {}}
+		"ranked": [], "problems": [], "sample": {}, "probe_drivers": [], "compilers": [],
+		"fidelity": {}}
 	note = toolchain.build_note(target)
 	out["note"] = note
 	if note.get("error"):
@@ -592,26 +593,63 @@ def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=
 			or "the executable sections of the file (cut at every ret)", *toolchain.BAND,
 			" in --range" if rng else "")}
 		out["sample"]["range"] = [hex(rng[0]), hex(rng[1])] if rng else None
+		if "ret" in str(profile.get("sample_source") or ""):
+			# A file that names no units (an i386 PE has no `.pdata`, a stripped ELF no symbols) can
+			# still be sampled at real function boundaries when the analysis is cached: `--sample`
+			# takes its bodies from there. Say so where the weaker sample is printed, because for an
+			# i386 MSVC target it is the difference between a /Od answer and a wrong one (measured:
+			# the ret-cut sample of `Tests/build/msvc-o0-x86` ranks /O1 first, its analysis sample
+			# ranks /O0 first and states it as `strong`).
+			out["sample"]["hint"] = ("this file names no function boundaries, so every body here was "
+				"cut at a `ret`. `decomp analyze` it and pass --sample <name> to sample the analysis's "
+				"real function boundaries instead") if conn is None else (
+				"the cached analysis is available: pass --sample <name> to sample its function "
+				"boundaries instead of this ret-cut stream")
 	out["profile"] = profile
-	if not probe:
-		return out
-	if not profile.get("bodies"):
-		return out
+	# Which compiler on this machine could stand in for the one that made this file. For `cl` that
+	# question has a bitness in it: `bin/x86/cl` and `bin/x64/cl` are different compilers, and the
+	# file's own bitness is what picks the one a variant for this target would get (X86-5). So it is
+	# resolved once, here, with the same resolver `try` and `check` use since X86-2: the probe below,
+	# the fidelity answer below and a later `try` all name the same driver, or say why none does -
+	# and that answer comes before anything is compiled.
 	import shutil
 
+	bits = note.get("bits") or 64
 	family = note.get("compiler")
 	candidates = {"gcc": ["g++"], "clang": ["clang++"], "msvc": ["cl"]}.get(family, [])
 	if not candidates:
 		candidates = [compiler for compiler in ("g++", "clang++") if shutil.which(compiler)]
 		out["problems"].append("the compiler is not named in the file: ranking the toolchains "
 			"that are installed here by shape instead")
-	out["compilers"] = candidates
-	bits = note.get("bits") or 64
+	prefix, prefix_from = (config.msvc_prefix(cfg) if cfg else (None, ""))
 	for compiler in candidates:
-		if not shutil.which(compiler):
-			out["problems"].append("%s is not installed here - no probe for it, so no -O inference"
-				% compiler)
+		if not toolchain.msvc(compiler):
+			if shutil.which(compiler):
+				out["compilers"].append(compiler)
+			else:
+				out["problems"].append("%s is not installed here - no probe for it, so no -O "
+					"inference" % compiler)
 			continue
+		driver = toolchain.compiler_for({"compiler": compiler,
+			"arch": "x86" if bits == 32 else "x86-64"}, prefix=prefix, prefix_from=prefix_from)
+		out["probe_drivers"].append({"requested": compiler, "driver": driver.name,
+			"arch": driver.arch, "arch_from": driver.arch_from, "why": driver.why,
+			"gap": driver.gap})
+		if not driver.name:
+			out["problems"].append("no probe compiler for this target: %s - no -O inference"
+				% driver.gap)
+			continue
+		out["compilers"].append(driver.name)
+	# Phase 7's two answers about this file - whether the compiler here is the compiler that made
+	# it, and the flags beyond `-O` the file itself names. Both come from the file's own records,
+	# not from the code's shape, and both are needed by the `-O` answer below, so they are computed
+	# here rather than in the caller: `decomp detect`, `decomp check` and `decomp try` read the same
+	# one answer (`fidelity.version_agreement`) and cannot disagree about it (X86-5's guard).
+	out["fidelity"] = fidelity.for_target(note, profile,
+		out["compilers"] or [fidelity.default_compiler(note)])
+	if not probe or not profile.get("bodies"):
+		return out
+	for compiler in out["compilers"]:
 		signatures, problems = toolchain.probe_signatures(compiler, bits, levels=levels)
 		out["signatures"] += signatures
 		out["problems"].extend(problems)
@@ -620,6 +658,15 @@ def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=
 		out["guess"] = out["ranked"][0] if out["ranked"] else None
 	if out["guess"]:
 		out["guess"]["sampled"] = profile.get("bodies", 0)
+		# The era question, next to the answer (Docs/MSVC-x86-Plan.md §8's last trap): `-O` is
+		# inferred from what *this machine's* compiler produces, and a file made by another era - or
+		# another bitness - was made by a compiler whose flags mean something else. The agreement is
+		# Phase 7's one answer to "is this the toolchain that made this file", so it is quoted here,
+		# not recomputed.
+		gaps = [item["detail"] for item in out["fidelity"]["versions"]
+			if item.get("hard") or item.get("what") == "toolset era"]
+		if gaps:
+			out["guess"]["toolset_gap"] = " | ".join(gaps)
 	out["sample_warning"] = toolchain.sample_warning(profile, note,
 		narrowed=bool(range_text or sample))
 	return out
@@ -663,7 +710,7 @@ def detect(
 		conn = None
 	try:
 		outcome = detect_target(target, range_text=sample_range, sample=sample, conn=conn,
-			levels=wanted, probe=probe)
+			levels=wanted, probe=probe, cfg=cfg)
 	finally:
 		if conn is not None:
 			conn.close()
@@ -671,17 +718,20 @@ def detect(
 	note, profile, ranked = outcome["note"], outcome["profile"], outcome["ranked"]
 	guess = outcome["guess"]
 	# Phase 7: the flags beyond `-O` that the file itself names, and whether the compiler here is
-	# the compiler that made it. Both come from the file's own records, not from the code's shape.
-	fid = fidelity.for_target(note, profile, outcome.get("compilers") or [])
-	outcome["fidelity"] = {"versions": [{"state": item["state"], "hard": item["hard"],
-		"detail": item["detail"], "built": item["built"], "installed": item["installed"]}
-		for item in fid["versions"]],
-		"flags": [{"flag": item["flag"], "state": item["state"],
-			"certainty": item["certainty"], "add": item["add"], "why": item["why"]}
-			for item in fid["flags"]["findings"]],
-		"suggest": fid["flags"]["suggest"]}
+	# the compiler that made it. Both come from the file's own records, not from the code's shape,
+	# and `detect_target` computed them next to the `-O` answer so the two cannot disagree.
+	fid = outcome["fidelity"]
 	if as_json:
-		payload = {key: value for key, value in outcome.items() if key != "signatures"}
+		payload = {key: value for key, value in outcome.items()
+			if key not in ("signatures", "fidelity")}
+		payload["fidelity"] = {
+			"versions": [{"state": item["state"], "hard": item["hard"],
+				"detail": item["detail"], "built": item["built"], "installed": item["installed"]}
+				for item in fid["versions"]],
+			"flags": [{"flag": item["flag"], "state": item["state"],
+				"certainty": item["certainty"], "add": item["add"], "why": item["why"]}
+				for item in fid["flags"]["findings"]],
+			"suggest": fid["flags"]["suggest"]}
 		payload["probes"] = [{"optimize": item["optimize"], "compiler": item.get("compiler"),
 			"profile": item["profile"]} for item in outcome["signatures"]]
 		echo(json.dumps(payload, indent=1, default=str))
@@ -699,7 +749,7 @@ def detect(
 	echo("code shape (%s):" % outcome["sample"].get("source", "the target"))
 	if profile:
 		for line in toolchain.profile_lines(profile,
-				features=toolchain.feature_family((note.get("compiler") or ""))):
+				features=toolchain.feature_family(note.get("compiler") or "", note.get("bits"))):
 				echo(line)
 	else:
 		for problem in outcome["problems"]:
@@ -707,8 +757,10 @@ def detect(
 	warning = outcome.get("sample_warning") or ""
 	if warning:
 		echo("  caution: %s" % warning)
+	if outcome["sample"].get("hint"):
+		echo("  sample better: %s" % outcome["sample"]["hint"])
 	if toolchain.msvc(note.get("compiler")):
-		for line in toolchain.msvc_shape_flags(profile):
+		for line in toolchain.msvc_shape_flags(profile, bits=note.get("bits")):
 			echo("  %s" % line)
 
 	echo()
@@ -719,11 +771,24 @@ def detect(
 	if probe and ranked:
 		echo()
 		echo("measured with the toolchains installed here (a candidate is built with these):")
+		for item in outcome.get("probe_drivers") or []:
+			# Which compiler answered, and which bitness it emits: for `cl` that *is* the target
+			# architecture, so an `-O` answer about a 32-bit file has to say it came from a 32-bit
+			# driver (Docs/MSVC-x86-Plan.md X86-5).
+			echo("  probe %s -> %s%s" % (item["requested"], item["driver"] or "none",
+				" (target %s: %s)" % (item["arch"], item["arch_from"]) if item["arch"] else ""))
+			if item["why"]:
+				echo("    chosen: %s" % item["why"])
 		for item in ranked[:8]:
-			echo("  %-10s -O%d  distance %.3f  next %.3f" % (item.get("compiler"), item["optimize"],
-				item["distance"], item.get("runner_up", item["distance"])))
+			echo("  %-40s -O%d  distance %.3f  next %.3f" % (str(item.get("compiler"))[-40:],
+				item["optimize"], item["distance"], item.get("runner_up", item["distance"])))
 		echo()
-		echo("optimize = %s  (%s)" % (guess["optimize"], guess.get("confidence")))
+		answer = str(guess["optimize"])
+		if guess.get("toolset_gap"):
+			# The era/bitness gap goes *in the answer*, not two screens earlier: a v141 `-O` reading
+			# of a v80 file is not that file's -O (Docs/MSVC-x86-Plan.md §8's last trap).
+			answer += " - for the toolchain here, not the file's: %s" % guess["toolset_gap"]
+		echo("optimize = %s  (%s)" % (answer, guess.get("confidence")))
 		if guess.get("level_class"):
 			echo("  as a flag this is %s: the config picks the nearer one, %s" % (
 				guess["level_class"], toolchain._MSVC_OPTIMIZE.get(int(guess["optimize"]), "?")))

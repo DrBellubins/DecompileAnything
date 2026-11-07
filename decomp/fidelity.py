@@ -50,11 +50,21 @@ def note_identity(note: dict) -> dict:
 	if "no toolset table entry" in family:
 		family = ""
 	version = str(note.get("compiler_version") or "")
-	if not version and family and note.get("compiler") == "msvc":
+	if not version and note.get("compiler") == "msvc":
+		# A linker version is the file's own fact even when the toolset table has no entry for it, so
+		# it is named in either case - the wording is what differs (`outside_table` below).
 		version = str(toolset.get("linker_version") or "")
 	return {"vendor": note.get("compiler") or "", "version": version,
 		"toolset": family if note.get("compiler") == "msvc" else "",
 		"path": note.get("compiler_id") or "",
+		# The bitness the file is. Not a detail: for a target, bitness is a property of the
+		# *compiler that made it* (`bin/x86/cl` vs `bin/x64/cl`), so it belongs to the identity this
+		# function returns and is compared there (Docs/MSVC-x86-Plan.md X86-5).
+		"bits": int(note.get("bits") or 0) or None, "arch": note.get("arch") or "",
+		# A file can name its linker exactly and still name no *toolset*: a link.exe 8.0 image is
+		# outside the table (v100 and newer), and that is a fact about the era question, not an
+		# absence of one. Kept apart so the wording can say which of the two happened.
+		"outside_table": "no toolset table entry" in str(toolset.get("family") or ""),
 		"source": ("the file's own version record" if note.get("compiler_version")
 			else ("the linker version and Rich header" if family else "")),
 		"named": bool(version or family or note.get("compiler"))}
@@ -68,8 +78,11 @@ _RICH_LINKER = re.compile(r"rich:id=258:build=(\d+)")
 _RICH_ANY = re.compile(r"rich:id=|codeview:|pogo:|\.pdb")
 
 
-def text_identity(build_notes: str) -> dict:
+def text_identity(build_notes: str, bits: int | None = None, arch: str = "") -> dict:
 	"""What the analysis cached about the compiler that made the target.
+
+	The bitness is not in the record string, so the caller passes what the analysis cached next to
+	it (`target_bits`/`target_arch`) - the same fact, from the same build note.
 
 	`decomp check` answers the question about a cached target from this string instead of
 	re-reading a 40 MB binary. Records that name only the toolchain (a Rich header, a CodeView or
@@ -78,7 +91,8 @@ def text_identity(build_notes: str) -> dict:
 	"""
 	text = str(build_notes or "")
 	identity = {"vendor": "", "version": "", "toolset": "", "path": "", "source":
-		"the build notes cached with the analysis", "named": False}
+		"the build notes cached with the analysis", "named": False,
+		"bits": int(bits or 0) or None, "arch": str(arch or "")}
 	match = toolchain._COMMENT_GCC.search(text)
 	if match:
 		identity["vendor"], identity["version"] = "gcc", (match.group(2) or match.group(3) or "")
@@ -132,7 +146,7 @@ def installed_identity(compiler: str) -> dict:
 
 def _identify(name: str) -> dict:
 	out = {"compiler": name, "path": "", "vendor": "", "version": "", "toolset": "",
-		"line": "", "named": False}
+		"line": "", "named": False, "bits": None, "bits_from": ""}
 	if toolchain.msvc(name):
 		from . import check  # local: check imports toolchain
 
@@ -143,6 +157,11 @@ def _identify(name: str) -> dict:
 		out["toolset"] = (tool.toolset() or {}).get("family", "") if tool.vendor == "msvc" else ""
 		out["line"] = tool.describe()
 		out["named"] = bool(out["toolset"] or out["version"])
+		# Which bitness this driver emits, from the directory it is installed for. For `cl` there is
+		# no other answer to that question, and it is the first question a 32-bit target asks.
+		bitness, how = toolchain.driver_bitness(tool.path or name)
+		out["bits"], out["bits_from"] = (32 if bitness == "x86"
+			else 64 if bitness == "x64" else None), how
 		return out
 	import shutil
 
@@ -201,6 +220,22 @@ def version_agreement(built: dict, installed: dict) -> dict:
 			or installed.get("compiler") or "the variant's compiler")
 		return out
 	built_vendor, machine = str(built.get("vendor") or ""), str(installed.get("vendor") or "")
+	# The bitness first, because it is the more basic mismatch and the one an MSVC target hits: an
+	# x64 `cl` and an i386 `cl` are different compilers, and no flag closes that gap. Asked only
+	# when both sides can say, which for `cl` means the directory the driver is installed for
+	# (Docs/MSVC-x86-Plan.md §8's first trap). This is the one place the question is answered, so
+	# `decomp check`, `decomp try` and `decomp detect` cannot disagree about it (X86-5's guard).
+	want_bits, have_bits = built.get("bits"), installed.get("bits")
+	if want_bits and have_bits and int(want_bits) != int(have_bits):
+		out["state"], out["hard"], out["what"] = "different", True, "target bitness"
+		out["detail"] = ("this file is %d-bit%s code and %s emits %d-bit (%s): a target bitness is "
+			"which compiler you run, not a flag you add, so these two cannot produce the same bytes - "
+			"use the variant whose driver targets this bitness (Docs/MSVC-x86-Plan.md X86-2, "
+			"Docs/Setup.md §6.7)" % (int(want_bits),
+				" (%s)" % built["arch"] if built.get("arch") else "",
+				installed.get("line") or installed.get("compiler") or "the variant's compiler",
+				int(have_bits), installed.get("bits_from") or "its install directory"))
+		return out
 	if built_vendor and machine and built_vendor != machine:
 		out["state"], out["hard"] = "different", True
 		out["what"] = "different toolchain"
@@ -225,6 +260,21 @@ def version_agreement(built: dict, installed: dict) -> dict:
 					"Docs/Setup.md §6 for installing one by version" % (
 						want, installed.get("line"), installed.get("toolset")))
 		else:
+			if built.get("outside_table"):
+				# The era question, answered instead of shrugged at: the file names a linker the
+				# toolset table has no entry for, so its era cannot be named - and the honest
+				# consequence is that a reading taken from the compiler installed here describes
+				# *this* compiler. Not `hard`: the tier question is about bytes, and nobody can
+				# answer that one either way across a gap this wide (Docs/MSVC-x86-Plan.md §8).
+				out["state"], out["what"] = "unknown", "toolset era"
+				out["detail"] = ("the file names link.exe %s, which is outside the toolset table "
+					"(v100 and newer), so its era cannot be named: the compiler here is %s, and "
+					"anything measured with it describes this toolchain, not the one that made this "
+					"file - see Docs/Setup.md §6.5 for installing a toolchain by version"
+						% (built.get("version") or "?",
+							installed.get("line") or installed.get("compiler") or "the variant's "
+							"compiler"))
+				return out
 			out["detail"] = ("the file says %s and %s answered %s: one of the two is not named "
 				"exactly, so no comparison is made" % (
 					want or built.get("version") or "an MSVC toolchain",
@@ -270,7 +320,8 @@ def cached_agreement(meta: dict, compiler: str) -> dict:
 	Only when those notes name nothing (a fully stripped target) is the file re-read, which is the
 	case where the answer is worth a second parse.
 	"""
-	built = text_identity(meta.get("build_notes") or "")
+	built = text_identity(meta.get("build_notes") or "", meta.get("target_bits"),
+		meta.get("target_arch"))
 	path = Path(str(meta.get("target_path") or ""))
 	if not built["named"] and path.is_file():
 		found = note_identity(toolchain.build_note(path))
@@ -294,7 +345,7 @@ def evidence(profile: dict | None = None, texts: list[str] | None = None) -> dic
 	"""
 	from . import toolchain as _t
 
-	names = ("canary", "endbr", "vex", "ymm", "zmm", "fma", "rcp", "gs")
+	names = ("canary", "endbr", "vex", "ymm", "zmm", "fma", "rcp", "gs", "gs_frame")
 	if profile:
 		out = {name: float(profile.get(name, 0.0)) for name in names}
 		out["bodies"] = int(profile.get("bodies", 0))
@@ -313,6 +364,8 @@ def evidence(profile: dict | None = None, texts: list[str] | None = None) -> dic
 		out["endbr"] = 1.0
 	if any(_t._GS_XOR.search(item) or _t._GS_CALL.search(item) for item in body):
 		out["gs"] = 1.0
+	if any(_t._GS_XOR_FRAME.search(item) for item in body):
+		out["gs_frame"] = 1.0
 	for name in ("vex", "ymm", "zmm", "fma", "rcp"):
 		pattern = getattr(_t, "_" + name.upper())
 		out[name] = 1.0 if any(pattern.search(item) for item in body) else 0.0
@@ -412,28 +465,57 @@ def flag_findings(note: dict, ev: dict | None = None, profile: dict | None = Non
 			_finding(out, "/guard:cf", "unknown", "shape",
 				"/guard:cf is x64-only: nothing is claimed about it for a 32-bit image")
 	# --- stack protection --------------------------------------------------------------
-	if ev["canary"] >= 0.95 and not single:
-		_finding(out, "-fstack-protector", "on", "shape",
-			"every one of the %d sampled bodies reads a stack canary: that is "
-			"-fstack-protector-all, which is the only level that guards every function"
-			% ev["bodies"], add="-fstack-protector-all")
-	elif ev["canary"] > 0.0:
-		_finding(out, "-fstack-protector", "on", "shape",
-			("this body reads a stack canary: the build has some -fstack-protector level on, and "
-				"one body cannot say which" if single else
-				"%d%% of the sampled bodies read a stack canary: some -fstack-protector level is "
-				"on. Which level is not separable from the code (-strong guards functions with "
-				"arrays and address-of locals, -all guards every function), so try -strong first"
-				% round(ev["canary"] * 100)),
-			add="-fstack-protector-all" if ev["canary"] >= 0.95 else "-fstack-protector-strong")
-	elif not single and ev["bodies"] >= 10:
-		_finding(out, "-fstack-protector", "off", "shape",
-			"none of the %d sampled bodies reads a canary: this build has -fstack-protector off, "
-			"or is a build of functions none of that flag protects" % ev["bodies"])
+	# The dialect matters: `-fstack-protector` is a GCC flag and `%fs:` is a System V canary, so
+	# neither is a sentence to say about a file this tool identified as `built by msvc`. MSVC's
+	# guard is /GS, and it looks different by bitness as well (the cookie is xor-ed with %rsp on
+	# x64 and with the frame register on i386). Saying the wrong dialect is the bug that made
+	# `deadrising2.exe` get an `-fstack-protector` finding two lines under its own `/GS-` reading
+	# (Docs/MSVC-x86-Plan.md §4).
+	if is_msvc:
+		guarded = int(note.get("bits") or 64) != 64
+		share = max(ev["gs_frame"] if guarded else ev["gs"], ev["gs"])
+		form = ("the cookie xor-ed with the frame register" if guarded
+			else "the cookie xor-ed with %rsp")
+		if share > 0.0:
+			_finding(out, "/GS", "on", "shape",
+				("this body carries the /GS guard (%s): the build has it on, which is `cl`'s "
+					"default" if single else
+					"%d%% of the sampled bodies carry the /GS guard (%s), which is `cl`'s default. Not "
+					"every function is guarded - only the ones with a buffer - so a low share is not "
+					"evidence of /GS-" % (round(share * 100), form)), add="/GS")
+		elif not single and ev["bodies"] >= 10:
+			_finding(out, "/GS", "unknown", "shape",
+				"none of the %d sampled bodies carries the /GS guard. That is what /GS- looks like, or "
+				"a build whose functions have nothing to guard - and /GS only guards functions with a "
+				"buffer, so it cannot be called from an absence" % ev["bodies"])
+	else:
+		if ev["canary"] >= 0.95 and not single:
+			_finding(out, "-fstack-protector", "on", "shape",
+				"every one of the %d sampled bodies reads a stack canary: that is "
+				"-fstack-protector-all, which is the only level that guards every function"
+				% ev["bodies"], add="-fstack-protector-all")
+		elif ev["canary"] > 0.0:
+			_finding(out, "-fstack-protector", "on", "shape",
+				("this body reads a stack canary: the build has some -fstack-protector level on, and "
+					"one body cannot say which" if single else
+					"%d%% of the sampled bodies read a stack canary: some -fstack-protector level is "
+					"on. Which level is not separable from the code (-strong guards functions with "
+					"arrays and address-of locals, -all guards every function), so try -strong first"
+					% round(ev["canary"] * 100)),
+				add="-fstack-protector-all" if ev["canary"] >= 0.95 else "-fstack-protector-strong")
+		elif not single and ev["bodies"] >= 10:
+			_finding(out, "-fstack-protector", "off", "shape",
+				"none of the %d sampled bodies reads a canary: this build has -fstack-protector off, "
+				"or is a build of functions none of that flag protects" % ev["bodies"])
 	# --- instruction set ---------------------------------------------------------------
 	levels = [str(item) for item in (note.get("gnu_isa") or [])]
 	used = [str(item).upper() for item in (note.get("gnu_features") or [])]
 	exact = next((item for item in reversed(levels) if item.startswith("x86-64-v")), "")
+	if int(note.get("bits") or 64) != 64:
+		# An x86-64 ISA level is a statement about a 64-bit build. Quoting one for a 32-bit image -
+		# or reasoning from a `.note.gnu.property` a PE cannot have - is the other half of the
+		# dialect bug (Docs/MSVC-x86-Plan.md X86-5): the level names go in the 64-bit branch only.
+		levels, exact = [], ""
 	if not is_msvc and exact:
 		# The ISA level the file's own record names, in GCC's own spelling. This is the strongest
 		# evidence there is for a vector flag, and it is a fact rather than a reading.
@@ -474,7 +556,9 @@ def flag_findings(note: dict, ev: dict | None = None, profile: dict | None = Non
 			"%d%% of the instructions are fused multiply-add forms%s. -mfma is how gcc is asked for "
 			"them; -march=%s already includes them, and an intrinsic written in the source is the "
 			"other way they appear"
-			% (round(ev["fma"] * 100), "" if not single else " (in this body)", exact or "x86-64-v3"),
+			% (round(ev["fma"] * 100), "" if not single else " (in this body)", exact
+				or ("-march=x86-64-v3" if int(note.get("bits") or 64) == 64
+					else "the AVX level above")),
 			add="-mfma")
 	if ev["rcp"] > 0.0:
 		_finding(out, "-ffast-math", "unknown", "hint",

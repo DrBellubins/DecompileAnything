@@ -623,7 +623,9 @@ PATH=$PWD/toolchains/msvc/bin/x64:$PATH WINEPREFIX=$PWD/.wine \
   .venv/bin/python Tests/tools/check_msvc_detect.py
 ```
 
-Six groups, and only two of them need a compiler. **(1) The toolset, read twice**: the Rich
+Seven groups, and only two of them need a compiler — see
+[What a 32-bit MSVC build is](#what-a-32-bit-msvc-build-is-msvc-x86-x86-5-2026-11-07) for the
+seventh, which is the 32-bit one. **(1) The toolset, read twice**: the Rich
 header's linker record (id 258) gives build 25711 on `notepad.exe`, which reads as the 14.12 its
 optional header states, so `agree` must be true; the records that name no toolset (id 1 at build
 0, id 147 at build 30729) must stay out of the identity — the same 30729 appears in a 2018 OS
@@ -639,7 +641,44 @@ writes for a PE parsed back and compiled. **(5) The shape profile**: `cl` probed
 requiring `/Od` to be far from the optimising levels on the MSVC features and `detect` on the
 shipped `/O2 /GL` target to answer an optimising level while reporting `/O1|/O2` as a class, and
 reporting `/GS` from the code. **(6)** the ELF path — still the ret-cut sample, still the Itanium
-features. Exit 2 when there is no `cl` (groups 1-4 still run and are reported).
+features. **(7)** the 32-bit path — see the X86-5 section. Exit 2 when there is no `cl` (groups 1-4
+still run and are reported).
+
+## What a 32-bit MSVC build is (MSVC-x86 X86-5, 2026-11-07)
+
+```sh
+# the whole file, with the x64 groups included
+PATH=$PWD/toolchains/msvc/bin/x64:$PATH WINEPREFIX=$PWD/.wine \
+  .venv/bin/python Tests/tools/check_msvc_detect.py
+```
+
+Group 7 is the 32-bit one, and it needs no `cl` on PATH — the driver comes from `[msvc] prefix` in
+`Tests/project.toml`, which is how `try` and `check` get it too. It asserts, against this machine's
+`bin/x86/cl`: the **x64 feature set reads 0.000** at `/Od`, `/O1` and `/O2` (`rspmem`, `argstore`,
+the cookie-xor-`%rsp` of `/GS` — they are Microsoft *x64 ABI* features and cannot carry an answer
+here); the **i386 set separates the classes** — `/Od` stands up a `%ebp` frame in 78% more bodies
+than `/O1|/O2` do, while `/O1` and `/O2` sit 0.890 apart against `/Od`'s 2.812, so they are
+reported as a class; the i386 `/GS` reading (the cookie xor-ed with the **frame** register) is
+non-zero at `/Od` and `/O1`. Then `detect` itself: on `Tests/Proprietary/deadrising2.exe` the
+readings are non-zero (1 515 bodies), the probe driver is `bin/x86/cl` and is named with why, and
+the answer carries the era gap in the same line (`the file names link.exe 8.0, which is outside the
+toolset table`) — no v141 `-O` is presented as that file's. The known-answer case is
+`Tests/build/msvc-o0-x86/da_tests.stripped`, built here at `/Od`: sampled from the **cached
+analysis** it must answer `-O0` with confidence `strong` (measured distance 1.248 against 1.776).
+That last group is skipped with a printed reason if the target is not analysed — a 32-bit PE has no
+function table, so the analysis is the only sample whose bodies start at real boundaries; the
+ret-cut sample ranks `/O1` first and says so in the same sentence. Finally the dialect guards: no
+`-fstack-protector` finding for a `built by msvc` file (it gets `/GS`), no x86-64 ISA claim for a
+32-bit image, and `fidelity.version_agreement` naming an **x64 driver against a 32-bit file** as a
+bitness gap — the one answer `check`, `try` and `detect` all read.
+
+By hand:
+
+```sh
+.venv/bin/python -m decomp detect Tests/Proprietary/deadrising2.exe -C Tests/project.toml
+.venv/bin/python -m decomp detect Tests/build/msvc-o0-x86/da_tests.stripped \
+  -C Tests/project.toml --sample FUN_        # the analysis sample, real boundaries
+```
 
 ## The binary
 
@@ -816,8 +855,10 @@ which is the half that matters: the tool does not raise a toolchain gap where th
   *run* (X86-4: wibo, `89 cases, 0 failures`, goldens captured, `crosscheck` clean). A 32-bit
   *target* needed none of the Wine work; a 32-bit *guest* needed Setup.md §6.7's Option B.
   `decomp check` keeps the two facts apart (`msvc target x86` vs `run 32-bit PE`).
-  What is still open in that plan is X86-5 (an i386 shape profile, so `detect` can answer `-O` for a
-  32-bit MSVC file) and X86-6 (the normalisation ceiling below, which the two 32-bit paths share).
+  What is still open in that plan is X86-6 (the normalisation ceiling below, which the two 32-bit
+  paths share); X86-5 closed the same day — an i386 shape profile measured on this `cl` means
+  `detect` answers `-O` for a 32-bit MSVC file, probes with the driver of that bitness, and states
+  the toolset-era gap inside the answer (see *What a 32-bit MSVC build is* above).
   Two rules for reading any 32-bit MSVC number: a 32-bit PE has no `.pdata`, so its answer key is
   symbol spacing or `link /MAP` (and `eval.py build` prints which), and its numbers belong next to
   the `-m32` row, never next to `msvc-o0`'s.

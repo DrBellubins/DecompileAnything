@@ -29,7 +29,7 @@ Reading a 32-bit binary works. Matching one exists for GCC only. Per command, on
 |---|---|---|
 | `analyze` / `find` / `show` / `status` | works (`x86:LE:32:default`, the ret-cut unit situation) | works — `deadrising2.exe` is analysed and listed |
 | `types` (structure recovery) | works (Design-Plan Phase 4; `this` from `8(%ebp)`) | works (MSVC-Plan MS-5: RTTI in absolute 4-byte addresses, `this` from `%ecx`, 769 classes in the game) |
-| `detect` | works | works **except** the `-O` inference: the x64 MSVC feature set reads zeros, and it refuses to probe ("cl is not installed here") |
+| `detect` | works | works **except** the `-O` inference: the x64 MSVC feature set reads zeros, and it refuses to probe ("cl is not installed here"). **Since X86-5 (same day):** that half works too — a PE32 is probed with the driver that emits i386 code (`[msvc] prefix`/`arch` resolves it, and the report names it), scored on an i386 feature set measured on that `cl` (the x64 set reads 0.000 here, which is now asserted), with the ret-cut sample's weakness and the toolset-era gap stated *inside* the answer |
 | `check` | the variant, its arch and the compiler agree | *was:* reports no `cl`, or the x64 one; `msvc_sdk()` called the SDK complete because it looked at x64 paths only. **Since X86-0 (2026-11-07):** an installed-but-off-PATH toolchain is found and named as that, `msvc target x64` / `msvc target x86` state the bitness each installed toolchain can produce, `msvc_sdk(arch=…)` answers per arch, and an `arch = "x86"` MSVC variant is named before any work starts. **Since X86-1 (same day):** both rows say `ok can build x86 candidates` — the 32-bit target toolset is installed, so the report's remaining MSVC gap is tool-side, not machine-side. **Since X86-2:** the `compiler msvc-*` rows report the driver the variant resolves to (with its bitness and why), so an installed toolchain is `ok` with no `cl` on PATH, and the `arch <variant>` row is the resolver's own sentence — `check` and `try` cannot disagree |
 | `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **the driver exists and is now chosen**: since X86-1 the machine can produce 32-bit COFF, and since X86-2 (2026-11-07) `arch = "x86"` resolves to `bin/x86/cl`, whose object measures 32-bit, with no `-m32`/`/arch:IA32` in its flags. **Since X86-3 (same day)** there is something to score: `msvc-o0-x86` builds, is analysed and is read — 89/89 extents agree and `check_msvc_x86_candidate.py` holds the first floor (mean 99.75 %, 66/89 past the gate); the 23 that stop at `structural` do so for two reasons that are not i386 reading (naming, and the X86-6 operand shape) |
 | `link` (whole-program, Phase 6) | tested on 64-bit ELF only (`check_phase6_link.py` measures `gcc-o0`); a 32-bit ELF relink is untested | untested for a 32-bit PE. Two of the three things it needed are done — i386 relocation reading (X86-3) and a link that can be run (X86-4, Setup.md §6.7 Option B: wibo runs a 32-bit PE here) — what remains is the x86 link form in `relink` |
@@ -109,7 +109,11 @@ symptom: nothing upstream was ever asked to produce 32-bit code.
    a bare `cl`/`cl.exe` name only, so a path-named driver is treated as GCC; nothing resolves
    `arch = "x86"` to `bin/x86/cl`; and `Tests/eval.py:98` has its own copy of the flag rule which
    turns `arch = "x86"` into `-m32` for every non-MSVC-name driver. Two places, already divergent.
-3. **The MSVC shape profile is x64-shaped.** `FEATURES_MSVC` (toolchain.py:1215) is `rspmem`,
+3. **The MSVC shape profile was x64-shaped.** *(Closed by X86-5, 2026-11-07 — `FEATURES_MSVC_I386`
+   and the i386 /GS reading are measured on this `cl`, `feature_family` is bitness-aware, and the
+   probe runs on the driver the target's bitness asks for. The paragraph is kept as the measurement
+   the phase was written from.)*
+   `FEATURES_MSVC` (toolchain.py:1215) is `rspmem`,
    `argstore`, `gs` — locals off `%rsp`, parameters written to the 32-byte shadow space, the cookie
    xor-ed with `%rsp`. All three are properties of the Microsoft **x64** ABI and are identically
    zero on i386 code, which is what §3 measured.
@@ -126,6 +130,9 @@ symptom: nothing upstream was ever asked to produce 32-bit code.
 Plus one reporting bug that is not a cause but should be fixed with X86-5: for an MSVC file the
 fidelity block offers `-fstack-protector` (a GCC flag) as the finding — see the `deadrising2`
 output above, which says `/GS-` two lines earlier and `-fstack-protector` in the flags list.
+*(Closed by X86-5: an MSVC file gets a `/GS` finding; the x86-64 ISA spellings are behind a bitness
+guard; the x86-64/x86 dialect of every finding is chosen from `note["compiler"]` and
+`note["bits"]`.)*
 
 ## 5. The bar this plan is aiming at
 
@@ -140,6 +147,8 @@ output above, which says `/GS-` two lines earlier and `-fstack-protector` in the
    Tests/README.md, the way `gcc-o0-x86` has one.
 4. `decomp detect` on a 32-bit MSVC target either answers `-O` or refuses **with a reason**, and the
    feature readings it prints are non-zero for i386 shapes (i.e. the profile measures something).
+   *Done by X86-5 and asserted by `check_msvc_detect.py` group 7; the known-answer case — the
+   `/Od` benchmark build detected as `/Od` — is in that group too.*
 5. Nothing that the x64 MSVC path or the `-m32` GCC path asserts today moves (see §7).
 
 What this plan does **not** aim at: matching a 32-bit MSVC target at `/O1` or `/O2`; matching a
@@ -678,6 +687,97 @@ analyses, matches and scores a 32-bit target without ever starting one.
 * Not claimed: the `/O1` vs `/O2` distinction, and any `-O` answer for a file whose era differs from
   the compiler installed here (§8).
 
+**Done 2026-11-07.** The i386 shape profile, measured; the probe driver chosen by the target's
+bitness; and bitness inside the one answer that says "is this the toolchain that made this file".
+What the bullets above expected, against what this `cl` produced — the table below *is* the
+measurement (14.12.25835 through `toolchains/msvc/bin/x86/cl`, share of the 9 probe bodies), and
+the last column is the X86-4 build, made here at `/Od`, so it is a known answer:
+
+| feature | `/Od` | `/O1` | `/O2` | `msvc-o0-x86` (/Od, known) |
+|---|---|---|---|---|
+| `frame` (`push %ebp; mov %esp,%ebp`) | 1.00 | 0.22 | 0.00 | 0.75 |
+| `framemem` (locals read through `%ebp`) | 0.46 | 0.11 | 0.00 | 0.31 |
+| `poprbp` | 1.00 | 0.22 | 0.11 | 0.69 |
+| `spill` (a store to `-N(%ebp)`) | 0.56 | 0.11 | 0.00 | 0.33 |
+| `subrsp` | 0.56 | 0.11 | 0.11 | 0.36 |
+| `gs_frame` (the /GS cookie xor-ed with the frame register) | 0.11 | 0.11 | 0.00 | 0.05 |
+| `xmm` | 0.03 | 0.05 | 0.27 | 0.06 |
+| `calls` | 0.01 | 0.01 | 0.00 | 0.05 |
+| `rspmem` / `argstore` / `gs` — the x64 set | 0.00 | 0.00 | 0.00 | 0.00 |
+
+* **Confirmed:** `rspmem`, `argstore` and the cookie-xor-`%rsp` form of `gs` are x64-ABI features.
+  They read 0.000 at every level and on the real 32-bit target too, exactly as §3 measured for
+  `deadrising2.exe`. They stay in `FEATURES_MSVC`, which is now the **x64** set.
+* **Confirmed:** what separates the levels here is the Itanium frame set — `FEATURES_MSVC_I386` is
+  `frame, framemem, poprbp, spill, subrsp, gs_frame, xmm, calls`, i.e. the MSVC-specific part
+  shrank to a single new reading, as the bullet guessed. `/GS` on i386 is `_GS_XOR_FRAME`: the
+  cookie comes from an absolute slot and is xor-ed with the *frame* register (`xorl %ebp, %eax`,
+  or `%esp` where no frame pointer is used), stored to `-4(%ebp)`. Not `%fs:`, not the x64 form.
+* **Refuted, by measurement:** two features the bullets expected to be useful. `leave` — this `cl`
+  writes `popl %ebp; retl` and emits no `leave` at any level (0.000), so it is excluded from the
+  set: it would add a constant to every distance. And an argument-push feature (`argpush`):
+  measured 1.00/0.44/0.56 counting any `push`, and 0.11/0.00/0.00 once only pushes next to a
+  `call` are counted — against 0.50 on the target. It reads what the *program* does (does it call,
+  with what arguments), not what the flags did, so it is reported and not scored. `retimm`
+  (`ret $N`, the callee pops) is likewise reported: 0.65 on `deadrising2.exe` against 0.12 on the
+  benchmark, which is a calling-convention reading (C++ member functions), not an optimisation one.
+* **`/O1` vs `/O2` is even less separable here than on x64**, as expected: on the i386 set the two
+  probe profiles are **0.890** apart while `/Od` is **2.812** from `/O1`. The class machinery is
+  unchanged and says so (`level_class`, and `confidence` quotes the frame readings, not `%rsp` ones
+  — `_msvc_tells` is bitness-aware).
+* **`probe_signatures`** no longer refuses `bits != 64` for an MSVC driver, and its flags now come
+  from `build_flags` (X86-2's single source), so a probe cannot drift from what a variant would be
+  built with. Nothing about bitness is in those flags, because for `cl` bitness never was a flag.
+* **The probe driver.** `detect` resolves it through `toolchain.compiler_for` for the *file's*
+  bitness (the X86-2 resolver), so a PE32 is probed with `toolchains/msvc/bin/x86/cl` — printed as
+  `probe cl -> …/bin/x86/cl (target x86: bin/x86/cl is the directory this driver is installed for)`
+  with the reason, carried in `--json` as `probe_drivers`, and used for the fidelity comparison too.
+  When nothing can serve the target, the refusal is `check`'s own sentence and nothing is compiled.
+* **One place, with bitness in it.** `fidelity.note_identity` carries the file's bitness (from the
+  build note, and from `target_bits` in the cached analysis) and `installed_identity` carries what
+  the driver's install directory says it emits; `version_agreement` answers a bitness gap
+  (`what = "target bitness"`, `hard`) *before* the toolset question. `check.build_agreement`,
+  `try`'s `verdict.build_mismatch` and `detect`'s fidelity block all read that one answer, so the
+  disagreement §X86-5's bullet warned about cannot happen. A file whose linker has no table entry is
+  now named as an era gap (`what = "toolset era"`, not `hard`) instead of "no comparison is made".
+* **The dialect guards** (§4's trailing bug) are in `fidelity.flag_findings`: an MSVC file gets a
+  `/GS` finding, never `-fstack-protector`; the x86-64 ISA spellings sit behind `bits == 64`. The
+  `deadrising2.exe` output now says `/GS` under its own shape block and `/guard:cf is x64-only`.
+* **Sampling, in the same sentence.** `confidence()` ends every branch with `sample_caveat()`, so a
+  ret-cut sample is named in the answer itself, and `detect` names the better sample where one
+  exists (`sample.hint`). The consequence is measured, not asserted away: on
+  `Tests/build/msvc-o0-x86/da_tests.stripped` — built here at `/Od`, so the answer is known — a
+  ret-cut sample ranks **/O1 first** (1.257 against /O0's 1.816) while saying it is a weaker sample,
+  and the same file sampled from the cached analysis ranks **-O0 first and calls it `strong`**
+  (1.248 against 1.776). For a 32-bit PE, the analysis *is* the only sample with real function
+  boundaries: no `.pdata`, and a ret-cut stream cuts prologues off bodies. So `detect` says which
+  sample it used and what that costs.
+* **The era question, in the open.** `detect Tests/Proprietary/deadrising2.exe` answers
+  `optimize = 2 - for the toolchain here, not the file's: the file names link.exe 8.0, which is
+  outside the toolset table (v100 and newer)…` — one line, no v141 answer presented as that file's.
+  `starter_config` writes the same warning in the config it produces, and keeps the
+  "`--major 15 --msvc-version 15.5`" install line only for a file whose era the table can name.
+
+**Measured (the acceptance bar).** `Tests/tools/check_msvc_detect.py` is now seven groups, 68 checks,
+exit 0. The x64 group's probe shapes and `notepad.exe`'s target shape are identical to the run
+before this change (0.537/1.0/0.111 and 0.118/0.037/0.156). Group 7 asserts: the x64 set reads
+0.000 on i386 at every level; the i386 set separates `/Od` from `/O1|/O2` (a frame reading 78 points
+wider) and `/O1` from `/O2` only by 0.890; the i386 `/GS` reading is non-zero at `/Od` and `/O1`;
+the probe for a PE32 is a `bin/x86/cl`; the shipped 32-bit target's readings are non-zero (1 515
+bodies) and the era gap is inside the answer; the `/Od` benchmark build is detected as `/Od`,
+`strong`, from the analysis sample; and the x64-driver-against-32-bit-file gap fires there and not
+for the x86 driver. Regression, one suite at a time: `check_masked_bytes`/`check_gate_tiers`
+{79,10} {78,11} {59,19,11}, `check_diff_accounting`, `check_phase2_try`, `check_analysis_cache`,
+`check_phase3_discovery`, `check_phase4_evidence` (47), `check_phase4_structures`,
+`check_phase5_ledger` (55), `check_phase5_o2`, `check_phase6_link` (43), `check_phase7_fidelity`
+(56, unchanged), `check_pe_target`, `check_driver_resolution_cli`, `check_msvc_toolchain`,
+`check_msvc_x86_toolchain`, `check_msvc_x86_install`, `check_msvc_x86_candidate` (89/89 · 99.75 % ·
+66 past the gate) all rc=0; `check_coff_candidate`'s 19 unnamed units and `check_msvc_structures`'
+STRUCT-24 are the same two known failures as before this work.
+
+Not claimed here either: an `/O1`-vs-`/O2` answer on i386 (measured 0.890 apart, reported as a
+class), any `-O` that belongs to `deadrising2`'s own era, or any movement in the X86-6 ceiling.
+
 **X86-6: the i386 normalisation both 32-bit paths share.** *The phase that pays twice.*
 
 This is the ceiling §4.5 describes, and it is the difference between an x86 MSVC variant that
@@ -735,6 +835,10 @@ Re-measure and compare before/after every phase, as the existing scripts already
   14.12.25835.7); `check_msvc_structures.py`'s six groups; `check_phase7_fidelity.py`'s 56 checks.
 * The ELF path keeps sampling the ret-cut stream in `target_shape`, which `check_msvc_detect.py`
   group 6 asserts directly.
+* X86-5's 32-bit answers, asserted by `check_msvc_detect.py` group 7: the x64 feature set reading
+  0.000 on i386 (so it cannot be reused "because it's MSVC"), the i386 set separating `/Od` from
+  `/O1|/O2` while `/O1` and `/O2` stay 0.890 apart, the probe for a PE32 being a `bin/x86/cl`, and
+  the X86-4 `/Od` build being detected as `/Od` (`strong`) when sampled from the cached analysis.
 * The bitness refusal at cli.py:1108 stays. Making it reachable more often is the opposite of
   weakening it.
 

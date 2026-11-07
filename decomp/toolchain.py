@@ -1323,8 +1323,16 @@ def starter_config(target: Path, note: dict, guess: dict | None = None,
 		# constrains - with the two independent readings of it, and whether they agree.
 		lines.append("# Its toolset: %s (link.exe %s). %s" % (toolset["family"],
 			note.get("linker_version") or "?", toolset.get("detail") or ""))
-		lines.append("# Build a candidate with a `cl` of that era: Docs/Setup.md §6 installs one")
-		lines.append("# by version (this one is --major 15 --msvc-version 15.5).")
+		if "no toolset table entry" in str(toolset["family"]):
+			# No table entry means there is no install line to quote. Asking for a v141 compiler for a
+			# `link.exe 8.0` file is exactly the era trap of Docs/MSVC-x86-Plan.md §8, and this is a
+			# file someone will act on, so the trap has to be written in it.
+			lines.append("# No toolset table entry names that linker, so no compiler version is")
+			lines.append("# implied: a candidate built with the newest `cl` here is *a* 32-bit MSVC")
+			lines.append("# build, not that toolset's. Docs/Setup.md §6.5 installs one by version.")
+		else:
+			lines.append("# Build a candidate with a `cl` of that era: Docs/Setup.md §6 installs one")
+			lines.append("# by version (this one is --major 15 --msvc-version 15.5).")
 	if (note.get("crt") or {}).get("static_crt"):
 		lines.append("# Its own bytes hold the CRT: no CRT DLL is imported, so it was linked /MT.")
 	elif note.get("compiler") == "msvc" and (note.get("crt") or {}).get("dlls"):
@@ -1359,6 +1367,9 @@ def starter_config(target: Path, note: dict, guess: dict | None = None,
 				guess.get("confidence", "see `decomp detect`")))
 		if guess.get("sample_warning"):
 			lines.append("# CHECK THIS: %s" % guess["sample_warning"])
+		if guess.get("toolset_gap"):
+			lines.append("# CHECK THIS: that -O describes this machine's toolchain, which is not the")
+			lines.append("# toolchain that made this file: %s" % guess["toolset_gap"])
 	else:
 		lines.append("# optimize=0 is a placeholder: `-O` was not inferred from this sample.")
 	lines += [
@@ -1471,24 +1482,105 @@ _RSP_MEM = re.compile(r"\(%rsp[,)]")
 # slot near the top of the body: `cl` at /Od spills every parameter, and never does at /O1|/O2.
 _ARG_STORE_MSVC = re.compile(r"^(mov|mov[a-z]+|lea|fstp)\s+%(ecx|edx|r8d|r9d|rcx|rdx|r8|r9),\s*"
 	r"(?:qword|dword|byte|word|ptr)?\s*-?[0-9a-fx]*\(%rsp\)")
-# The /GS guard: the cookie xor-ed with `%rsp`, or the call that checks it.
+# The /GS guard of an **x64** MSVC build: the cookie xor-ed with `%rsp`, or the call that checks
+# it. (`%rsp`, not `%esp`: the i386 form is a different shape and is read separately, below.)
 _GS_XOR = re.compile(r"^xor[a-z]*\s+%rsp,\s*%[a-z0-9]+|^xor[a-z]*\s+%[a-z0-9]+,\s*%rsp\b")
 _GS_CALL = re.compile(r"security_check_cookie|__guard|@comp\.guard_check")
+
+# ---------------------------------------------------------------------------------------
+# the i386 MSVC shapes (Docs/MSVC-x86-Plan.md X86-5)
+#
+# Every pattern in this block was read off this machine's `toolchains/msvc/bin/x86/cl` (v141,
+# 14.12.25835) at /Od, /O1 and /O2, and the table under FEATURES_MSVC_I386 below *is* that
+# measurement. An i386 `cl` body is not an x64 one with narrower registers: there is no shadow
+# space and no home-slot spill (the caller pushes its arguments), locals live at `N(%ebp)`, and
+# the /GS cookie is xor-ed with the *frame* register rather than with the stack pointer:
+#
+#   subl $0x34, %esp        /Od, a body with a buffer: the cookie comes from an absolute slot
+#   movl 0, %eax            (a relocation, so no name survives in an object disassembly), and
+#   xorl %ebp, %eax         the check call's target is a relocation too - so the xor is the only
+#   movl %eax, -4(%ebp)     reading of /GS that survives on an object *and* on a stripped image
+#
+# At /O1 the same guard appears with `%esp`, where the frame pointer was omitted.
+_GS_XOR_FRAME = re.compile(r"^xor[a-z]*\s+%(?:e|s)bp,\s*%[a-z0-9]+$|^xor[a-z]*\s+%[a-z0-9]+,\s*"
+	"%(?:e|s)bp\b")
+# An argument pushed at a call site: i386 passes its arguments on the stack, and at /Od every one
+# of them is set up with a `push` in the instructions just above the `call`.
+_PUSH = re.compile(r"^push(?:l|w|b)?\s+(\S+)")
+# A `push` of one of these is a frame pointer or a callee-saved register save, not an argument -
+# which is why only a push next to a call counts (a feature that reads 1.000 at every level of
+# every build carries no information).
+_SAVED_REGISTERS = frozenset(("%ebx", "%esi", "%edi", "%ebp", "%esp", "%rsp", "%rbx", "%rsi",
+	"%rdi", "%r12", "%r13", "%r14", "%r15", "%r12d", "%r13d", "%r14d", "%r15d"))
+# `ret $N`: the callee pops its own arguments, i.e. a stdcall/thiscall body. That is a property
+# of how the function was *declared*, not of the flags, so it is reported and never scored. It is
+# still a real reading of a 32-bit image: measured here, 65% of `deadrising2.exe`'s sampled
+# bodies end in `ret $N` against 12% of this benchmark's /Od build - one more way of saying most
+# of that code is C++ member functions with a `this`.
+_RET_IMM = re.compile(r"^ret(?:l|f)?\s+\$[0-9a-fx]+\b")
+
+
+def pushes_arguments(text: list[str]) -> bool:
+	"""Does this body push an argument before one of its calls (the i386 convention)?"""
+	for index, item in enumerate(text):
+		if not _CALL.match(item):
+			continue
+		for earlier in text[max(0, index - 4):index]:
+			pushed = _PUSH.match(earlier)
+			if pushed and pushed.group(1).rstrip(",") not in _SAVED_REGISTERS:
+				return True
+	return False
 
 # Per-body features are shares over the sampled bodies (share of bodies, or share of
 # instructions). `bodies` and `insmean` are reported but never scored: they describe the
 # program, not the flags.
 FEATURES = ("frame", "endbr", "subrsp", "canary", "leave", "poprbp", "spill", "framemem",
 	"xmm", "calls")
-# The ones scored for an MSVC target/probe. `subrsp`/`calls`/`xmm` mean the same thing on both
-# ABIs and discriminate here too; the rest are the MSVC-only readings of the same flags.
+# The ones scored for an MSVC target/probe **at x86-64**. `subrsp`/`calls`/`xmm` mean the same
+# thing on both ABIs and discriminate here too; the rest are the MSVC-x64 readings of the flags.
 FEATURES_MSVC = ("rspmem", "argstore", "gs", "calls", "xmm")
+# The ones scored for an MSVC target/probe **at i386**. The x64 set is not reusable "because it's
+# MSVC" - that is the bug X86-5 exists to fix, and §3 of that plan is its measurement: `rspmem`
+# (locals addressed off `%rsp`), `argstore` (inbound argument registers written to their home
+# slots) and the cookie-xor-`%rsp` form of /GS are properties of the Microsoft **x64 ABI**, and on
+# i386 all three read 0.000 at every level, for the probe and for a real 32-bit target alike. What
+# does separate the levels here is the frame - the Itanium patterns, which are already
+# bitness-aware (`%(?:r|e)bp`) - plus the /GS reading above. Measured on this `cl`, share of the 9
+# probe bodies, against the 32-bit benchmark build of X86-4 (built at /Od, so it is a known
+# answer; its 254 functions sampled from the cached analysis, which is the only sample of a 32-bit
+# PE with real function boundaries - see the note under `target_shape`):
+#
+#                  /Od   /O1   /O2   msvc-o0-x86 (/Od, known answer)
+#   frame          1.00  0.22  0.00  0.75
+#   framemem       0.46  0.11  0.00  0.31
+#   poprbp         1.00  0.22  0.11  0.69
+#   spill          0.56  0.11  0.00  0.33
+#   subrsp         0.56  0.11  0.11  0.36
+#   gs_frame       0.11  0.11  0.00  0.05
+#   xmm            0.03  0.05  0.27  0.06
+#   calls          0.01  0.01  0.00  0.05
+#   rspmem / argstore / gs - the x64 set - 0.00 at every level and on the target too
+#
+# That sample ranks -O0 at 1.633 against 2.272 and 3.030, which is the right answer and is stated
+# as `strong`. Two features are deliberately not scored: `leave`, because this `cl` writes
+# `popl %ebp; retl` and never emits `leave` in the probe at any level (0.000 everywhere, so it
+# would only add a constant to every distance); and `argpush`, which measured 0.111/0.000/0.000 on
+# the probe against 0.50 on that target - it only fires in a body that *calls* something, so it
+# reads what the program does, not what the flags did. It is reported, not scored.
+FEATURES_MSVC_I386 = ("frame", "framemem", "poprbp", "spill", "subrsp", "gs_frame",
+	"xmm", "calls")
 # Measured and reported, never scored against the -O probe: these say which *instruction set* the
 # build used (Phase 7), not how hard it optimised. Putting them in the scored sets would change
 # the -O ranking every measured number in Docs/byte-cleanup-plan.md rests on.
 FEATURES_VECTOR = ("vex", "ymm", "zmm", "fma", "rcp")
-ALL_FEATURES = (FEATURES + tuple(name for name in FEATURES_MSVC if name not in FEATURES)
-	+ FEATURES_VECTOR)
+# Measured and reported, never scored against the probe: what a 32-bit body's *calling
+# convention* is. Scoring it would rank a stdcall-heavy C++ target toward whichever probe level
+# happens to use more of the convention. (`argpush` is not in this set: on i386 pushing arguments
+# is both the convention and, at /Od, done for every one of them - which is why it scores there,
+# as the i386 counterpart of x64's `argstore`.)
+FEATURES_CONVENTION = ("argpush", "retimm")
+ALL_FEATURES = (FEATURES + tuple(name for name in FEATURES_MSVC + FEATURES_MSVC_I386
+	if name not in FEATURES) + FEATURES_VECTOR + FEATURES_CONVENTION)
 
 # What a feature means where it is present, so the report names the reason and not just a
 # distance. Only the ones that discriminate.
@@ -1507,7 +1599,14 @@ FEATURE_MEANING = {
 		"(cl /Od); at /O1|/O2 they live in registers",
 	"argstore": "the inbound argument registers are stored to stack slots at the top of the body "
 		"(cl /Od writes every parameter to its home slot)",
-	"gs": "/GS stack guard: the cookie xor-ed with %rsp, or the check of it",
+	"gs": "/GS stack guard: the cookie xor-ed with %rsp, or the check of it (the x64 form)",
+	"gs_frame": "the /GS stack guard of a 32-bit build: the cookie xor-ed with the frame register "
+		"(%ebp, or %esp where no frame pointer is used) - what `cl` /GS writes on i386",
+	"argpush": "arguments are pushed on the stack at the call site: at /Od each one is set up just "
+		"before its call; at /O1|/O2 fewer are, because registers and memory operands are used "
+		"directly",
+	"retimm": "the body ends in `ret $N`, so the callee pops its arguments: a stdcall/thiscall "
+		"body, which says what the code is, not how hard it was optimised",
 	"vex": "VEX-encoded instructions (an AVX form), whatever register width they use",
 	"ymm": "the body uses 256-bit %ymm registers: -mavx or higher built it",
 	"zmm": "the body uses 512-bit %zmm registers or %k mask registers: -mavx512* built it",
@@ -1545,6 +1644,15 @@ def shape_profile(bodies: list[list[str]]) -> dict:
 			counts["argstore"] += 1
 		if any(_GS_XOR.match(item) for item in text[:8]) or _GS_CALL.search(joined):
 			counts["gs"] += 1
+		# The i386 /GS form (the cookie xor-ed with the frame register) and the i386 argument
+		# pushes. Read for every sample, scored only for a 32-bit MSVC target/probe - an x64 body
+		# never matches these, and an i386 body never matches the x64 forms above.
+		if any(_GS_XOR_FRAME.match(item) for item in text):
+			counts["gs_frame"] += 1
+		if pushes_arguments(text):
+			counts["argpush"] += 1
+		if any(_RET_IMM.match(item) for item in text):
+			counts["retimm"] += 1
 		counts["rspmem"] += sum(1 for item in text if _RSP_MEM.search(item))
 		counts["framemem"] += sum(1 for item in text if _FRAME_MEM.search(item))
 		counts["xmm"] += sum(1 for item in text if _XMM.search(item))
@@ -1559,7 +1667,7 @@ def shape_profile(bodies: list[list[str]]) -> dict:
 		instructions += len(text)
 	profile = {name: counts[name] / max(1, bodies_counted) for name in
 		("frame", "endbr", "subrsp", "canary", "leave", "poprbp", "spill", "argstore", "gs",
-			"ymm", "zmm")}
+			"gs_frame", "argpush", "retimm", "ymm", "zmm")}
 	profile.update({name: counts[name] / max(1, instructions) for name in
 		("framemem", "xmm", "calls", "rspmem", "vex", "fma", "rcp")})
 	profile["bodies"] = bodies_counted
@@ -1597,21 +1705,23 @@ def probe_signatures(compiler: str, bits: int, std: str = "c++17",
 	for level in levels:
 		object_path = directory / ("decomp_probe_o%d%s.o" % (level, "-m32" if bits == 32 else ""))
 		if msvc(compiler):
-			# cl's own flag spellings and driver_form's argument order; no 32-bit target from this
-			# machine's MSVC (Docs/Setup.md §6.7). /Gy gives one `.text$…` COMDAT per function,
-			# which is also what makes the bodies readable in a COFF object (below).
-			if bits != 64:
-				problems.append("%s: no 32-bit x86 target from this machine's MSVC (Docs/Setup.md §6.7)"
-					% compiler)
-				continue
+			# cl's own flag spellings and driver_form's argument order, from `build_flags` - the one
+			# place that turns `optimize=` into a flag set, so a probe cannot drift from what a variant
+			# would actually be built with (Docs/MSVC-x86-Plan.md X86-2). /Gy is asked for because it
+			# gives one `.text$…` COMDAT per function, which is also what makes the bodies readable in
+			# a COFF object (below). Nothing here says anything about bitness: for `cl` the bitness is
+			# the driver that was resolved, not a flag, and `bits` says which one this probe was run
+			# with. An x86 driver is a supported probe target since X86-1 installed one; the old
+			# refusal ("no 32-bit x86 target from this machine's MSVC") was true until then and would
+			# now be a lie.
 			if level >= 3:
 				# cl has no -O3. `/O2 /Ob2` is the nearest it has and it is the same shape as /O2,
 				# so probing it separately would only add a duplicate row to the ranking.
 				problems.append("%s: no -O3 to probe - /O2 is the top level this driver has "
 					"(/Ob2 inlines more calls but does not change the shape of a body)" % compiler)
 				continue
-			flags = ["/std:%s" % std, "/Gy",
-				"/Od" if level == 0 else ("/O1" if level == 1 else "/O2")]
+			flags = build_flags({"compiler": compiler, "std": std, "optimize": level,
+				"comdat": True})
 			command = driver_form(compiler, flags, [source], object_path)
 		else:
 			command = [compiler, "-std=%s" % std] + (["-m32"] if bits == 32 else []) + [
@@ -1791,32 +1901,69 @@ def target_shape(target: Path, rng: tuple[int, int] | None = None, band: tuple[i
 	return profile, note, problems
 
 
-def feature_family(compiler) -> tuple:
+def feature_family(compiler, bits=None) -> tuple:
 	"""Which features carry the answer for this side. An MSVC probe and an MSVC target are
-	compared on the MSVC set; nothing else knows what a shadow space is."""
-	return FEATURES_MSVC if msvc(compiler) else FEATURES
+	compared on the MSVC set; nothing else knows what a shadow space is.
+
+	The MSVC set is *not* one set: `rspmem`/`argstore`/`gs` are the Microsoft x64 ABI's shape, and
+	they read 0.000 for an i386 `cl` at every flag level and for a real 32-bit target alike
+	(Docs/MSVC-x86-Plan.md X86-5). So the bitness is part of the question, and a caller that knows
+	the target's bitness passes it - `detect` and `infer_optimize` both do.
+	"""
+	if not msvc(compiler):
+		return FEATURES
+	return FEATURES_MSVC if int(bits or 64) == 64 else FEATURES_MSVC_I386
 
 
-def msvc_shape_flags(profile: dict) -> list[str]:
+def msvc_shape_flags(profile: dict, bits: int | None = None) -> list[str]:
 	"""What the shape says about the MSVC flags that have no other trace in a stripped file.
 
 	/GS is a compile flag, not a byte the file carries; the guard it leaves in every body that
 	has a buffer is the only place it can still be seen. (The /GL half of the question is
 	answered exactly by the POGO directory and the linker's own Rich records, in `note_lines`.)
+
+	What "the guard" *looks like* is bitness-specific, so the bitness is part of the question: the
+	x64 cookie is xor-ed with `%rsp`, the i386 one with the frame register (Docs/MSVC-x86-Plan.md
+	X86-5). With it, the sentence says what the sample can actually support: a file that names no
+	function boundaries was sampled by cutting at every `ret`, which cuts a prologue off some bodies
+	and understates every shape that lives in a prologue.
 	"""
 	lines = []
 	if not profile.get("bodies"):
 		return lines
-	share = profile.get("gs", 0.0)
-	if share >= 0.02:
+	guarded = int(bits or 64) != 64
+	share = profile.get("gs_frame" if guarded else "gs", 0.0)
+	cut_at_ret = "ret" in str(profile.get("sample_source") or "")
+	# A guard is emitted by nothing else, so *any* non-zero share proves /GS is on. The x64 reading
+	# keeps its 2% bar (every measured number on that path rests on it); the i386 one has to be
+	# lower because a 32-bit target with no function table is sampled in a way that cuts
+	# prologues off bodies - measured at 0.9% on `deadrising2.exe`, where the guard is real.
+	if share >= (0.02 if not guarded else 1e-9):
 		lines.append("/GS: the stack guard appears in %d%% of the sampled bodies - this build "
-			"has it on (cl's default)" % round(share * 100))
+			"has it on (cl's default)%s" % (round(share * 100),
+				". This sample has no function boundaries to start a body at, so some prologues were "
+				"cut off it: that share is a floor, not the share" if cut_at_ret else ""))
 	elif share == 0.0:
 		lines.append("/GS-: no sampled body checks a stack guard, which is what /GS- or a build "
-			"of only leaf functions looks like")
-	if profile.get("argstore", 0.0) >= 0.5:
-		lines.append("the argument registers are stored to their home slots in most bodies: this "
-			"is /Od code, and a candidate built at /O1|/O2 will not match it")
+			"of only leaf functions looks like%s" % (" - and with no function boundaries in this "
+			"sample, no prologue was reliably read, so it cannot rule /GS out either" if cut_at_ret
+			else ""))
+	if not guarded:
+		if profile.get("argstore", 0.0) >= 0.5:
+			lines.append("the argument registers are stored to their home slots in most bodies: this "
+				"is /Od code, and a candidate built at /O1|/O2 will not match it")
+		return lines
+	# An i386 body has no home slots to spill to, so the /Od tell here is the frame itself.
+	if profile.get("frame", 0.0) >= 0.7 and profile.get("framemem", 0.0) >= 0.25:
+		lines.append("almost every sampled body sets up a %ebp frame and reads its locals through it: "
+			"this is /Od code on a 32-bit target, and a candidate built at /O1|/O2 will not match it")
+	elif profile.get("frame", 0.0) <= 0.15:
+		lines.append("almost no sampled body sets up a %ebp frame: this is not /Od code on a "
+			"32-bit target - a candidate built at /Od will not match it")
+	if profile.get("retimm", 0.0) >= 0.25:
+		lines.append("%d%% of the sampled bodies end in `ret $N`, so the callee pops its arguments: "
+			"that is the stdcall/thiscall convention, i.e. C++ member functions and WinAPI-style "
+			"calls. It says nothing about the optimisation level" % round(profile["retimm"] * 100))
 	return lines
 
 
@@ -1829,7 +1976,7 @@ def infer_optimize(target: dict, signatures: list[dict]) -> list[dict]:
 	"""
 	ranked = []
 	for item in signatures:
-		profile, family = item["profile"], feature_family(item.get("compiler"))
+		profile, family = item["profile"], feature_family(item.get("compiler"), item.get("bits"))
 		ranked.append({"optimize": item["optimize"], "compiler": item.get("compiler"),
 			"bits": item.get("bits"), "features": list(family),
 			"distance": round(sum(abs(profile[name] - target[name]) for name in family), 3),
@@ -1861,37 +2008,99 @@ def infer_optimize(target: dict, signatures: list[dict]) -> list[dict]:
 	return ranked
 
 
+def sample_caveat(target: dict) -> str:
+	"""What the sample itself costs the answer, or '' when it costs nothing.
+
+	This belongs in the same sentence as the answer, not two screens earlier. A file that names no
+	function boundaries (an i386 PE has no `.pdata`, a stripped ELF has no symbols) is sampled by
+	cutting its `.text` at every `ret`, and that cut strips the prologue off some bodies, joins two
+	bodies at a padding run and puts an alignment gap inside one. Every feature that lives in a
+	prologue is therefore understated, and the same distance measured against a file that *does*
+	name its units is a weaker claim (Docs/MSVC-x86-Plan.md X86-5, and MS-1's original debt).
+	"""
+	if "ret" not in str(target.get("sample_source") or ""):
+		return ""
+	return ("this file names no function boundaries, so its code was sampled by cutting it at every "
+		"`ret`, which cuts prologues off some bodies - a weaker sample than a file's own function "
+		"table, so this answer carries less weight than the same distance on a file that names its "
+		"units")
+
+
+def _with_caveat(text: str, target: dict) -> str:
+	"""The answer and what its sample costs, as one string (X86-5: the same sentence)."""
+	caveat = sample_caveat(target)
+	return text + (" - and %s" % caveat if caveat else "")
+
+
+def _msvc_tells(target: dict, best: dict, i386: bool) -> tuple:
+	"""The readings that carry an MSVC answer, in words, for this bitness.
+
+	Quoting them is what makes the answer checkable, and they are bitness-specific because the
+	shape is: on x64 it is the shadow space and the locals addressed off `%rsp`; on i386 there is
+	no shadow space, and it is the `%ebp` frame and the arguments pushed at the call site
+	(Docs/MSVC-x86-Plan.md X86-5).
+	"""
+	probe = best.get("profile") or {}
+	if i386:
+		return ("this is /Od 32-bit cl code: %d%% of the sampled bodies set up a %%ebp frame and "
+			"%d%% read their locals through it"
+				% (round(target.get("frame", 0.0) * 100),
+					round(target.get("framemem", 0.0) * 100)),
+			"%d%% of the sampled bodies set up a %%ebp frame and %d%% read their locals through it, "
+			"against %d%% and %d%% at /Od"
+				% (round(target.get("frame", 0.0) * 100), round(target.get("framemem", 0.0) * 100),
+					round(probe.get("frame", 0.0) * 100), round(probe.get("framemem", 0.0) * 100)),
+			"only %d%% of the sampled bodies set up a %%ebp frame"
+				% round(target.get("frame", 0.0) * 100))
+	return ("this is /Od cl code: %d%% of the sampled bodies address their locals off %%rsp and "
+		"%d%% store their arguments to their home slots"
+			% (round(target.get("rspmem", 0) * 100), round(target.get("argstore", 0) * 100)),
+		"%d%% of bodies address their locals off %%rsp and %d%% store their arguments to their "
+		"home slots, against %d%% and %d%% at /Od"
+			% (round(target.get("rspmem", 0) * 100), round(target.get("argstore", 0) * 100),
+			round(probe.get("rspmem", 0.0) * 100), round(probe.get("argstore", 0.0) * 100)),
+		"%d%% of the sampled bodies address their locals off %%rsp"
+			% round(target.get("rspmem", 0) * 100))
+
+
 def confidence(best: dict, target: dict) -> str:
-	"""How much weight the answer carries, in the tool's own words."""
+	"""How much weight the answer carries, in the tool's own words.
+
+	Every branch ends with `sample_caveat` where the sample deserves it, so the strength of the
+	answer and the strength of the sample are one sentence (X86-5).
+	"""
 	if best.get("margin", 0.0) >= 0.5:
-		return "strong: the shape of this code is not produced by the other levels"
+		return _with_caveat("strong: the shape of this code is not produced by the other levels",
+			target)
 	if msvc(best.get("compiler")):
 		# `cl` has no -O3, and /O1 and /O2 trade size against speed rather than differing in the
 		# shape of a body: whether /O2 vectorises depends on whether the program has a loop it
 		# can vectorise. So two optimising levels close together are reported as the class they
-		# are, and only /Od against the rest is claimed as an answer. (Docs/MSVC-Plan.md MS-4.)
+		# are, and only /Od against the rest is claimed as an answer. (Docs/MSVC-Plan.md MS-4; on
+		# i386 the same holds, and *more* strongly, because the argstore gap that did most of the
+		# x64 separation is absent there - Docs/MSVC-x86-Plan.md X86-5.)
+		i386 = int(best.get("bits") or 64) != 64
+		od, class_, optimised = _msvc_tells(target, best, i386)
 		if best.get("level_class"):
-			return ("a class, not a level: /O1 and /O2 are %.3f apart on these features and which "
-				"one it is depends on what the program contains (cl /O2 vectorises loops, /O1 "
-				"trades size for speed). What is established is that this is optimised cl code: "
-				"%d%% of bodies address their locals off %%rsp and %d%% store their arguments to "
-				"their home slots, against %d%% and %d%% at /Od") % (best.get("margin", 0.0),
-					round(target.get("rspmem", 0) * 100), round(target.get("argstore", 0) * 100),
-					round(best["profile"]["rspmem"] * 100), round(best["profile"]["argstore"] * 100))
+			return _with_caveat(("a class, not a level: /O1 and /O2 are %.3f apart on these features "
+				"and which one it is depends on what the program contains (cl /O2 vectorises loops, "
+				"/O1 trades size for speed). What is established is that this is optimised cl code: %s")
+				% (best.get("margin", 0.0), optimised), target)
 		if best["optimize"] == 0:
-			return ("probable as a class: this is /Od cl code - %d%% of the sampled bodies address "
-				"their locals off %%rsp and %d%% store their arguments to their home slots" % (
-					round(target.get("rspmem", 0) * 100), round(target.get("argstore", 0) * 100)))
-		return ("weak as a level: /O1 and /O2 differ in how hard they optimise, not in the shape "
-			"of a body. What is established is that this is not /Od code")
+			return _with_caveat("probable as a class: %s" % od, target)
+		return _with_caveat(("weak as a level: /O1 and /O2 differ in how hard they optimise, not in "
+			"the shape of a body. What is established is that this is not /Od code: %s") % class_,
+			target)
 	if best.get("margin", 0.0) >= 0.15:
-		return "probable: clearly closer than the next level, but the levels are adjacent"
+		return _with_caveat("probable: clearly closer than the next level, but the levels are "
+			"adjacent", target)
 	if best["optimize"] >= 1:
-		return ("weak as a level: -O1/-O2/-O3 differ in ways a prologue does not show "
+		return _with_caveat(("weak as a level: -O1/-O2/-O3 differ in ways a prologue does not show "
 			"(inlining depth, unrolling). What is established is that this is optimised code: "
 			"no frame pointer (%d%%) and no argument spilling (%d%%)") % (
-				round(target.get("frame", 0.0) * 100), round(target.get("spill", 0.0) * 100))
-	return "weak: the sample is too small or too mixed to rank the levels apart"
+				round(target.get("frame", 0.0) * 100), round(target.get("spill", 0.0) * 100)), target)
+	return _with_caveat("weak: the sample is too small or too mixed to rank the levels apart",
+		target)
 
 
 def sample_warning(profile: dict, note: dict | None = None, narrowed: bool = False) -> str:

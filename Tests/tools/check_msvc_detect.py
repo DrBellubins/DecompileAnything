@@ -4,7 +4,7 @@
 
 MS-0 made the PE path run, MS-1 read its function table, MS-2/MS-3 put a compiler on the
 machine and read a COFF candidate. This is the report side: given a PE target, what can the
-tool state, and does it state it from the file rather than from a guess. Six groups:
+tool state, and does it state it from the file rather than from a guess. Seven groups:
 
 1. **The toolset, read twice and compared.** The Rich header's product ids have names, and one
    of them (258, "Linker1400") is link.exe's own record: its build number *is* the fourth
@@ -33,6 +33,18 @@ tool state, and does it state it from the file rather than from a guess. Six gro
 6. **Sampling real units**: the shape sample for a PE comes from `.pdata`, and every sampled
    body starts at a record the file names - not at a `ret` boundary. And the ELF path is
    unchanged: still the ret-cut sample, still scored on the Itanium features.
+7. **A 32-bit MSVC target is described in its own dialect** (Docs/MSVC-x86-Plan.md X86-5).
+   Measured on this machine's `bin/x86/cl`: the x64 feature set (`rspmem`, `argstore`, the
+   cookie-xor-`%rsp` of /GS) reads 0.000 at /Od, /O1 and /O2, so it cannot carry an answer; the
+   i386 set - the `%ebp` frame, locals read through it, the cookie xor-ed with the frame register -
+   separates /Od from /O1|/O2 by a wide margin, while /O1 and /O2 stay close together. Asserted
+   against a known answer: the `msvc-o0-x86` build of X86-4 was built here at /Od, and `detect`
+   sampling the cached analysis (the only sample of a 32-bit PE with real function boundaries) has
+   to answer 0. On the shipped 32-bit game the readings are non-zero, the probe driver is the x86
+   one, and the era gap is stated *in the answer* - the file says `link.exe 8.0`, so a v141 `-O`
+   reading is not that file's. Plus the dialect guards: no GCC flag for a `built by msvc` file, no
+   x86-64 ISA claim for a 32-bit image, and the bitness disagreement between an x64 driver and a
+   32-bit file answered in the one place `check`, `try` and `detect` all read from.
 
 Exit: 0 everything passed, 1 a fact came out wrong, 2 the target or the MSVC toolchain is
 missing (nothing was judged, which is not the tool failing).
@@ -49,9 +61,11 @@ TESTS = Path(__file__).resolve().parents[1]
 REPO = TESTS.parent
 sys.path.insert(0, str(REPO))
 
-from decomp import check, cli, config, extract, spawn, toolchain  # noqa: E402
+from decomp import cache, check, cli, config, extract, fidelity, spawn, toolchain  # noqa: E402
 
 TARGET = TESTS / "Proprietary" / "notepad.exe"
+X86_TARGET = TESTS / "Proprietary" / "deadrising2.exe"     # PE32, link.exe 8.0 (Docs/MSVC-x86-Plan.md §3)
+X86_BUILD = TESTS / "build" / "msvc-o0-x86" / "da_tests.stripped"  # built here at /Od: known answer
 GCC_STRIPPED = TESTS / "build" / "gcc-o0" / "da_tests.stripped"
 
 # Docs/MSVC-Plan.md §2: what this file carries.
@@ -101,6 +115,9 @@ def main() -> int:
 		check_shape(work)
 	print("\n=== 6. the ELF path: still its own sample, still its own features ===")
 	check_elf_unchanged()
+	with tempfile.TemporaryDirectory(prefix="ms4-x86-") as directory:
+		print("\n=== 7. a 32-bit MSVC target, in its own dialect (X86-5) ===")
+		check_i386(Path(directory))
 
 	if failures:
 		print("\nFAILURES (%d):" % len(failures))
@@ -425,6 +442,135 @@ def check_elf_unchanged() -> None:
 		"and sampled the way it always has: %r" % outcome["profile"].get("sample_source"))
 	expect(not toolchain.msvc(outcome["note"].get("compiler")),
 		"the note still says gcc: %s" % outcome["note"].get("compiler"))
+
+
+# --------------------------------------------------------------------------------------
+# 7. a 32-bit MSVC target, in its own dialect (Docs/MSVC-x86-Plan.md X86-5)
+
+
+def check_i386(work: Path) -> None:
+	cfg = config.load(str(TESTS / "project.toml"))
+	prefix, prefix_from = config.msvc_prefix(cfg)
+	driver = toolchain.compiler_for({"compiler": "cl", "arch": "x86"}, prefix=prefix,
+		prefix_from=prefix_from)
+	expect(bool(driver.name), "an `arch = \"x86\"` MSVC driver resolves here: %s (%s)"
+		% (driver.name or "none", driver.gap or driver.why))
+	if not driver.name:
+		return
+
+	signatures, problems = toolchain.probe_signatures(driver.name, 32, levels=(0, 1, 2),
+		work_dir=work)
+	expect(len(signatures) == 3,
+		"the 32-bit driver probes at /Od, /O1, /O2 - the old `bits != 64` refusal is gone: %s %r"
+		% (",".join("O%d" % item["optimize"] for item in signatures), problems))
+	if len(signatures) < 3:
+		return
+	by = {item["optimize"]: item["profile"] for item in signatures}
+	i386_set = toolchain.FEATURES_MSVC_I386
+	print("      the x64 set on i386 code: " + "  ".join("/O%d %s" % (level, {name:
+			by[level][name] for name in toolchain.FEATURES_MSVC if name != "calls" and name != "xmm"})
+			for level in sorted(by)))
+	expect(all(by[level][name] == 0.0 for level in by for name in ("rspmem", "argstore", "gs")),
+		"the x64 ABI readings are 0.000 at every level here, which is why they cannot be the "
+		"feature set for a 32-bit target (the §3 measurement, asserted)")
+	print("      the i386 set: " + "  ".join("/O%d %s" % (level, {name: round(by[level][name], 3)
+			for name in i386_set}) for level in sorted(by)))
+	expect(by[0]["frame"] >= 0.9 and by[0]["framemem"] >= 0.3 and by[0]["poprbp"] >= 0.9,
+		"/Od on i386 sets up a %%ebp frame in %d%% of bodies and reads locals through it in %d%% of "
+		"its instructions" % (round(by[0]["frame"] * 100), round(by[0]["framemem"] * 100)))
+	expect(by[0]["gs_frame"] > 0.0 and by[1]["gs_frame"] > 0.0,
+		"/GS on i386 is read from the cookie xor-ed with the frame register: %d%%/%d%% of the "
+		"/Od|/O1 bodies carry it" % (round(by[0]["gs_frame"] * 100), round(by[1]["gs_frame"] * 100)))
+	gap = max(by[1]["frame"], by[2]["frame"])
+	expect(by[0]["frame"] - gap >= 0.6,
+		"/Od stands up a frame in %d%% more bodies than /O1|/O2 do (%.3f): the classes separate on "
+		"i386 as well, on the frame rather than the shadow space" % (round((by[0]["frame"] - gap) * 100),
+			by[0]["frame"]))
+	distance = lambda a, b: sum(abs(a[name] - b[name]) for name in i386_set)  # noqa: E731
+	expect(distance(by[1], by[2]) < distance(by[0], by[1]),
+		"/O1 and /O2 are %.3f apart on this set against /Od's %.3f: even more of a class than on "
+		"x64, where the argstore gap did half the separating"
+		% (distance(by[1], by[2]), distance(by[0], by[1])))
+
+	# `detect` on a real 32-bit MSVC target: its own dialect, its own driver, and the era gap
+	# stated rather than papered over.
+	if not X86_TARGET.is_file():
+		print("  skipped: %s is not here - gitignored; see Docs/MSVC-x86-Plan.md §3" % X86_TARGET)
+	else:
+		outcome = cli.detect_target(X86_TARGET, levels=(0, 1, 2), cfg=cfg)
+		profile, note, guess = outcome["profile"], outcome["note"], outcome["guess"]
+		expect(toolchain.feature_family(note.get("compiler"), note.get("bits")) == i386_set,
+			"a 32-bit MSVC target is scored on the i386 set: %s" % (i386_set,))
+		expect(profile.get("bodies", 0) > 100 and any(profile[name] > 0.0 for name in i386_set),
+			"the readings on the shipped 32-bit target are non-zero: %s over %d bodies"
+			% ({name: round(profile[name], 3) for name in i386_set}, profile.get("bodies", 0)))
+		drivers = outcome.get("probe_drivers") or []
+		expect(bool(drivers) and drivers[0].get("arch") == "x86"
+			and str(drivers[0].get("driver", "")).replace("\\", "/").endswith("/bin/x86/cl"),
+			"the probe for a 32-bit PE is the driver that emits 32-bit code: %s"
+			% ([(item.get("driver"), item.get("arch")) for item in drivers] or "none"))
+		expect(bool(guess) or any("no -O inference" in item for item in outcome["problems"]),
+			"detect answers an optimize, or refuses with the reason: %s"
+			% ("optimize=%s" % guess["optimize"] if guess else outcome["problems"][:2]))
+		if guess:
+			stated = guess.get("toolset_gap") or ""
+			expect(bool(stated) and "outside the toolset table" in stated,
+				"the era question is answered in the open: this file is link.exe %s, so the reading "
+				"from the toolchain here is labelled as this toolchain's - %s"
+					% (note.get("linker_version"), stated or "nothing said"))
+			expect("ret" in str(profile.get("sample_source") or "")
+				and "ret" in str(guess.get("confidence", "")),
+				"a ret-cut sample says so in the same sentence as the answer: %r"
+					% str(guess.get("confidence", ""))[:150])
+		lines = toolchain.msvc_shape_flags(profile, bits=32)
+		expect(any("/GS" in line for line in lines),
+			"the stack guard of a 32-bit MSVC target is spoken of as /GS, not as a canary: %s"
+			% (lines or "nothing said"))
+		findings = outcome["fidelity"]["flags"]["findings"]
+		expect(not any(item["flag"].startswith("-fstack-protector") for item in findings),
+			"no GCC stack-protector finding for a file this tool identified as `built by msvc` "
+			"(the §4 bug): %s" % [item["flag"] for item in findings])
+		expect(not any("x86-64" in item["flag"] for item in findings),
+			"no x86-64 ISA level claimed for a 32-bit image: %s" % [item["flag"] for item in findings])
+
+	# A 32-bit build made *here*, so its flag is a known answer. Sampled from the cached analysis,
+	# which is the only sample of a 32-bit PE whose bodies start at real function boundaries.
+	if not X86_BUILD.is_file():
+		print("  skipped: %s is not built (Tests/eval.py build --variant msvc-o0-x86)" % X86_BUILD)
+		return
+	store = cache.Cache(config.cache_dir(cfg))
+	status = store.status(cache.target_key(X86_BUILD)["key"])
+	if not status.get("complete"):
+		print("  skipped: %s is not analysed here, and the analysis is the only sample of a 32-bit "
+			"PE with real function boundaries" % X86_BUILD.name)
+		return
+	conn = cache.open_readonly(Path(status["db"]))
+	try:
+		known = cli.detect_target(X86_BUILD, sample="FUN_", conn=conn, levels=(0, 1, 2), cfg=cfg)
+	finally:
+		conn.close()
+	answer, known_profile = known["guess"], known["profile"]
+	expect("cached analysis" in str(known["sample"].get("source", "")),
+		"the sample of a file with no function table came from the cached analysis: %r"
+		% known["sample"].get("source"))
+	expect(bool(answer) and answer["optimize"] == 0,
+		"the /Od 32-bit MSVC build of X86-4 is detected as /Od: %s"
+		% (answer and "-O%d distance %.3f next %.3f" % (answer["optimize"], answer["distance"],
+			answer.get("runner_up", 0.0))))
+	expect(bool(answer) and "strong" in str(answer.get("confidence", "")),
+		"and the answer says it is strong, because that sample has real boundaries: %s"
+		% str(answer and answer.get("confidence"))[:120])
+
+	# One place answers \"is this the toolchain that made this file\", and bitness is part of it.
+	x64_driver = toolchain.compiler_for({"compiler": "cl", "arch": "x86-64"}, prefix=prefix,
+		prefix_from=prefix_from)
+	agreement = fidelity.version_check(X86_BUILD, x64_driver.name)
+	expect(agreement["what"] == "target bitness" and agreement["hard"],
+		"an x64 driver against a 32-bit file is named as a bitness gap: %s" % agreement["detail"])
+	same = fidelity.version_check(X86_BUILD, driver.name)
+	expect(same["what"] != "target bitness",
+		"and the same question about the driver that serves this bitness does not fire: %s"
+		% same["detail"])
 
 
 if __name__ == "__main__":
