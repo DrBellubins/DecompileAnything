@@ -345,6 +345,11 @@ def msvc_map_names(binary, image_base, sections):
 	  arithmetic at all. Rows of section `0000` are `<absolute>`/`<linker-defined>` symbols
 	  (0x0, 0x100, the image base itself), which is exactly why the address is also required
 	  to land inside an executable section of the file.
+	* the width of that column is the image's own pointer size: a 32-bit link prints `004023c0`,
+	  an x64 link prints `0000000140001270` (measured on the two links of this benchmark,
+	  `msvc-o0-x86` and `msvc-o0`). Read as a fixed 16 digits it finds **no row at all** in an
+	  i386 map, and a parser that silently returns no names becomes "this PE carries no answer
+	  key" (Docs/MSVC-x86-Plan.md X86-3).
 	"""
 	for path in (Path(str(binary) + ".map"), Path(binary).with_suffix(".map")):
 		# `link /MAP` names the file after the output: da_tests -> da_tests.map, u.exe -> u.map
@@ -361,7 +366,7 @@ def msvc_map_names(binary, image_base, sections):
 	names = {}
 	body = text.split("Publics by Value", 1)[1]
 	for line in body.splitlines():
-		match = re.match(r"^\s*([0-9a-f]{4}):([0-9a-f]{8})\s+(\S+)\s+([0-9a-f]{16})\b", line)
+		match = re.match(r"^\s*([0-9a-f]{4}):([0-9a-f]{8})\s+(\S+)\s+([0-9a-f]{8,16})\b", line)
 		if not match or match.group(1) == "0000":
 			continue
 		address = int(match.group(4), 16)
@@ -392,8 +397,7 @@ def pe_symbols(binary):
 	image_base, sections = pe_sections(binary)
 	units = pe_units(binary)
 	if not units:
-		raise RuntimeError("%s has no .pdata - the answer key of an x64 PE is its function table"
-			% binary)
+		return pe_symbols_without_unwind(binary, image_base, sections)
 	names = pe_names(binary, units, image_base, sections)
 	entries = []
 	for unit in units:
@@ -426,6 +430,36 @@ def pe_symbols(binary):
 	itanium = [entry["mangled"] for entry in entries if entry["mangled"].startswith("_Z")]
 	if itanium:
 		table = dict(zip(sorted(set(itanium)), demangle(sorted(set(itanium)))))
+		for entry in entries:
+			if entry["mangled"]:
+				entry["name"] = simple_name(table.get(entry["mangled"], entry["mangled"]))
+	entries.sort(key=lambda entry: entry["address"])
+	return entries
+
+
+def pe_symbols_without_unwind(binary, image_base, sections):
+	"""The answer key of a PE that carries no function table: `link /MAP`, and symbol spacing.
+
+	An **i386** PE has no `.pdata` at all. The x64 unwind directory exists for x86 only for code
+	that needs EH, so what an i386 image carries is `.xdata$x`/`.sxdata` and nothing that bounds a
+	function (Docs/MSVC-x86-Plan.md X86-3). This is the same position a stripped ELF with no symbol
+	table and no `.eh_frame` is in, and the answer is the same: the names the linker wrote, with an
+	extent up to the next name. It is a worse key and it is printed as one, because a unit boundary
+	taken from spacing is the linker's layout, not the compiler's claim - and any score built on it
+	inherits that. (The MinGW case below prints the same kind of note for the same reason.)
+	"""
+	names = msvc_map_names(binary, image_base, sections)
+	if not names:
+		raise RuntimeError("%s has no .pdata and no usable map file: this PE carries neither a "
+			"function table nor the names the linker wrote, so there is no answer key to build"
+			% Path(binary).name)
+	entries = symbol_units(names)
+	print("  note: %s carries no .pdata (an i386 PE has no unwind directory except for EH code), "
+		"so its answer key is `link /MAP`: %d names, each with an extent up to the next one - the "
+		"linker's layout, not a compiler-authored function table" % (Path(binary).name, len(entries)))
+	titanium_mangled = [entry["mangled"] for entry in entries if entry["mangled"].startswith("_Z")]
+	if titanium_mangled:
+		table = dict(zip(sorted(set(titanium_mangled)), demangle(sorted(set(titanium_mangled)))))
 		for entry in entries:
 			if entry["mangled"]:
 				entry["name"] = simple_name(table.get(entry["mangled"], entry["mangled"]))

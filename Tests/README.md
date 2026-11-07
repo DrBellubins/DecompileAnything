@@ -451,6 +451,61 @@ Exit 2 when there is no `cl`, no build, or no analysis of it.
 `decomp check` prints the same facts about the installed toolchain (versions, the toolset family,
 the Windows SDK state).
 
+## Reading i386 COFF: a 32-bit MSVC candidate (MSVC-x86 X86-3, 2026-11-07)
+
+`check_coff_candidate.py` is the x64 candidate side and stays that; a second arch inside it would
+change what its numbers mean. The i386 side is its own script, and it asks one question x64 never
+has to ask: **on i386 every reference to something outside the body is an absolute 32-bit field**
+(`I386_DIR32`), not a pc-relative one — and a field whose width the tool does not know is a field it
+cannot mask, cannot read an offset out of, and cannot compare.
+
+```
+.venv/bin/python Tests/eval.py build --variant msvc-o0-x86          # ~3 s, no `cl` on PATH needed
+.venv/bin/python -m decomp analyze Tests/build/msvc-o0-x86/da_tests.stripped \
+        --variant msvc-o0-x86 --config Tests/project.toml            # Ghidra once, cached
+.venv/bin/python Tests/tools/check_msvc_x86_candidate.py             # ~35 s
+```
+
+The candidate objects are built through `compile.build(variant=…)`, i.e. the same driver resolver
+`decomp try` uses (`arch = "x86"` → `toolchains/msvc/bin/x86/cl`), and every object the script reads
+must *measure* 32-bit: an x64 object handed to an i386 target would be scoring nothing.
+
+1. **The field rules**, no target needed. The width of every `IMAGE_REL_I386_*` field as LIEF spells
+   it (`TYPE.I386_DIR32` — and LIEF reports a record `size` of 0, so the type table is the only
+   source of a width); no i386 record biased as though it were pc-relative; the same rule pointed the
+   other way, an x86-64 `R_X86_64_PC32`/`PLT32` on a call keeps its `+4`; and the two i386 spellings
+   of "reach outside the body" — a `[disp32]` memory operand and a relocated `$disp32` immediate —
+   found at the same offset at the same width, with an *unresolved* immediate left a constant.
+   Measured against one real object: `math.obj`, 84 functions (5 their own COMDAT, 79 bounded by the
+   next symbol), 784 relocations, all 784 with a known field width (0 were, before the fix).
+2. **Extents**: 89/89 units — the extent read out of the `.obj` equals the extent the original side
+   is compared over. An i386 PE has no `.pdata` (only `.xdata$x`/`.sxdata`), so the original side is
+   read over the analysis' body: the `gcc-o0-x86` situation, which is why these numbers belong next
+   to the `-m32` ones and not next to `msvc-o0`'s.
+3. **The loop**: 89/89 scored, **mean 99.75 %**, byte-identical 52, identical once the link-filled
+   fields are zeroed 86, tiers `{exact 66, structural 17, none 6}`, **66 past the gate**. The floor
+   is in the script as `{extents: 89, pass: 66, mean: 99.75}`, taken from this run — X86-3 refuses
+   to invent a floor before measuring one. `--all` lists every unit below the gate.
+4. **The controls** (40.00 %, 38.10 %, 88.89 %) still reported as the kind of wrong they are.
+
+The 23 that stop short are two families, and neither is a reading gap — `decomp try` says so on its
+own, which is how they were classified:
+
+* 15 reach 100.00 % with identical masked bytes but a callee neither side can name — `SYM0 original:
+  FUN_004076e0 candidate: ?ToLowerChar@@YADD UNVERIFIED` — so the tier caps at `structural`. The
+  naming gap (a PDB's `S_PUB32` rows, or the ledger), not this one.
+* 8 are operand differences, 7 of them one shape: `- subss 0x41f488(%ecx), %xmm0` against
+  `+ subss (%ecx), %xmm0`, because in the object the base of that address is a relocation placeholder
+  and in the image it is the final address. X86-6 ("the i386 normalisation both 32-bit paths share")
+  is the same set of units that caps `gcc-o0-x86`.
+
+Two facts the answer key needed, both measured rather than read off documentation: `link /MAP` writes
+`Rva+Base` at the image's own pointer size — 8 digits for a 32-bit link, 16 for x64 — and an i386 PE
+carries no function table at all, so its key is the map with extents from symbol spacing, printed as
+the worse key: `note: da_tests carries no .pdata … its answer key is link /MAP: 906 names` → 89 units
+matched to the source markers. Goldens warn (`/lib/ld-linux.so.2: could not open`: this Wine cannot
+run a 32-bit image), and `crosscheck` treats that as "no goldens".
+
 ## The C++ structure of a PE (MS-5)
 
 ```sh

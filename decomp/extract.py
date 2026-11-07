@@ -48,6 +48,17 @@ _COFF_FIELD_WIDTH = {
 	# how LIEF spells the same types
 	"AMD64_REL32": 4, "AMD64_ADDR32NB": 4, "AMD64_ADDR32": 4, "AMD64_REL64": 8,
 	"AMD64_DIR64": 8, "AMD64_IMMGREL32": 4, "AMD64_SECREL": 4,
+	# i386 (IMAGE_REL_I386_*, winnt.h), as LIEF names them - measured on a `cl /Od` object of
+	# this benchmark, which emits `TYPE.I386_REL32` (384 records) and `TYPE.I386_DIR32` (400) and
+	# nothing else, and reports a record `size` of 0 for all of them. The names are prefixed per
+	# machine here exactly as they are in the ELF table below: `DIR32` alone would not match the
+	# key `relocation_width` reads out of `TYPE.I386_DIR32`. Without these, an i386 candidate
+	# reads every reference with no field at all - no addend, no masked bytes, and a warning about
+	# an unknown type (Docs/MSVC-x86-Plan.md X86-3).
+	"I386_ABSOLUTE": 0, "I386_SECTION": 4, "I386_ADDR32": 4, "I386_REL32": 4,
+	"I386_SECTIONOFFSET": 2, "I386_IMMEDIATE": 4, "I386_SECIMAGE_REL32": 0, "I386_SECREL": 4,
+	"I386_IMM_SECREL": 4, "I386_LITERAL": 4, "I386_FILE": 0, "I386_MACH": 4, "I386_IMPREL": 0,
+	"I386_DIR32": 4, "I386_DIR32NB": 4, "I386_SECREL7": 1, "I386_REL32BF": 4,
 }
 
 # The same for ELF (R_*): the type says the width of the field it fixes. LIEF spells these

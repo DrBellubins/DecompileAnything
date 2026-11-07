@@ -100,6 +100,20 @@ arch = "x86-64"
 cppflags = ["/MT"]
 linkflags = ["/SUBSYSTEM:CONSOLE"]
 
+# The 32-bit twin of msvc-o0 (Docs/MSVC-x86-Plan.md X86-3/X86-4): the same sources, the same
+# /Od, the x86 target driver (`toolchains/msvc/bin/x86/cl`, chosen by `arch` - X86-2), and no
+# flag that switches bitness, because for `cl` the bitness is the driver and not a flag.
+# It exists to be scored: an i386 PE is the only MSVC target this machine can build whose
+# analysis has no compiler-authored unit table (no `.pdata` for x86 - X86-3), which is exactly
+# the situation the 32-bit proprietary targets are in, and the same one `gcc-o0-x86` is in. That
+# is why its numbers belong next to the -m32 ones and not next to msvc-o0's.
+[variants.msvc-o0-x86]
+compiler = "cl"
+optimize = 0
+arch = "x86"
+cppflags = ["/MT"]
+linkflags = ["/SUBSYSTEM:CONSOLE"]
+
 # A PE built by GCC. Not an MSVC variant and never an MSVC stand-in (Docs/MSVC-Plan.md §1):
 # the flags above would not apply to it and the codegen is GCC's. It is here because it is
 # the only PE this machine can build without a Windows SDK, so it is what exercises eval.py's

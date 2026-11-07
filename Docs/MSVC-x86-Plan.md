@@ -31,7 +31,7 @@ Reading a 32-bit binary works. Matching one exists for GCC only. Per command, on
 | `types` (structure recovery) | works (Design-Plan Phase 4; `this` from `8(%ebp)`) | works (MSVC-Plan MS-5: RTTI in absolute 4-byte addresses, `this` from `%ecx`, 769 classes in the game) |
 | `detect` | works | works **except** the `-O` inference: the x64 MSVC feature set reads zeros, and it refuses to probe ("cl is not installed here") |
 | `check` | the variant, its arch and the compiler agree | *was:* reports no `cl`, or the x64 one; `msvc_sdk()` called the SDK complete because it looked at x64 paths only. **Since X86-0 (2026-11-07):** an installed-but-off-PATH toolchain is found and named as that, `msvc target x64` / `msvc target x86` state the bitness each installed toolchain can produce, `msvc_sdk(arch=…)` answers per arch, and an `arch = "x86"` MSVC variant is named before any work starts. **Since X86-1 (same day):** both rows say `ok can build x86 candidates` — the 32-bit target toolset is installed, so the report's remaining MSVC gap is tool-side, not machine-side. **Since X86-2:** the `compiler msvc-*` rows report the driver the variant resolves to (with its bitness and why), so an installed toolchain is `ok` with no `cl` on PATH, and the `arch <variant>` row is the resolver's own sentence — `check` and `try` cannot disagree |
-| `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **the driver exists and is now chosen**: since X86-1 the machine can produce 32-bit COFF, and since X86-2 (2026-11-07) `arch = "x86"` resolves to `bin/x86/cl`, whose object measures 32-bit, with no `-m32`/`/arch:IA32` in its flags. What is not there yet is anything to score: a 32-bit MSVC benchmark variant is X86-4, and reading i386 COFF units is X86-3 |
+| `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **the driver exists and is now chosen**: since X86-1 the machine can produce 32-bit COFF, and since X86-2 (2026-11-07) `arch = "x86"` resolves to `bin/x86/cl`, whose object measures 32-bit, with no `-m32`/`/arch:IA32` in its flags. **Since X86-3 (same day)** there is something to score: `msvc-o0-x86` builds, is analysed and is read — 89/89 extents agree and `check_msvc_x86_candidate.py` holds the first floor (mean 99.75 %, 66/89 past the gate); the 23 that stop at `structural` do so for two reasons that are not i386 reading (naming, and the X86-6 operand shape) |
 | `link` (whole-program, Phase 6) | tested on 64-bit ELF only (`check_phase6_link.py` measures `gcc-o0`); a 32-bit ELF relink is untested | untested for a 32-bit PE: it needs the x86 link form, i386 relocation reading, and a link that can be run |
 
 The four "32-bit" things people mean, and their state:
@@ -433,7 +433,84 @@ drivers get scored).
 * Not claimed: a `MIN_EXACT` floor before the first run. The floor is set *from* that run, in the
   same commit that records the number, as Phase 3 of the byte-cleanup plan did.
 
+**Done 2026-11-07.** i386 COFF is read, and an i386 candidate is scored.
+
+*`decomp/extract.py`.* One table: `_COFF_FIELD_WIDTH` gained the `IMAGE_REL_I386_*` names **as LIEF
+spells them** (`I386_DIR32`, `I386_REL32`, `I386_DIR32NB`, `I386_SECREL`, `I386_SECREL7`, …),
+because `relocation_width` keys on the part after the last `.` and an entry called `DIR32` would
+never match `TYPE.I386_DIR32`. Measured on a `cl /Od` object of this benchmark: it emits
+`TYPE.I386_DIR32` (400 records) and `TYPE.I386_REL32` (384) and nothing else, and **LIEF reports a
+record `size` of 0 for every one of them**, so that table is the only source of a field width there.
+Before: 0 of the 784 relocations in that object had a known width — every candidate reference lost
+its offset, every link-filled field was *compared* instead of masked, and every unit carried an
+"unknown field width" warning. After: 784 of 784.
+
+Nothing else in the reader needed changing, and that was the question this phase asked:
+
+* **The pc rule.** `reference()` already passes no bias for a COFF record; now both directions of the
+  rule are asserted instead of assumed — an `I386_DIR32` is never classed as pc-relative, and an
+  x86-64 `R_X86_64_PC32`/`PLT32` on a call keeps its `+4`. The two i386 spellings of one thing, a
+  `[disp32]` memory operand and a relocated `$disp32` immediate, are found at the same offset at the
+  same width (`field_span` = `(1, 4)` on both) and hidden by the same rule, while an *unresolved*
+  immediate stays a constant — which is what keeps the rule from hiding everything.
+* **Extents: measured, not assumed.** `cl /Od` for x86 does **not** put each function in its own
+  COMDAT: one `.text$mn` (characteristics `0x60500020`, no `IMAGE_SCN_LNK_COMDAT`) holds 44 of
+  `math.cpp`'s 84 functions, 5 are their own `.text$mn` COMDAT, and the rest are bounded by the next
+  function symbol with the `int 3`/`nop` run cut off. The x64 object of the same source has the same
+  shape, so MS-3's symbol-spacing path — not its exact-COMDAT one — is the live one on both arches.
+  It is exact here: **89/89 units' candidate extent equals the extent the original side is compared
+  over**, with no new extent code.
+* **No unit table, as expected.** An i386 image carries `.xdata$x`/`.sxdata` and no `.pdata`, so 0
+  units of it come from the file's own function table and `original_function` reads the analysis'
+  body. That is the `gcc-o0-x86` situation, and why these numbers sit next to the `-m32` ones.
+
+Two things the plan took as already true were not, and both stood between it and a measurement:
+
+1. "the parser for [the map file] already exists and already knows … that `Rva+Base` is final" — it
+   knew the column is final but read it as **16 hex digits**. A 32-bit link prints 8 (`004023c0`),
+   so `msvc_map_names` found no rows at all and the image looked like it carried nothing.
+2. `pe_symbols` *raising* on "no `.pdata`" was X86-4's item, and had to go here or nothing could be
+   measured: `pe_symbols_without_unwind` builds the key from `link /MAP` with extents from symbol
+   spacing and prints that it is the worse key (906 names → 89 units matched to the source markers).
+   The asset came with it: `[variants.msvc-o0-x86]`, which `decomp check` reports as
+   `ok cl -> toolchains/msvc/bin/x86/cl`.
+
+Measured — `Tests/tools/check_msvc_x86_candidate.py`, exit 0 (~35 s once the target is analysed):
+group 1 the field rules against one i386 object, no target needed; group 2 extents 89/89; group 3
+89/89 units scored, **mean 99.75 %**, byte-identical 52, identical once the link-filled fields are
+zeroed 86, tiers `{exact 66, structural 17, none 6}`, **66 past the gate**; group 4 the three wrong
+candidates still reported as the kind of wrong they are (40.00 %, 38.10 %, 88.89 % with the expected
+categories). The floor is taken from that run, in this commit, as the phase said it would be:
+`{extents 89, pass 66, mean 99.75}`.
+
+The 23 that stop short fall into two families, neither an i386 reading gap — both are already named
+and owned elsewhere:
+
+* 15 reach **100.00 % with identical masked bytes** but a callee neither side can name
+  (`FUN_004076e0` against `?ToLowerChar@@YADD`), which caps the tier at `structural`. That is the
+  PDB/ledger naming gap: the fetched `notepad.pdb`'s `S_PUB32` rows are stored and unread.
+* 8 have operand differences, 7 of them one shape: the original reads `subss 0x41f488(%ecx), %xmm0`
+  where the object has `subss (%ecx), %xmm0`, because in the `.obj` the base of that address is a
+  relocation placeholder (0) and in the image it is the final address. The bytes are masked; the
+  operand text is not. That is **X86-6**, and it is the same set of units that caps `gcc-o0-x86` —
+  this phase makes that gap measurable on a second toolchain, which is what X86-6 meant by paying twice.
+
+Not moved: `check_coff_candidate.py` (x64) is untouched and says what it said before this phase (89/89
+extents, mean 100.00 %, the same 19-unit gate failure); `Tests/eval.py build --variant msvc-o0` still
+writes a byte-identical answer key (md5 `d7add1c058c4e8ee544345e8eb7c22ad`) and selfcheck is 89 cases
+/ 0 failures; `check_msvc_x86_toolchain.py`, `check_masked_bytes.py` and `check_phase2_try.py` exit 0.
+Goldens for the new variant warn (`/lib/ld-linux.so.2: could not open` — this Wine cannot run a
+32-bit image), which `crosscheck` already treats as "no goldens".
+
+Next: X86-5 (shape/detect — independent), then X86-6, which is where those 23 units live.
+
 **X86-4: a 32-bit MSVC reference build and its answer key.** *The test asset.*
+
+*Done in part on 2026-11-07, pulled forward by X86-3, which cannot be measured without a target:*
+the variant exists and so does its answer key — see X86-3's Done block, where the map file's
+pointer-size bug and the `pe_symbols` raise were both in the way and are fixed. What is **not** done
+here: goldens, which need *running* a 32-bit program (`eval.py build` warns, and this Wine has no
+`/lib/ld-linux.so.2`), and `selfcheck` for the variant, which depends on them.
 
 * `[variants.msvc-o0-x86]` in `Tests/project.toml` (`compiler = "cl"`, `arch = "x86"`,
   `optimize = 0`, `crt = "mt"`) with a comment saying it is the 32-bit twin of `msvc-o0` and why it
