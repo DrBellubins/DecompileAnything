@@ -21,7 +21,9 @@ python3 eval.py try --unit MATH-01 --src my/math.cpp --fn AbsDiff
 
 Everything generated lives in `Tests/build/<variant>/` (gitignored): `da_tests`
 (with symbols), `da_tests.stripped`, `answer_key.json`, `task_list.json`,
-`goldens.jsonl`, `build.json`.
+`goldens.jsonl`, `build.json` — which records, besides the compiler and its flags,
+`answer_key_extents`: what bounded every unit of that variant's key (a function table, a symbol
+length, or the next name), the same thing `build` prints under the unit count.
 
 ## Feeding the decomp tool
 
@@ -437,9 +439,18 @@ where it names the function, the analysis' body where it does not). All 89 agree
 how many came from a COMDAT section and how many from the next symbol in the section. **(2) The
 loop** - the untouched source through `decomp try` for every unit, the same call
 (`cli.score_candidate`), the same threshold and the same KNOWN_GAPS discipline as
-`check_phase2_try.py`: **100.00 % mean, 89 of 89 past the gate** since MS-5 named the type
-descriptors on the target side (it used to be 88 of 89, with STRUCT-24's reason recorded here and
-in the script's history). **(3) The wrong candidates** of
+`check_phase2_try.py`: **89 of 89 scored, 100.00 % mean, 54 byte-identical, 89 identical once the
+fields the link writes are masked.** The *gate* result is not what it was when this paragraph was
+written: since the tier rules landed, 70 reach `exact` and **19 land at `structural` at 100.00 %
+with `bytes +0 {}`**, because a callee neither side can name caps the tier there. That is the
+naming gap (X86-0 recorded the same 19 units as a pre-existing MS-3/MS-6 question, and
+`check_coff_candidate.py` exits 1 on them), not the COFF reader: extents, bytes and categories are
+all clean. `STRUCT-24` is one of the 19 — its unverified reference is `__RTDynamicCast`, original
+side `FUN_14000e794`, "nothing on either side names it" — and because
+`check_msvc_structures.py`'s loop group asserts that same unit passes, **that group now fails for
+the same reason** (re-measured 2026-11-07, and identically at HEAD without X86-4's changes, so it is
+not a consequence of that phase). Both wait on the same thing: a name for a CRT helper a symbol-less
+`/MT` image does carry but does not say (the fetched PDB's `S_PUB32` rows, or the ledger). **(3) The wrong candidates** of
 `Tests/examples/candidate_math_bad.cpp`, built by `cl`, still reported as the kind of wrong they
 are. `msvc-o2` runs the same script over the `/O2` build and is **measured but not gated** (no
 `KNOWN_GAPS` entry = report, don't fail): 91.40 % mean, 75 of 89 past the gate, because `cl /O2`
@@ -504,7 +515,77 @@ Two facts the answer key needed, both measured rather than read off documentatio
 carries no function table at all, so its key is the map with extents from symbol spacing, printed as
 the worse key: `note: da_tests carries no .pdata … its answer key is link /MAP: 906 names` → 89 units
 matched to the source markers. Goldens warn (`/lib/ld-linux.so.2: could not open`: this Wine cannot
-run a 32-bit image), and `crosscheck` treats that as "no goldens".
+run a 32-bit image), and `crosscheck` treats that as "no goldens". (Superseded the same day by
+X86-4 below: with wibo installed the 32-bit program runs, its goldens are captured, and its
+self-test passes.)
+
+## The 32-bit MSVC reference build and its answer key (MSVC-x86 X86-4, 2026-11-07)
+
+X86-3 made an i386 candidate readable; this is the asset it is read against, and the asset had three
+problems of its own. `check_msvc_x86_reference.py` asserts all three, plus the one thing the plan
+explicitly refuses to claim.
+
+```sh
+.venv/bin/python toolchains/install_wibo.py                          # §6.7 Option B, no root
+.venv/bin/python Tests/eval.py build --variant msvc-o0-x86          # ~4 s
+.venv/bin/python Tests/eval.py selfcheck --variant msvc-o0-x86      # exit 2 if no 32-bit guest
+.venv/bin/python Tests/tools/check_msvc_x86_reference.py            # ~1 s
+```
+
+1. **No bitness flag.** `build_flags`/`link_flags` for `msvc-o0-x86` are
+   `/std:c++17 /Od /W3 /EHsc /nologo /MT` + `/SUBSYSTEM:CONSOLE`: no `-m32`, no `/arch:IA32`, and
+   **no `/MACHINE:X86`** — measured, not assumed: a link is only told what its inputs do not already
+   say, and every object here is an i386 object. The assertion is on the file: the linked program is
+   `machine 0x14c`, optional header PE32, 32-bit.
+2. **One directory, one program.** `link` appends `.exe` to an extension-less `/Fe:` target, so a
+   fresh build wrote `da_tests.exe` while an old `da_tests` sat in the same directory — and the
+   rename guard (`if not binary.exists()`) never fired. Every MSVC build directory on this machine
+   held a fresh `da_tests.map` and objects beside the **previous** build's binary: the answer key was
+   built from the new map against the old image's section table, and `da_tests.stripped` — which is
+   what gets analysed, because a PE is not stripped — was a copy of the old bytes. The `.text`
+   after-strip check cannot see this: it compares a file against its own copy. Now the previous
+   `da_tests`, `da_tests.exe` and `da_tests.map` are removed before linking, and the build refuses
+   if the map's `Timestamp is …` header and the image's own `TimeDateStamp` disagree. What the
+   script asserts: one reference binary per directory, `.stripped` byte-identical to it, map stamp ==
+   image stamp, and every answer-key unit address inside an executable section of *that* image
+   (89/89; before the fix, a directory with an old image and a new map would have failed here).
+3. **The answer key names its own basis.** `eval.py build` prints the extent source under the unit
+   count, and `build.json` records it as `answer_key_extents`:
+   *`answer key: 89 units …` then `extents: 89 of 89 units came from a link /MAP name bounded by
+   the next name (this PE carries no function table)`*. The x64 keys are unchanged (`89 units`, same
+   md5s) and their provenance says what they always used — `msvc-o0`: 77 units from `.pdata` + 12
+   from the next named boundary; `msvc-o2`: 33 + 56; `mingw-o0`: 89 from `.pdata`. Recording it is
+   what keeps "the same 89 units" from meaning two different things across variants.
+4. **Running it.** A 32-bit *target* needed nothing from this machine; a 32-bit *guest* needs
+   [../Docs/Setup.md](../Docs/Setup.md) §6.7, and this Wine still has no i386 guest (re-measured:
+   `/usr/lib/wine` holds `x86_64-unix`/`x86_64-windows` only, and the host's `/lib/ld-linux.so.2`
+   resolves now — the failure moved, it did not go away). Option B closes it with no root:
+   `toolchains/install_wibo.py` fetches wibo 1.2.0 (sha256 pinned), runs the §6.7 probe — an
+   i386 `hello32` that must exit 3 — and installs it at `toolchains/wibo/wibo`, where
+   `toolchain.wibo_path()` finds it (`$DECOMP_WIBO`, PATH, that path). `runner()` prefers it for an
+   image whose optional header is PE32 and keeps `wine64` for PE32+; with nothing installed,
+   `selfcheck` exits **2** naming the option instead of reporting a failure. Measured here:
+   `goldens: 89 cases`, `selfcheck` → `89 cases, 0 failures`, and
+   `crosscheck: 0 differing cases across 7 variants` — the 32-bit MSVC program behaves like the four
+   x64 builds and the `-m32` one on every case (the two pre-existing cross-arch float differences
+   are gcc-o0-x86's, and are still labelled expected).
+5. **`decomp check` now separates the two facts.** Next to `msvc target x86 ok` it prints
+   `run 32-bit PE`, which is about Wine or wibo, never about the toolchain: with wibo it names it,
+   with an i386 Wine guest it names that, and with neither it warns with the two commands that fix
+   it and the sentence "Building 32-bit code never needed either of them".
+
+Two operational notes. Rebuilding a variant changes the bytes of `da_tests.stripped`, so its analysis
+cache entry is new: after any rebuild, re-run `decomp analyze … --variant <v>` before the
+candidate-side checks, which otherwise exit 2 and say so. And the rebuild makes every PE directory
+self-consistent for the first time, which re-anchors scores on the current link: the seven
+`answer_key.json` files are byte-identical (`msvc-o0 d7add1c0…`, `msvc-o0-x86 f6876757…`), but
+`check_msvc_structures.py`'s loop group now fails on `STRUCT-24` for the naming gap described in the
+MS-3 section above — measured again with these changes stashed at HEAD, so it is not a consequence
+of this phase.
+
+Not claimed: any byte score (that is X86-3's, and its floors are unchanged — see the section above),
+running a shipped 32-bit target's behaviour, or that wibo is required anywhere: it is a runner, and
+the tool works without it.
 
 ## The C++ structure of a PE (MS-5)
 
@@ -727,18 +808,19 @@ which is the half that matters: the tool does not raise a toolchain gap where th
   addressing forms only. A real `msvc-*` variant of this benchmark (PE/COFF, `cl`, an answer key
   from `.pdata` and `link /MAP` instead of `nm --print-size`) has been in and passing since MS-2;
   `try` against a COFF candidate is MS-3 of [../Docs/MSVC-Plan.md](../Docs/MSVC-Plan.md).
-* **The 32-bit MSVC toolset half is installed now** ([../Docs/MSVC-x86-Plan.md](../Docs/MSVC-x86-Plan.md)
-  X86-1, 2026-11-07): `VC/Tools/MSVC/14.12.25827/bin/Hostx64/x86` and `lib/x86` are there next to the
-  x64 ones, and `bin/x86/{cl,link,lib,ml,…}` wraps them - so a 32-bit *target* exists, while a 32-bit
-  Wine *guest* still does not (§1, Setup.md §6.7): the i386 `.exe` that probe links is never run. Before
-  that, the same tree had `bin/Hostx64/x64` and `lib/x64` only, while the Windows SDK's x86 import
-  libraries were installed all along - which is why `decomp check` answers per arch (`msvc target x64` /
-  `msvc target x86`, and `arch <name>` per variant) instead of saying "no MSVC". What is still missing is
-  tool-side: nothing resolves `arch = "x86"` to that driver yet (X86-2), `extract.py` cannot read a COFF
-  file that is 32-bit (`_COFF_FIELD_WIDTH` has no `I386_*` entries, X86-3), and there is no 32-bit MSVC
-  reference build or answer key (X86-4). Two consequences for how any future 32-bit MSVC number is read:
-  a 32-bit PE has no `.pdata`, so there is no compiler-authored answer key (symbol spacing or `link /MAP`
-  instead), and its numbers belong next to the `-m32` row, never next to `msvc-o0`'s.
+* **32-bit MSVC is a first-class variant now** ([../Docs/MSVC-x86-Plan.md](../Docs/MSVC-x86-Plan.md)
+  X86-1…X86-4, all 2026-11-07): the toolset has `bin/Hostx64/x86` + `lib/x86` and
+  `bin/x86/{cl,link,lib,ml,…}` wraps them; `arch = "x86"` resolves to that driver (X86-2);
+  `_COFF_FIELD_WIDTH` reads the `I386_*` spellings (X86-3); and `[variants.msvc-o0-x86]` is built,
+  analysed, scored (`check_msvc_x86_candidate.py`, floor `{extents 89, pass 66, mean 99.75}`) and
+  *run* (X86-4: wibo, `89 cases, 0 failures`, goldens captured, `crosscheck` clean). A 32-bit
+  *target* needed none of the Wine work; a 32-bit *guest* needed Setup.md §6.7's Option B.
+  `decomp check` keeps the two facts apart (`msvc target x86` vs `run 32-bit PE`).
+  What is still open in that plan is X86-5 (an i386 shape profile, so `detect` can answer `-O` for a
+  32-bit MSVC file) and X86-6 (the normalisation ceiling below, which the two 32-bit paths share).
+  Two rules for reading any 32-bit MSVC number: a 32-bit PE has no `.pdata`, so its answer key is
+  symbol spacing or `link /MAP` (and `eval.py build` prints which), and its numbers belong next to
+  the `-m32` row, never next to `msvc-o0`'s.
 * **Goldens are per-variant, not portable.** `crosscheck` treats a same-arch difference as
   a bug (there are none) and x87-vs-SSE float differences as expected: `-m32` computes
   `SineApprox` and `InitVehicleDescriptor`'s grip in float registers with different

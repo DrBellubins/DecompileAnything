@@ -811,6 +811,39 @@ def variant_arch_gap(variant: dict) -> str:
 		% (arch, detail))
 
 
+def i386_guest() -> dict:
+	"""Can a **32-bit PE be run** here? A different question from building one (Docs/Setup.md §6.7).
+
+	Nothing in this tool is required to execute a target, so this row is never fatal. What it gates is
+	the behavioural half: the benchmark's goldens and `Tests/eval.py selfcheck` for a 32-bit variant,
+	and the same question for a shipped 32-bit target. It is reported here because of the plan's trap
+	that a report blurs "this toolchain can build x86" with "this machine can run an x86 program":
+	the first is a fact about `bin/x86/cl` (the `msvc target x86` row above), the second about Wine
+	or wibo (§6.7).
+	"""
+	wibo = toolchain.wibo_path()
+	wine_i386 = sorted(str(directory) for directory in
+		(Path("/usr/lib/wine"), Path("/usr/lib32/wine"), Path("/usr/lib/i386-linux-gnu/wine"),
+			Path("/opt/wine/lib/wine")) if (directory / "i386-windows").is_dir())
+	interpreter = next((str(path) for path in ("/lib/ld-linux.so.2", "/usr/lib/ld-linux.so.2")
+		if Path(path).exists()), None)
+	if wibo:
+		return {"ok": True, "detail": "wibo at %s starts a 32-bit image (§6.7 Option B); wine64 "
+			"still starts the 64-bit ones" % wibo,
+			"fix": "a 32-bit *target* needed none of this - only *running* one does"}
+	if wine_i386:
+		return {"ok": True, "detail": "this Wine carries an i386 guest (%s)" % ", ".join(wine_i386),
+			"fix": "a fresh prefix may be needed (WINEARCH=win32): an existing prefix does not gain "
+			"32-bit support in place (§6.7 Option A)"}
+	how = ("this Wine has no i386 guest build (no i386-windows under its wine library directory)"
+		+ ("; the host's 32-bit ELF interpreter is %s" % interpreter if interpreter else
+			"; /lib/ld-linux.so.2 is missing, so /usr/bin/wine cannot exec either"))
+	return {"ok": False, "detail": "no way to run a 32-bit PE here: %s" % how,
+		"fix": ".venv/bin/python toolchains/install_wibo.py (no root, §6.7 Option B), or Wine's "
+		"i386 build plus a fresh prefix (§6.7 Option A, needs root). Building 32-bit code never "
+		"needed either of them."}
+
+
 def msvc_arch_report(report: "Report", prefix: Path | None) -> None:
 	"""Print the per-target-arch table (Docs/MSVC-x86-Plan.md X86-0).
 
@@ -832,6 +865,11 @@ def msvc_arch_report(report: "Report", prefix: Path | None) -> None:
 		report.add("msvc other targets", True,
 			"this prefix also has %s; nothing in this tool builds for them" % ", ".join(sorted(extra)),
 			fatal=False)
+	# The row that stops the two facts being read as one: "can build x86" says something about
+	# bin/x86/cl, "can run an x86 program" says something about Wine or wibo (§6.7). Printed next to
+	# the arch rows so they cannot be quoted separately (Docs/MSVC-x86-Plan.md §8, X86-4).
+	guest = i386_guest()
+	report.add("run 32-bit PE", guest["ok"], guest["detail"], guest["fix"], fatal=False)
 
 
 def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> None:

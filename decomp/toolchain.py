@@ -117,6 +117,30 @@ def driver_bitness(driver) -> tuple[str, str]:
 	return bitness, "%s is the directory this driver is installed for" % "/".join(parts[-3:])
 
 
+def wibo_path() -> str | None:
+	"""wibo, if it is installed: the loader that can **run a 32-bit PE** here (Docs/Setup.md §6.7 B).
+
+	Building 32-bit code needs nothing of the kind - an x64-host `cl` emits i386 (§6.7 item 1) - but
+	*running* the program that comes out needs either a Wine with an i386 guest (Option A, needs
+	root) or wibo (Option B, a static PE loader with no prefix). This machine has no i386 guest, so
+	without wibo a 32-bit reference program is simply not runnable here, and the honest answer is to
+	say so rather than to score nothing (Docs/MSVC-x86-Plan.md X86-4).
+
+	Found the way the tool finds its other machine-side assets: `$DECOMP_WIBO`, then PATH, then
+	`toolchains/wibo/wibo` beside this repository, which is what `toolchains/install_wibo.py`
+	installs. None means "not installed here", never "the build is wrong": nothing in the tool
+	requires a program to be runnable.
+	"""
+	explicit = os.environ.get("DECOMP_WIBO")
+	if explicit and Path(explicit).is_file():
+		return str(Path(explicit))
+	found = shutil.which("wibo")
+	if found:
+		return found
+	candidate = Path(__file__).resolve().parents[1] / "toolchains" / "wibo" / "wibo"
+	return str(candidate) if candidate.is_file() else None
+
+
 def msvc_wrapper(prefix, arch: str) -> Path | None:
 	"""`<prefix>/bin/<arch>/cl`, the wrapper that runs a target toolset under Wine (Setup.md §6.2).
 

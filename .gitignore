@@ -14,9 +14,9 @@ Tests/Proprietary/
 # Ghidra analysis cache (Docs/Setup.md §3): the Ghidra project + analysis.db per target
 cache/
 
-# MSVC toolchains and the Wine prefix (Docs/Setup.md §6): downloaded under Microsoft's
-# non-redistributable licence, rebuilt by the setup steps, never committed. The two drivers
-# that rebuild them are ours, so they are committed.
+# MSVC toolchains, the Wine prefix and wibo (Docs/Setup.md §1, §6, §6.7): downloaded under
+# Microsoft's non-redistributable licence or from an upstream release, rebuilt by the setup
+# steps, never committed. The drivers that rebuild them are ours, so they are committed.
 toolchains/*
 !toolchains/*.py
 .wine/

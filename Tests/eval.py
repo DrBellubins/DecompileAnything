@@ -55,6 +55,16 @@ DEFAULT_VARIANTS = {
 	"gcc-o0-x86": {"compiler": "g++", "optimize": 0, "arch": "x86"},
 }
 
+# What bounded a unit, recorded on every entry the answer key is built from. X86-4's acceptance
+# asks for the unit count *and* where each extent came from, because the two PEs in this benchmark
+# answer that differently: an x64 MSVC image carries the compiler's own function table, an i386 one
+# carries nothing (Docs/MSVC-x86-Plan.md X86-3). A score inherits the weakness of its boundaries.
+ELF_EXTENT = "the symbol's own length (nm --print-size)"
+UNWIND_EXTENT = "a .pdata unwind record (the compiler's own function table)"
+UNWIND_MISS = "the next named boundary - MSVC emits no .pdata record for this function"
+SPACED_EXTENT = "a symbol name bounded by the next name (the unwind records here name no symbol)"
+MAP_EXTENT = "a link /MAP name bounded by the next name (this PE carries no function table)"
+
 UNIT_MARKER = re.compile(
 	r"//\s*DA-UNIT\s+(?P<id>[A-Z]+-\d+)\s+level:(?P<level>easy|medium|hard)"
 	r"(?:\s+tags:(?P<tags>[\w,+.-]*))?(?:\s+sym:(?P<sym>\S+))?"
@@ -172,6 +182,45 @@ def is_pe(path):
 		return False
 
 
+def pe_header(path):
+	"""{machine, bits, timestamp} from a PE's file header and optional header.
+
+	Two facts that are only ever asked next to the section table. The target bitness decides what
+	it takes to **run** the file, which is a different question from what it took to build it
+	(a 32-bit target needs nothing from Wine; a 32-bit *guest* needs Docs/Setup.md §6.7). The link
+	timestamp is how a `link /MAP` gets tied to the exact link that wrote the bytes beside it - a
+	build directory has to describe one program, not the link of this run and the binary of the
+	last one (Docs/MSVC-x86-Plan.md X86-4).
+	"""
+	with open(path, "rb") as handle:
+		data = handle.read(4096)
+	offset = struct.unpack_from("<I", data, 0x3C)[0]
+	if data[offset:offset + 4] != b"PE\0\0":
+		raise RuntimeError("%s is not a PE" % path)
+	coff = offset + 4
+	machine, _, _, _, _, size_optional, _ = struct.unpack_from("<HHIIIHH", data, coff)
+	magic = struct.unpack_from("<H", data, coff + 20)[0]
+	return {"machine": machine, "bits": 64 if magic == 0x20B else 32,
+		"timestamp": struct.unpack_from("<I", data, coff + 4)[0]}
+
+
+class GuestError(RuntimeError):
+	"""This program cannot be started from here.
+
+	Named, because "the reference program failed" and "nothing here can start a 32-bit PE" are
+	different answers, and only the first one says anything about the code.
+	"""
+
+
+def wibo_path():
+	"""The 32-bit PE loader, if this machine has one - the tool's own answer, not a second copy.
+
+	One definition lives in `decomp.toolchain.wibo_path` so that `decomp check`'s report and the
+	harness that runs the reference program cannot disagree (the lesson of X86-2's two flag rules).
+	"""
+	return toolchain.wibo_path()
+
+
 def wine_runner():
 	"""A PE is built for Windows; Wine runs it. `wine64` first: a 32-bit wine launcher is not
 	usable on this machine (Docs/Setup.md §1)."""
@@ -181,7 +230,28 @@ def wine_runner():
 
 
 def runner(path):
-	return [wine_runner(), str(path)] if is_pe(path) else [str(path)]
+	"""How to start this program. A PE needs a Windows guest; a 32-bit PE needs a 32-bit one.
+
+	`wine64` starts a 64-bit image. An i386 image needs Wine built with an i386 guest (Setup.md
+	§6.7 Option A - this machine's Wine has none: `/usr/lib/wine` holds `x86_64-unix` and
+	`x86_64-windows` only, and `wine64` on a 32-bit PE answers `/lib/ld-linux.so.2: could not
+	open`, re-measured 2026-11-07), or wibo (Option B), which is the only thing here that starts
+	one. Nothing is *gated* on either: an unavailable guest is a `GuestError` naming the option,
+	not a zero score and not a silent skip.
+	"""
+	if not is_pe(path):
+		return [str(path)]
+	if pe_header(path)["bits"] == 32:
+		loaded = wibo_path()
+		if loaded:
+			return [loaded, str(path)]
+		raise GuestError("%s is a 32-bit Windows program and nothing here can start one: this Wine "
+			"has no i386 guest (Docs/Setup.md §6.7 Option A). `toolchains/install_wibo.py` installs "
+			"Option B, which does" % Path(path).name)
+	wine = wine_runner()
+	if not wine:
+		raise GuestError("no wine/wine64 on PATH: a 64-bit PE cannot be started from here")
+	return [wine, str(path)]
 
 
 # --------------------------------------------------------------------------------------
@@ -233,7 +303,9 @@ def symbols(binary):
 		if kind not in "tTwWdDrRbB":
 			continue
 		try:
-			entries.append({"address": int(address, 16), "size": int(size, 16), "mangled": mangled, "type": kind})
+			# nm quotes a length, so this extent is the file's own claim about the object.
+			entries.append({"address": int(address, 16), "size": int(size, 16), "mangled": mangled,
+				"type": kind, "extent_source": ELF_EXTENT})
 		except ValueError:
 			continue
 	names = demangle([e["mangled"] for e in entries])
@@ -403,13 +475,14 @@ def pe_symbols(binary):
 	for unit in units:
 		name = names.get(unit["address"], "")
 		entries.append({"address": unit["address"], "size": unit["size"], "mangled": name,
-			"name": simple_name(name) if name else "unnamed@0x%x" % unit["address"], "type": "t"})
+			"name": simple_name(name) if name else "unnamed@0x%x" % unit["address"], "type": "t",
+			"extent_source": UNWIND_EXTENT})
 	named = sum(1 for entry in entries if entry["mangled"])
 	if named * 3 < len(entries):
 		print("  note: only %d of %d .pdata records of %s carry a name - this PE was not built "
 			"by MSVC (GCC splits one function across several unwind records), so the units below "
 			"come from the symbol table with extents up to the next symbol" % (named, len(entries), binary))
-		entries = symbol_units(names)
+		entries = symbol_units(names, SPACED_EXTENT)
 	else:
 		# Functions the unwind table does not describe, named by the map: added with an extent
 		# up to the next boundary, which is the same fallback the paragraph above describes.
@@ -418,14 +491,14 @@ def pe_symbols(binary):
 		missing = [(address, name) for address, name in sorted(names.items())
 			if not any(start <= address < end for start, end in covered)]
 		if missing:
-			print("  note: %d named functions of %s have no .pdata record - MSVC emits none for a "
-				"function with no prologue or epilogue; their extent comes from the next boundary"
-				% (len(missing), Path(binary).name))
+			print("  note: %d named functions of %s have no .pdata record - an unwind record exists "
+				"only for code that needs unwinding, so a function with no prologue and no epilogue "
+				"gets none; their extent comes from the next boundary" % (len(missing), Path(binary).name))
 		for address, name in missing:
 			nexts = [boundary for boundary in boundaries if boundary > address]
 			end = nexts[0] if nexts else address
 			entries.append({"address": address, "size": end - address, "mangled": name,
-				"name": simple_name(name), "type": "t"})
+				"name": simple_name(name), "type": "t", "extent_source": UNWIND_MISS})
 	# A PE built by GCC still uses Itanium names; MSVC decorations are handled by simple_name.
 	itanium = [entry["mangled"] for entry in entries if entry["mangled"].startswith("_Z")]
 	if itanium:
@@ -453,7 +526,7 @@ def pe_symbols_without_unwind(binary, image_base, sections):
 		raise RuntimeError("%s has no .pdata and no usable map file: this PE carries neither a "
 			"function table nor the names the linker wrote, so there is no answer key to build"
 			% Path(binary).name)
-	entries = symbol_units(names)
+	entries = symbol_units(names, MAP_EXTENT)
 	print("  note: %s carries no .pdata (an i386 PE has no unwind directory except for EH code), "
 		"so its answer key is `link /MAP`: %d names, each with an extent up to the next one - the "
 		"linker's layout, not a compiler-authored function table" % (Path(binary).name, len(entries)))
@@ -467,17 +540,18 @@ def pe_symbols_without_unwind(binary, image_base, sections):
 	return entries
 
 
-def symbol_units(names):
+def symbol_units(names, source=SPACED_EXTENT):
 	"""Named addresses -> units, each running to the next name. A merged `.rdata` pool or a
 	tail-padded function makes this wrong at the edges; it is still the boundary the file
-	names, and better than no boundary at all."""
+	names, and better than no boundary at all. `source` says which names those were, so the
+	answer key can name the weaker basis it had to use (X86-4)."""
 	addresses = sorted(names)
 	entries = []
 	for index, address in enumerate(addresses):
 		end = addresses[index + 1] if index + 1 < len(addresses) else address
 		name = names[address]
 		entries.append({"address": address, "size": max(0, end - address), "mangled": name,
-			"name": name, "type": "t"})
+			"name": name, "type": "t", "extent_source": source})
 	return [entry for entry in entries if entry["size"]]
 
 
@@ -553,6 +627,7 @@ def build_answer_key(variant, config):
 	index = name_index(entries)
 	units = parse_units()
 	resolved, unresolved, ambiguous = [], [], []
+	extent_of = {}  # unit id -> what bounded it, for the report below and for build.json
 	for unit in units:
 		hint = unit["symbol_hint"]
 		candidates = []
@@ -574,6 +649,7 @@ def build_answer_key(variant, config):
 			ambiguous.append((unit["id"], [c["name"] for c in candidates]))
 			continue
 		entry = candidates[0]
+		extent_of[unit["id"]] = entry.get("extent_source", "unknown")
 		resolved.append({
 			"id": unit["id"],
 			"level": unit["level"],
@@ -630,7 +706,15 @@ def build_answer_key(variant, config):
 		for item in ambiguous:
 			print("  ambiguous %s: %s" % item)
 	print("answer key: %d units (%d markers in source), %d other symbols" % (len(resolved), len(units), len(other)))
-	return answer
+	tally: dict[str, int] = {}
+	for unit in resolved:
+		tally[extent_of[unit["id"]]] = tally.get(extent_of[unit["id"]], 0) + 1
+	# Where every extent came from, printed next to the count it qualifies. The units of a PE with
+	# no function table and the units of one that has a record per function are not the same kind
+	# of claim, and any score built on them inherits that (Docs/MSVC-x86-Plan.md X86-3/X86-4).
+	for source, count in sorted(tally.items(), key=lambda item: -item[1]):
+		print("  extents: %d of %d units came from %s" % (count, len(resolved), source))
+	return answer, tally
 
 
 # --------------------------------------------------------------------------------------
@@ -914,11 +998,22 @@ def cmd_build(config, variants, capture=True):
 				SOURCE_DIR / source, object_path)
 			objects.append(object_path)
 		binary = out_dir / "da_tests"
+		# Link into clean names. `link` appends `.exe` to an extension-less `/Fe:` target, and a
+		# `da_tests` left by an earlier build then sits there while the map and the objects describe
+		# the link that just ran - so the strip copy, the answer key and the analysis all read a
+		# *different program* from the map beside them. Measured on this tree before the fix: a
+		# 2026-11-04 `da_tests` next to a fresh `da_tests.exe`/`da_tests.map`, at every MSVC
+		# variant. One directory, one program (Docs/MSVC-x86-Plan.md X86-4).
+		for stale in (binary, Path(str(binary) + ".exe"), Path(str(binary) + ".map")):
+			stale.unlink(missing_ok=True)
 		link_binary(compiler, flags, objects, linkflags, binary)
 		if not binary.exists() and Path(str(binary) + ".exe").exists():
 			# A Windows toolchain adds the .exe suffix to an extension-less output name (MinGW's
-			# ld does; `cl /Fe:` does not). This harness names the reference binary one way.
+			# ld does; so does `link`, reached through `cl /Fe:`). This harness names the reference
+			# binary one way.
 			Path(str(binary) + ".exe").rename(binary)
+		if not binary.exists():
+			raise RuntimeError("%s: the link ran but produced no %s" % (variant, binary.name))
 		stripped = out_dir / "da_tests.stripped"
 		if is_pe(binary):
 			# A PE from `link` has no symbol table to strip and `strip` would only rewrite the
@@ -932,6 +1027,20 @@ def cmd_build(config, variants, capture=True):
 		stripped_text = sh(["objdump", "-s", "--section=.text", str(stripped)], binary=False)
 		if original_text.split("\n", 2)[2:] != stripped_text.split("\n", 2)[2:]:
 			raise RuntimeError("%s: .text differs after strip, addresses are not reusable" % variant)
+		if is_pe(binary) and Path(str(binary) + ".map").is_file():
+			# The map file *is* the answer key of an MSVC-built PE, so it has to be this link's map.
+			# `link` stamps the same value in its own "Timestamp is …" header and in the PE header's
+			# TimeDateStamp; if they disagree, this directory describes two links and the answer key
+			# points at bytes that are not the ones it was read from.
+			stamp = pe_header(binary)["timestamp"]
+			written = re.search(r"Timestamp is ([0-9a-fA-F]{8})",
+				Path(str(binary) + ".map").read_text(errors="replace"))
+			if not written or int(written.group(1), 16) != stamp:
+				raise RuntimeError("%s: %s is not the map of this image (the image is stamped %s, the map "
+				"says %s) - the answer key would describe a different program than the bytes it scores"
+				% (variant, Path(str(binary) + ".map").name, hex(stamp),
+					written.group(1) if written else "nothing"))
+		answer, extents = build_answer_key(variant, config)
 		try:
 			compiler_version = sh([compiler, "--version"] if not toolchain.msvc(compiler)
 				else [compiler, "/Bv", "/c"])
@@ -943,14 +1052,19 @@ def cmd_build(config, variants, capture=True):
 			"flags": flags,
 			"binary": str(binary),
 			"stripped": str(stripped),
+			"target_bits": (pe_header(binary)["bits"] if is_pe(binary) else None),
+			"answer_key_extents": extents,
 			"comment_section": (sh(["readelf", "-p", ".comment", str(binary)], binary=False).strip()
 				if not is_pe(binary) else ""),
 		}
 		(out_dir / "build.json").write_text(json.dumps(build_info, indent=1) + "\n")
-		build_answer_key(variant, config)
 		if capture:
 			try:
 				cmd_goldens(variant, config)
+			except GuestError as exc:
+				# A program that cannot be started says nothing about the code in it. Said as a
+				# warning with the option that would fix it, never as a failure of the build.
+				print("  warning: no goldens for %s: %s" % (variant, exc))
 			except (RuntimeError, FileNotFoundError) as exc:
 				print("  warning: no goldens for %s (%s) - link it statically if you want them" % (variant, exc))
 	print("built: %s" % ", ".join(variants))
@@ -967,7 +1081,14 @@ def cmd_goldens(variant, config):
 
 def cmd_selfcheck(variant, config):
 	binary = BUILD_DIR / variant / "da_tests"
-	out = sh(runner(binary))
+	try:
+		args = runner(binary)
+	except GuestError as exc:
+		# Exit 2, not 1: the reference program's own expectations were not run, so nothing is
+		# claimed about them. That is a machine fact (Docs/Setup.md §6.7), not a failed check.
+		print("selfcheck %s: not run - %s" % (variant, exc))
+		return 2
+	out = sh(args)
 	print(out.strip())
 	return 0 if " 0 failures" in out else 1
 

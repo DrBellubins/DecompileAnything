@@ -19,7 +19,7 @@ Two layers: **system tools** (installed once, machine-wide, on `PATH`) and a **p
 | `capstone`, `pyelftools`, `pefile`, `click` | provided by the distro's site-packages | disassembly, `.o`/PE reading — reused by the venv |
 | MSVC `cl` | *installed 2026-11-04 by §6.10*: `toolchains/msvc` — toolset v141 (`14.12.25827`) + Windows SDK 10.0.19041, driven through `toolchains/msvc/bin/x64/{cl,link,lib,dumpbin}` (`PATH=$PWD/toolchains/msvc/bin/x64:$PATH`, which is what the MSVC scripts set; a default shell has no `cl` and `decomp check` says so rather than saying there is no toolchain). **Target arches it can build: x64 and x86** — since the X86-1 re-run of 2026-11-07 the tree holds `bin/Hostx64/{x64,x86}` and `lib/{x64,x86}`, and the wrappers are `bin/x64/{cl,link,…}` **and** `bin/x86/{cl,link,…}`; use one at a time, because the *directory* is what picks the target (§6.2). Both `cl.exe`s print the same banner, `Version 19.12.25835`, one for x64 and one for x86. `clang-cl` is still refused as an impostor (§6.8). | real PE/MSVC targets only; **§6** gives the setup steps for every toolchain era from VS2005 to VS2026, in both 32-bit and 64-bit form ([MSVC-Plan.md](MSVC-Plan.md) §5 and phase MS-2 are the why, §6 is the how). What is and is not 32-bit-capable today, per target arch, is what `decomp check` prints (§6.9): the toolset half was closed by [MSVC-x86-Plan.md](MSVC-x86-Plan.md) X86-1 (2026-11-07), the tool half — `arch` picking that driver, reading i386 COFF — is X86-2/X86-3 |
 | `objdiff-cli` | *not installed* | optional Phase 5 alternate diff backend |
-| `wine` | 9.21 Staging. `wine64` runs **64-bit** PE files (`x86_64-w64-mingw32-g++` probe prints, exit 0). It cannot start a **32-bit** PE: `/lib/ld-linux.so.2: could not open` — the Wine build does have 32-bit guests (`/usr/lib/wine/i386-windows` exists) but the host has no 32-bit ELF interpreter; `/usr/bin/wine` itself is that 32-bit ELF and fails to exec. | running `cl.exe`/`link.exe` for MSVC targets — `wine64` is enough for every toolset from VS2015 on (they all ship an x64-hosted `cl`), and *not* enough for the 32-bit-host tools of VS2013 and older; §6.7 fixes that |
+| `wine` | 9.21 Staging. `wine64` runs **64-bit** PE files (`x86_64-w64-mingw32-g++` probe prints, exit 0). It cannot start a **32-bit** PE — re-measured 2026-11-07: `/lib/ld-linux.so.2: could not open`, and the reason is now the other half of what it was: the host *does* have a 32-bit ELF interpreter (`ldd /usr/bin/wine` resolves `/lib/ld-linux.so.2` → `/usr/lib/ld-linux.so.2`), but this Wine ships no i386 guest — `/usr/lib/wine` holds `x86_64-unix` and `x86_64-windows` only, and `/usr/bin/wine` itself still will not exec. Option A below fixes it with root; **Option B is installed** (`toolchains/wibo/wibo`, §6.7), which is what runs 32-bit PEs here. | running `cl.exe`/`link.exe` for MSVC targets — `wine64` is enough for every toolset from VS2015 on (they all ship an x64-hosted `cl`), and *not* enough for the 32-bit-host tools of VS2013 and older; §6.7 fixes that |
 
 ### Ghidra must be a system install reachable from `/usr/bin`
 
@@ -462,6 +462,23 @@ renames `HostX64` → `Hostx64`.
      ```
      (the 64-bit twin with `x86_64-w64-mingw32-g++` is the baseline — it passes here.)
 
+**Option B is installed (2026-11-07, Docs/MSVC-x86-Plan.md X86-4).** `toolchains/install_wibo.py`
+fetches wibo 1.2.0 (`wibo-x86_64`, sha256 `13f86a2d…` pinned in the file — it is not the upstream
+release's published checksum, it is the file this machine downloaded and tested), runs the probe
+above — built `-static`, because a shared `libgcc_s_dw2-1.dll` is a DLL the guest has to be handed
+separately and wibo answers `missing import __register_frame_info` without one — and installs it at
+`toolchains/wibo/wibo` (gitignored, like the rest of `toolchains/`). `decomp.toolchain.wibo_path()`
+is the single place that finds it (`$DECOMP_WIBO`, then PATH, then that path), used by `decomp check`
+and by `Tests/eval.py`'s `runner()`, which prefers it only for an image whose optional header is
+PE32 and keeps `wine64` for PE32+.
+
+Measured here: `probe: wibo hello32.exe -> exit 3, stdout 'hello32'`; the 32-bit MSVC build of the
+benchmark runs (`eval.py selfcheck --variant msvc-o0-x86` → `89 cases, 0 failures`, and its goldens
+capture 89 cases); Option A is still uninstalled, and `decomp check` now says which of the two this
+machine has (`run 32-bit PE`, next to the `msvc target x86` row, so the two facts cannot be quoted
+as one). Nothing is *gated* on either: building a 32-bit target needs no guest at all, and a tool
+that cannot run its target still analyses, matches and scores it.
+
 ### 6.8 Verifying a toolset after install (the probe every one must pass)
 
 Never record a toolchain's identity from its directory name; ask the compiler. Put this next to the
@@ -491,7 +508,10 @@ what says it (`cl` 19.12 is what a `14.12.25827` toolset answers, per §6.3's ta
 <vector>` compiles and a `/MT` console program links at both, with **no bitness flag anywhere** in
 the command line, so the only thing that decides the target is which `cl.exe` ran; the `.obj`s read
 back `I386/32` and `AMD64/64`. Step 2's *run* is done for x64 only — the i386 image is checked to be
-a 32-bit PE and not executed (§6.7). Step 4 is not covered by that script.
+a 32-bit PE and not executed (§6.7). Since X86-4 that half *could* be run here — wibo, §6.7
+Option B, is what `Tests/eval.py` runs the 32-bit benchmark program through — and this script
+deliberately still does not, so that it stays a check of the toolchain rather than of the guest.
+Step 4 is not covered by that script.
 
 ### 6.9 Not done yet (tool-side; these are the follow-ups, not part of setup)
 
@@ -529,12 +549,18 @@ a 32-bit PE and not executed (§6.7). Step 4 is not covered by that script.
   has `Hostx64/{x64,x86}` and `lib/{x64,x86}` and `decomp check` reports both as buildable; the
   earlier state (`Hostx64/x64` and `lib/x64` only, SDK x86 libraries present) is kept above because it
   is the example of why the answer has to be per arch. *Picking* that driver from
-  `arch = "x86"` is X86-2; reading an i386 COFF object is X86-3.
-  Still not done: a 32-bit-host answer (§6.7) and a `#include <vector>` probe - that one is
-  `Tests/tools/check_msvc_toolchain.py`'s link group, which needs the SDK.
-* `[msvc]` in `project.toml` next to `[ghidra]`: toolchain dir, expected `cl` version, target arch.
-  Today `cli.py` maps the `msvc` family to a bare `cl` on `PATH` (`Docs/MSVC-Plan.md` §1), which
-  works with the wrappers; a named prefix would let `decomp check` pin the era `detect` found.
+  `arch = "x86"` is X86-2; reading an i386 COFF object is X86-3. A 32-bit **guest** is answered since
+  X86-4 (§6.7 Option B: wibo at `toolchains/wibo/wibo`, reported by `decomp check`'s
+  `run 32-bit PE` row). Still not done: running a 32-bit **host** tool (VC2005/2008, or the
+  `VC/bin/x86*` of VS2013 and older) — wibo starts 32-bit PE processes here now, and
+  decompals/wibo#127 is the evidence that a VS2013 host `cl` can work under it, but nothing of that
+  era has been measured on this machine. The `#include <vector>` probe *is* done: §6.8's steps 1-3 at
+  both target arches are `Tests/tools/check_msvc_x86_install.py`.
+* `[msvc]` in `project.toml` next to `[ghidra]`: **done by X86-2** — `config.msvc_prefix`, the
+  `[msvc] prefix` table in `Tests/project.toml`, and `toolchain.compiler_for` resolving a variant's
+  `arch` to `<prefix>/bin/<arch>/cl` by path, so neither `eval.py` nor `decomp try` needs `cl` on
+  PATH. The half that is still open is the *expected `cl` version*: pinning the era `detect` found is
+  MS-4's toolset reading.
 * All Windows path translation in one place (`decomp/toolchain.py`): run `cl` from the source
   directory with relative `/Fo`/`/I`, convert unavoidable absolute paths with `winepath -w`, and
   normalise diagnostics the way msvc-wine's wrappers do (strip `\r`, rewrite `z:\...`) —
