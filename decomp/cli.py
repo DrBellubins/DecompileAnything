@@ -20,7 +20,7 @@ from typing import Optional
 import typer
 
 from . import (__version__, cache, check, compile, config, discover, diff, extract,
-	ghidra, normalize, relink, structures, symbols, toolchain)
+	fidelity, ghidra, normalize, relink, structures, symbols, toolchain)
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NOT_FOUND = 0, 1, 2, 3
 
@@ -605,6 +605,7 @@ def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=
 		candidates = [compiler for compiler in ("g++", "clang++") if shutil.which(compiler)]
 		out["problems"].append("the compiler is not named in the file: ranking the toolchains "
 			"that are installed here by shape instead")
+	out["compilers"] = candidates
 	bits = note.get("bits") or 64
 	for compiler in candidates:
 		if not shutil.which(compiler):
@@ -669,13 +670,23 @@ def detect(
 
 	note, profile, ranked = outcome["note"], outcome["profile"], outcome["ranked"]
 	guess = outcome["guess"]
+	# Phase 7: the flags beyond `-O` that the file itself names, and whether the compiler here is
+	# the compiler that made it. Both come from the file's own records, not from the code's shape.
+	fid = fidelity.for_target(note, profile, outcome.get("compilers") or [])
+	outcome["fidelity"] = {"versions": [{"state": item["state"], "hard": item["hard"],
+		"detail": item["detail"], "built": item["built"], "installed": item["installed"]}
+		for item in fid["versions"]],
+		"flags": [{"flag": item["flag"], "state": item["state"],
+			"certainty": item["certainty"], "add": item["add"], "why": item["why"]}
+			for item in fid["flags"]["findings"]],
+		"suggest": fid["flags"]["suggest"]}
 	if as_json:
 		payload = {key: value for key, value in outcome.items() if key != "signatures"}
 		payload["probes"] = [{"optimize": item["optimize"], "compiler": item.get("compiler"),
 			"profile": item["profile"]} for item in outcome["signatures"]]
 		echo(json.dumps(payload, indent=1, default=str))
 		if write is not None:
-			_path = _write_config(target, Path(write), note, guess, force)
+			_path = _write_config(target, Path(write), note, guess, force, fid["flags"])
 		raise typer.Exit(EXIT_OK if not note.get("error") else EXIT_FAIL)
 
 	echo("target %s" % target)
@@ -700,6 +711,11 @@ def detect(
 		for line in toolchain.msvc_shape_flags(profile):
 			echo("  %s" % line)
 
+	echo()
+	echo("build fidelity (the file's own records, and this machine's toolchain):")
+	for line in fidelity.detect_lines(fid):
+		echo("  %s" % line)
+
 	if probe and ranked:
 		echo()
 		echo("measured with the toolchains installed here (a candidate is built with these):")
@@ -720,7 +736,7 @@ def detect(
 		echo("  note: %s" % problem)
 
 	if write is not None:
-		path = _write_config(target, Path(write), note, guess, force)
+		path = _write_config(target, Path(write), note, guess, force, fid["flags"])
 		echo()
 		echo("wrote %s" % path)
 		echo("next: decomp analyze %s --variant %s -C %s" % (binary,
@@ -728,14 +744,15 @@ def detect(
 	raise typer.Exit(EXIT_OK)
 
 
-def _write_config(target: Path, path: Path, note: dict, guess: dict | None, force: bool) -> Path:
+def _write_config(target: Path, path: Path, note: dict, guess: dict | None, force: bool,
+		flags: dict | None = None) -> Path:
 	if path.is_dir():
 		path = path / config.CONFIG_NAME
 	if path.is_file() and not force:
 		raise Stop(EXIT_USAGE, "%s already exists - pass --force to replace it (or edit it: "
 		"`decomp detect` writes a starting point, not an answer)" % path)
 	path.parent.mkdir(parents=True, exist_ok=True)
-	path.write_text(toolchain.starter_config(target, note, guess))
+	path.write_text(toolchain.starter_config(target, note, guess, flags))
 	return path
 
 
@@ -1150,6 +1167,24 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		original_at=normalize.body_index(blocks_original, instructions_original, tokens_original),
 		candidate_at=normalize.body_index(blocks_candidate, instructions_candidate, tokens_candidate),
 		require=require, waive=tuple(waiver), ledger=ledger)
+	# Phase 7: the toolchain reading, and the flags the file names beyond `-O`. A compiler mismatch
+	# is the one difference the loop cannot iterate towards, so it goes where the loop reads it
+	# (`verdict.gaps`) as well as in the notes; the flags are offered as a build to try, never
+	# applied on their own.
+	target_path = Path(str(meta.get("target_path") or ""))
+	agreement = fidelity.cached_agreement(meta, str(body.get("compiler", "g++")))
+	if agreement["state"] not in ("same", "unknown"):
+		outcome["warnings"].append(agreement["detail"])
+		outcome["verdict"].build_mismatch = agreement["detail"]
+	if require == "exact" and not outcome["verdict"].bytes_equal_masked and target_path.is_file():
+		note = toolchain.build_note(target_path)
+		if not note.get("error"):
+			texts = [str(item.get("text") if isinstance(item, dict) else getattr(item, "text", "")
+				or "") for item in instructions_original]
+			found = fidelity.flag_findings(note,
+				fidelity.evidence(texts=[item for item in texts if item]))
+			outcome["flags_this_file_names"] = found["findings"]
+			outcome["flag_advice"] = fidelity.finding_lines(found)
 	return outcome
 
 
@@ -1347,6 +1382,12 @@ def try_cmd(
 		_hex(outcome["original"].address)), "%s (%s)" % (outcome["candidate"].display,
 		outcome["candidate"].section), max_diff=max_diff, max_symbols=max_symbols):
 		echo(line)
+	if outcome.get("flag_advice"):
+		# The exact tier is a claim about the build as much as about the source.
+		echo()
+		echo("the build this file names (its own records, not a guess about the source):")
+		for line in outcome["flag_advice"]:
+			echo("  %s" % line)
 	learned = outcome.get("learned") or {}
 	if learned.get("written"):
 		echo("learned: %d pair%s added to the match ledger - what a later unit has to name the same "

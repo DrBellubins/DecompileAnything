@@ -202,7 +202,43 @@ def check_all(cfg: dict, want_compilers: bool = True) -> Report:
 			else:
 				report.add("compiler %s" % name, True, message)
 		msvc_report(report, [body.get("compiler", "g++") for body in names.values()], want_compilers)
+		build_agreement(report, cfg, names)
 	return report
+
+
+def build_agreement(report: "Report", cfg: dict, variants: dict) -> None:
+	"""Phase 7: was each analysed target built by the compiler its variant would use here?
+
+	This is the check that tells an operator why `exact` is out of reach before a loop starts: a
+	file whose own `.comment` names another release, or a PE built by MSVC whose variant names
+	`g++`, cannot be byte-matched by the toolchain in front of them. It reads what `decomp analyze`
+	recorded about each file rather than re-reading the binaries, and a file that names nothing is
+	left alone: not knowing is not a mismatch. Warnings, never failures - an existing analysis is
+	still worth working with, and the report says which way to go about it.
+	"""
+	from . import cache  # local: the analysis store is not needed by any other check
+	from . import fidelity
+
+	try:
+		targets = cache.Cache(config.cache_dir(cfg)).targets()
+	except config.ConfigError:
+		return  # `check_all` already reported the cache path when it is unusable
+	seen: set[tuple] = set()
+	for values in targets:
+		target = Path(str(values.get("target_path") or ""))
+		for name, body in sorted(variants.items()):
+			compiler = str(body.get("compiler", "g++"))
+			agreement = fidelity.cached_agreement(values, compiler)
+			if agreement["state"] in ("same", "unknown"):
+				continue
+			key = (target.name, agreement["detail"])
+			if key in seen:
+				continue
+			seen.add(key)
+			report.items.append(Item("built by %s" % target.name, WARN,
+				"variant %s: %s" % (name, agreement["detail"]),
+				"use a variant whose compiler matches the file, or install the release the file names "
+				"(Docs/Setup.md §6); the exact tier is not available across the gap"))
 
 
 # ---------------------------------------------------------------------------------------

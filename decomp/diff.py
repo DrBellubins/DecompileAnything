@@ -148,6 +148,9 @@ class Verdict:
 	waive: list[str] = field(default_factory=list)
 	tier: str = "none"
 	warnings: list[str] = field(default_factory=list)
+	# What the file says about the compiler that made it, when that is not the compiler here
+	# (Phase 7). Empty when the toolchain matches or the file does not say.
+	build_mismatch: str = ""
 
 	@property
 	def register_only(self) -> int:
@@ -178,7 +181,7 @@ class Verdict:
 		"""What stands between this verdict and tier `want`, in the order to fix it."""
 		return tier_gaps(self.categories, self.abstract_categories, self.bytes_equal_masked, want,
 			byte_gap=self.byte_gap, unverified=self.unverified, waive=self.waive,
-			unverified_refs=self.unverified_refs)
+			unverified_refs=self.unverified_refs, build_mismatch=self.build_mismatch)
 
 	@property
 	def byte_gap(self) -> str:
@@ -502,7 +505,7 @@ def compare_bytes(original: bytes, original_fields, candidate: bytes, candidate_
 
 def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str,
 		byte_gap: str = "", unverified: int = 0, waive: tuple[str, ...] = (),
-		unverified_refs: list[dict] | None = None) -> list[str]:
+		unverified_refs: list[dict] | None = None, build_mismatch: str = "") -> list[str]:
 	"""What stands between a verdict and tier `want`, in the order the loop should fix it.
 
 	Shape first (an operation, a target, or a whole line is wrong), then operands, then the
@@ -528,6 +531,11 @@ def tier_gaps(categories: dict, abstract: dict, bytes_equal: bool, want: str,
 					"stands" if unverified == 1 else "stand", what or "unnamed",
 					_why_unverified(unverified_refs)))
 	if tier_rank(want) >= tier_rank("exact") and not bytes_equal:
+		# The toolchain gap goes first: it is the cause of the byte differences a loop would
+		# otherwise chase one operand at a time. Byte identity across two compiler releases is not
+		# a thing to iterate towards - it is either proven by the bytes or out of reach.
+		if build_mismatch:
+			gaps.append("the compiler here is not the one that made this file - %s" % build_mismatch)
 		gaps.append(byte_gap or "the bytes are not equal")
 	return gaps
 

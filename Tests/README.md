@@ -463,6 +463,40 @@ where the layout moved, and shows 36 of the 143 compared pairs as operands the l
 than source differences. Reading a program is LIEF on both sides, so this is ELF only: PE and
 Mach-O say so instead of being compared wrongly (Phase 7 of the cleanup plan brings MSVC `link`).
 
+### Phase 7: `check_phase7_fidelity.py`
+
+Two things decide whether the byte gate is reachable that are not `-O`: whether the compiler
+installed here is the compiler that made the file, and which flags the build used besides it.
+This suite checks that the tool says both, and that it keeps the two kinds of answer apart - a
+file's own record versus a pattern its code shows.
+
+The version reading needs no new data: `.comment` (ELF) and the Rich header (PE) are already in the
+build note, and the comparison is against the compiler the variant would actually run. A different
+minor release is as much of a wall for `exact` as a different toolchain - byte-identity across two
+releases is not something a loop iterates towards - so it becomes a `Verdict.build_mismatch`, which
+`gaps("exact")` names before the byte differences it explains. A file that names no compiler
+(stripped ELF, a binutils-linked PE) is left alone: not knowing is not a mismatch, and no tier is
+capped for it. `decomp check` asks the question for every target in the cache before a session
+starts; `decomp try` says it again on the score, where the loop reads it.
+
+For the flags, the wording follows the evidence. `ET_DYN` with no program interpreter *is*
+position-independent code, so `-fPIC` goes into a generated `cppflags`; `.note.gnu.property` names
+CET and the x86-64-vN ISA level in the compiler's own spelling, so those come out as the exact flags
+(`-fcf-protection=full`, `-march=x86-64-v3`); a PE's Guard CF bit is the linker's own statement
+about `/guard:cf`. A canary in some bodies says some `-fstack-protector` level was on but not which,
+`%ymm` says an AVX level without naming it, and a reciprocal pattern is a lead - those are findings
+with the evidence quoted, never flags written into a config for you.
+
+Built here with the flags known: three plugins at `-O1`, `-O2 -mavx2 -mfma` and
+`-fcf-protection=full -fstack-protector-all`; all three read as shared objects, the AVX one's
+property note names `x86-64-baseline` and `x86-64-v3`, the hardened one's names `IBT`/`SHSTK`, and
+the plain one is told to build for the baseline rather than for this machine's `-march`. Measured on
+real targets: `Tests/Proprietary/Dr Up-down gate.so` says gcc 16.1.1 against this machine's 16.2.1
+(a hard cap, named before any `try`) and asks for `-fPIC`; `notepad.exe` declares Guard CF and
+names MSVC, so a g++ variant against it is reported as a different code generator, not a bad model.
+Scoring the benchmark's own source stays silent - its `.comment` names the compiler installed here -
+which is the half that matters: the tool does not raise a toolchain gap where the bytes already match.
+
 
 ## Known gaps
 
@@ -508,6 +542,13 @@ Mach-O say so instead of being compared wrongly (Phase 7 of the cleanup plan bri
   extents as having no pair instead of naming them. It does not claim a pairing it cannot support;
   what improves it is more anchors (a populated ledger) and a better unit table (Phase 4 records),
   not a guess from size.
+
+* **A target built by a compiler this machine does not have cannot reach `exact`** (since
+  `Docs/byte-cleanup-plan.md` Phase 7). `Tests/build/msvc-o0*` and the MSVC files under
+  `Tests/Proprietary/` have no `cl` here, and `Tests/Proprietary/Dr Up-down gate.so` names gcc
+  16.1.1 while 16.2.1 is installed. `decomp check` says so per target and a scored candidate puts
+  it in the gaps for `exact` before the byte differences it explains; the scores of the gcc-built
+  benchmark are unaffected, and no tier is capped for a file that names no compiler at all.
 
 ## Adding or changing a unit
 

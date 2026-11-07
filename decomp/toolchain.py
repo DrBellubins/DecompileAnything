@@ -177,7 +177,9 @@ def build_note(target: Path) -> dict:
 	note = {"path": str(target), "name": Path(target).name, "format": None, "arch": None,
 		"bits": 0, "entrypoint": None, "file_type": None, "pie": None, "static": None,
 		"needed": [], "interp": None, "sections": {}, "segments": [], "gnu_features": [],
+		"gnu_hardening": [], "gnu_isa": [], "gnu_property": False, "reloc_kinds": {},
 		"comment": [], "rich": [], "linker_version": None, "dynstr": "", "image_base": None,
+		"guard_cf": None,
 		"pdb": None, "pogo": None, "ltcg": False, "toolset": None, "crt": None,
 		"decorated": [], "language_proof": None,
 		"compiler": None, "compiler_id": None, "compiler_version": None, "linker": None,
@@ -189,7 +191,7 @@ def build_note(target: Path) -> dict:
 		note["error"] = "lief is not importable: %s" % exc
 		return note
 	try:
-		binary = lief.parse(str(target))
+		binary = _lief_binary(target)
 	except Exception as exc:  # noqa: BLE001 - any parser failure is a note, not a crash
 		note["error"] = "lief could not parse %s: %s" % (Path(target).name, exc)
 		return note
@@ -234,6 +236,35 @@ def build_note(target: Path) -> dict:
 	language_evidence(note)
 	note["compiler_hint"] = {"gcc": "gcc", "clang": "clang", "msvc": "msvc"}.get(note["compiler"])
 	return note
+
+
+def _lief_binary(target: Path):
+	"""Parse a file with LIEF, reusing the parse of a file already read this session.
+
+	`build_note`, `target_shape`, `extract.TargetImage` and `relink` all read the same target, and
+	a 40 MB PE takes a second per parse. Keyed on (path, mtime, size), so an edited or rebuilt
+	binary is parsed again: a note for a file that changed is not a note about that file.
+	"""
+	import lief
+
+	key = str(Path(target))
+	try:
+		stat = Path(target).stat()
+		stamp = (int(stat.st_mtime_ns), int(stat.st_size))
+	except OSError:
+		return lief.parse(key)
+	cached = _BINARY_CACHE.get(key)
+	if cached and cached[0] == stamp:
+		return cached[1]
+	binary = lief.parse(key)
+	if binary is not None:
+		if len(_BINARY_CACHE) > 4:
+			_BINARY_CACHE.clear()
+		_BINARY_CACHE[key] = (stamp, binary)
+	return binary
+
+
+_BINARY_CACHE: dict[str, tuple] = {}
 
 
 def _short(value) -> str:
@@ -288,11 +319,40 @@ def _read_elf(binary, note: dict) -> None:
 	for note_item in binary.notes:
 		if "PROPERTY" not in str(note_item.type):
 			continue
+		# Its presence is itself a fact: the record is written by a toolchain that knows about
+		# these features, and a feature it does not list was not asked for.
+		note["gnu_property"] = True
+		# `.note.gnu.property` is the one place a stripped ELF still says what its code was built
+		# to use. LIEF spells each record as an object holding (FLAG, NAME) pairs. The two kinds
+		# answer different Phase 7 questions, so they are kept apart:
+		#   FLAG.NONE  -> `x86 feature: IBT, SHSTK`, the CET record, which -fcf-protection writes
+		#   FLAG.USED  -> `x86 feature used: XMM, YMM` and the x86-64-vN level, which -mavx,
+		#                 -mfma and -march=x86-64-vN write. Those level names are the compiler's.
 		for prop in getattr(note_item, "properties", []) or []:
-			if "FEATURE" not in type(prop).__name__:
-				continue
-			for feature in getattr(prop, "features", []) or []:
-				note["gnu_features"].append(_short(feature))
+			kind = type(prop).__name__.upper()  # LIEF spells them `X86Features` / `X86ISA`
+			if "FEATURE" in kind:
+				for feature in getattr(prop, "features", []) or []:
+					flag, name = _property_pair(feature)
+					if flag == "used":
+						if name and name not in note["gnu_features"]:
+							note["gnu_features"].append(name)
+					elif name and name not in note["gnu_hardening"]:
+						note["gnu_hardening"].append(name)
+			elif "ISA" in kind:
+				for value in getattr(prop, "values", []) or []:
+					name = _isa_name(_property_pair(value)[1])
+					if name and name not in note["gnu_isa"]:
+						note["gnu_isa"].append(name)
+	# The relocation tables survive stripping, and what they relocate says how the code was
+	# compiled: GOT slots (GOTPCREL*, GLOB_DAT) and PLT slots (JUMP_SLOT) only exist in code
+	# that was compiled position-independent.
+	for source in ("dynamic_relocations", "object_relocations"):
+		try:
+			for entry in getattr(binary, source) or []:
+				kind = _short(entry.type)
+				note["reloc_kinds"][kind] = note["reloc_kinds"].get(kind, 0) + 1
+		except Exception:  # noqa: BLE001 - a file may have neither table, which is an answer
+			continue
 	# Both are needed for a PIE (ET_DYN *and* a program interpreter), and no PT_DYNAMIC and
 	# no DT_NEEDED means it was linked static. `-m32`/`-m64` come from the class exactly.
 	note["pie"] = note["file_type"] == "DYN" and bool(note["interp"])
@@ -303,6 +363,23 @@ def _read_elf(binary, note: dict) -> None:
 		note["link_flags"] = ["-no-pie"]
 	else:
 		note["link_flags"] = []
+
+
+def _property_pair(item) -> tuple[str, str]:
+	"""(flag, name) out of a LIEF `.note.gnu.property` pair, however that version spells it."""
+	if isinstance(item, (tuple, list)) and len(item) == 2:
+		return _short(item[0]).lower(), _short(item[1])
+	return "", _short(item)
+
+
+# The GNU property's ISA level names are the compiler's own -march= spellings.
+_GNU_ISA = {"BASELINE": "x86-64-baseline", "V2": "x86-64-v2", "V3": "x86-64-v3",
+	"V4": "x86-64-v4"}
+
+
+def _isa_name(value) -> str:
+	value = str(value or "").upper()
+	return _GNU_ISA.get(value, value.lower() if value else "")
 
 
 def _read_pe(binary, note: dict) -> None:
@@ -317,6 +394,9 @@ def _read_pe(binary, note: dict) -> None:
 	# the tool is "no such function").
 	image_base = int(getattr(binary, "imagebase", 0) or getattr(optional, "imagebase", 0) or 0)
 	note["image_base"] = image_base
+	# /guard:cf: the guard-function table and this bit only appear when the flag was on, and the
+	# bit is the linker's own statement about it (Phase 7).
+	note["guard_cf"] = bool(int(getattr(optional, "dll_characteristics", 0) or 0) & 0x4000)
 	note["entrypoint"] = image_base + int(optional.addressof_entrypoint)
 	note["file_type"] = "DLL" if int(header.characteristics) & 0x2000 else "EXE"  # IMAGE_FILE_DLL
 	note["pie"] = bool(int(optional.dll_characteristics) & 0x0040)  # DYNAMIC_BASE (ASLR)
@@ -837,6 +917,15 @@ def language_evidence(note: dict) -> None:
 			note["std_hints"].append(hint)
 
 
+def _isa_note(note: dict) -> str:
+	"""The ISA facts of `.note.gnu.property` as one line: the level first, then what it names."""
+	levels = " ".join(note.get("gnu_isa") or [])
+	used = ", ".join(note.get("gnu_features") or [])
+	if levels and used:
+		return "%s (features: %s)" % (levels, used)
+	return levels or used
+
+
 def note_lines(note: dict, width: int = 12) -> list[str]:
 	"""The build note as lines a reader can act on."""
 	if note.get("error"):
@@ -896,7 +985,13 @@ def note_lines(note: dict, width: int = 12) -> list[str]:
 			" - proved by the toolset, not by a name" if hint.get("proof") == "toolset, not name"
 			else "") for hint in note.get("std_hints", []))
 			or "not determined from the imports"),
-		line("hardening", ", ".join(note.get("gnu_features", [])) or None),
+		line("hardening", ", ".join(filter(None, [
+			", ".join(note.get("gnu_hardening", [])),
+			"/guard:cf (the image declares Guard CF and carries a guard-function table)"
+			if note.get("guard_cf") else None])) or None),
+		# The instruction set the file's own property note names, in the compiler's own spelling.
+		# This is the fact that says whether a candidate built for the baseline can match at all.
+		line("isa used", _isa_note(note)),
 	) if item]
 
 
@@ -912,7 +1007,18 @@ def variant_name(note: dict, optimize: int | None) -> str:
 	return "-".join(parts)
 
 
-def starter_config(target: Path, note: dict, guess: dict | None = None) -> str:
+def shared_object(note: dict) -> bool:
+	"""Is this file a shared object rather than a program? `ET_DYN` with no program interpreter -
+	the loader is not going to start it, something else is going to dlopen it. Its code was
+	compiled position-independent, which is what makes `-fPIC` a fact of the file and not a guess
+	(Docs/byte-cleanup-plan.md Phase 7). A PIE *executable* is `DYN` with an interpreter, and the
+	flag that produces its code is `-fPIE`; the codegen is the same, the link is not."""
+	return (note.get("format") == "ELF" and note.get("file_type") == "DYN"
+		and not note.get("interp"))
+
+
+def starter_config(target: Path, note: dict, guess: dict | None = None,
+		flags: dict | None = None) -> str:
 	"""A `project.toml` for this target, facts and guesses separated.
 
 	Anything inferred is written as a comment next to the value it produced, so the first
@@ -924,6 +1030,12 @@ def starter_config(target: Path, note: dict, guess: dict | None = None) -> str:
 	cppflags: list[str] = []
 	if note.get("pie") is False and note.get("format") == "ELF" and note.get("file_type") == "EXEC":
 		cppflags.append("-no-pie")
+	elif shared_object(note):
+		# The one beyond-`-O` flag a shared object proves on its own: a `DYN` file no interpreter
+		# loads only exists as position-independent code, and its GOT/PLT relocations are the same
+		# statement from the other side. Written here because a candidate compiled without it cannot
+		# match, whatever else the config gets right.
+		cppflags.append("-fPIC")
 	compiler = {"gcc": "g++", "clang": "clang++", "msvc": "cl"}.get(note.get("compiler"), "g++")
 	lines = [
 		"# Written by `decomp detect` for %s." % target,
@@ -961,6 +1073,14 @@ def starter_config(target: Path, note: dict, guess: dict | None = None) -> str:
 	if levels:
 		lines.append("# The imports need at least -std=%s (%s)." % (levels[-1],
 			", ".join(hint["evidence"] for hint in note["std_hints"][:3])))
+	if shared_object(note):
+		lines.append("# cppflags carries -fPIC: this is a shared object (%s with no program "
+			"interpreter),\n# so its own bytes are position-independent code. Not a guess."
+			% note.get("file_type"))
+	for line in (flags or {}).get("config_comments", []):
+		# What the rest of the flags look like, from the same file. These are findings, not facts
+		# where the evidence is a pattern, and the comment says which is which.
+		lines.append("# " + line)
 	if guess:
 		lines.append("# optimize=%s is the flag-inference helper's best match over %d sampled"
 			" bodies (distance %.3f, next-best %.3f at -O%s): %s" % (
@@ -1057,6 +1177,17 @@ _XMM = re.compile(r"%(?:x|e)mm|movss|movsd|addss|mulss|cvtsi|punpck")
 _CALL = re.compile(r"^call")
 _RET = re.compile(r"^ret\b")
 
+# Phase 7: the trace a vector flag leaves in the instruction stream. `%ymm`/`%zmm` are
+# unambiguous; a mnemonic starting with `v` is a VEX encoding (no legacy x86 mnemonic starts
+# with `v`), which is how -mavx shows up when the compiler still only used xmm registers.
+# FMA and reciprocal forms are what -mfma and -ffast-math leave, with the caveat that the last
+# one is a pattern and not a proof (a hand-written intrinsic produces the same lines).
+_VEX = re.compile(r"^v[a-z]|%(?:y|z)mm\d", re.I)
+_YMM = re.compile(r"%ymm\d")
+_ZMM = re.compile(r"%zmm\d|%(?:kn)?k[1-7]\b")
+_FMA = re.compile(r"^v?f(?:n?madd|msub)")
+_RCP = re.compile(r"^v?r(?:cp|sqrt)")
+
 # What an MSVC x64 body looks like, which is a different shape in the literal sense: `cl`
 # never uses a frame pointer in a leaf-able x64 function, its locals are addressed off `%rsp`
 # with the caller's 32-byte shadow space above them, it emits no `endbr`, and its /GS guard is
@@ -1082,7 +1213,12 @@ FEATURES = ("frame", "endbr", "subrsp", "canary", "leave", "poprbp", "spill", "f
 # The ones scored for an MSVC target/probe. `subrsp`/`calls`/`xmm` mean the same thing on both
 # ABIs and discriminate here too; the rest are the MSVC-only readings of the same flags.
 FEATURES_MSVC = ("rspmem", "argstore", "gs", "calls", "xmm")
-ALL_FEATURES = FEATURES + tuple(name for name in FEATURES_MSVC if name not in FEATURES)
+# Measured and reported, never scored against the -O probe: these say which *instruction set* the
+# build used (Phase 7), not how hard it optimised. Putting them in the scored sets would change
+# the -O ranking every measured number in Docs/byte-cleanup-plan.md rests on.
+FEATURES_VECTOR = ("vex", "ymm", "zmm", "fma", "rcp")
+ALL_FEATURES = (FEATURES + tuple(name for name in FEATURES_MSVC if name not in FEATURES)
+	+ FEATURES_VECTOR)
 
 # What a feature means where it is present, so the report names the reason and not just a
 # distance. Only the ones that discriminate.
@@ -1102,6 +1238,12 @@ FEATURE_MEANING = {
 	"argstore": "the inbound argument registers are stored to stack slots at the top of the body "
 		"(cl /Od writes every parameter to its home slot)",
 	"gs": "/GS stack guard: the cookie xor-ed with %rsp, or the check of it",
+	"vex": "VEX-encoded instructions (an AVX form), whatever register width they use",
+	"ymm": "the body uses 256-bit %ymm registers: -mavx or higher built it",
+	"zmm": "the body uses 512-bit %zmm registers or %k mask registers: -mavx512* built it",
+	"fma": "fused multiply-add forms (-mfma; cl /fp:fast or /arch:AVX2)",
+	"rcp": "reciprocal/square-root approximations, the shape -ffast-math leaves (a pattern, not "
+		"a proof: intrinsics give the same lines)",
 }
 
 
@@ -1136,12 +1278,20 @@ def shape_profile(bodies: list[list[str]]) -> dict:
 		counts["rspmem"] += sum(1 for item in text if _RSP_MEM.search(item))
 		counts["framemem"] += sum(1 for item in text if _FRAME_MEM.search(item))
 		counts["xmm"] += sum(1 for item in text if _XMM.search(item))
+		counts["vex"] += sum(1 for item in text if _VEX.search(item))
+		counts["fma"] += sum(1 for item in text if _FMA.search(item))
+		counts["rcp"] += sum(1 for item in text if _RCP.search(item))
+		if any(_YMM.search(item) for item in text):
+			counts["ymm"] += 1
+		if any(_ZMM.search(item) for item in text):
+			counts["zmm"] += 1
 		counts["calls"] += sum(1 for item in text if _CALL.match(item))
 		instructions += len(text)
 	profile = {name: counts[name] / max(1, bodies_counted) for name in
-		("frame", "endbr", "subrsp", "canary", "leave", "poprbp", "spill", "argstore", "gs")}
+		("frame", "endbr", "subrsp", "canary", "leave", "poprbp", "spill", "argstore", "gs",
+			"ymm", "zmm")}
 	profile.update({name: counts[name] / max(1, instructions) for name in
-		("framemem", "xmm", "calls", "rspmem")})
+		("framemem", "xmm", "calls", "rspmem", "vex", "fma", "rcp")})
 	profile["bodies"] = bodies_counted
 	profile["insmean"] = instructions / max(1, bodies_counted)
 	return profile
