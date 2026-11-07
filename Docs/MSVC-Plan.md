@@ -756,3 +756,7 @@ Importing PDBs inside Ghidra (no Linux parser in the pinned install - do it outs
 `notepad.exe` byte-for-byte (§6); treating a MinGW-built PE as an MSVC target (§1); ARM64
 Windows, and any Windows-on-ARM or MSVC-x86 host tooling beyond what
 `Tests/project.toml`'s `arch` field already models.
+
+A 32-bit **target** (`arch = "x86"`, a `Hostx64/x86` `cl`) is not out of scope for the project, it
+is out of scope *here*: MS-0…MS-5 are all measured at `x86-64`, and the 32-bit track has its own
+phases, numbers and measured bar in [MSVC-x86-Plan.md](MSVC-x86-Plan.md).
