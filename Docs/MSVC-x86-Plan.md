@@ -30,8 +30,8 @@ Reading a 32-bit binary works. Matching one exists for GCC only. Per command, on
 | `analyze` / `find` / `show` / `status` | works (`x86:LE:32:default`, the ret-cut unit situation) | works — `deadrising2.exe` is analysed and listed |
 | `types` (structure recovery) | works (Design-Plan Phase 4; `this` from `8(%ebp)`) | works (MSVC-Plan MS-5: RTTI in absolute 4-byte addresses, `this` from `%ecx`, 769 classes in the game) |
 | `detect` | works | works **except** the `-O` inference: the x64 MSVC feature set reads zeros, and it refuses to probe ("cl is not installed here") |
-| `check` | the variant, its arch and the compiler agree | *was:* reports no `cl`, or the x64 one; `msvc_sdk()` called the SDK complete because it looked at x64 paths only. **Since X86-0 (2026-11-07):** an installed-but-off-PATH toolchain is found and named as that, `msvc target x64` / `msvc target x86` state the bitness each installed toolchain can produce, `msvc_sdk(arch=…)` answers per arch, and an `arch = "x86"` MSVC variant is named before any work starts. **Since X86-1 (same day):** both rows say `ok can build x86 candidates` — the 32-bit target toolset is installed, so the report's remaining MSVC gap is tool-side, not machine-side |
-| `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **cannot reach a comparison** — the machine can produce 32-bit COFF since X86-1 (`bin/x86/cl`), but nothing resolves `arch = "x86"` to that driver, and the flag set it would use is wrong (§3, §4.2). X86-2 is what unblocks this row |
+| `check` | the variant, its arch and the compiler agree | *was:* reports no `cl`, or the x64 one; `msvc_sdk()` called the SDK complete because it looked at x64 paths only. **Since X86-0 (2026-11-07):** an installed-but-off-PATH toolchain is found and named as that, `msvc target x64` / `msvc target x86` state the bitness each installed toolchain can produce, `msvc_sdk(arch=…)` answers per arch, and an `arch = "x86"` MSVC variant is named before any work starts. **Since X86-1 (same day):** both rows say `ok can build x86 candidates` — the 32-bit target toolset is installed, so the report's remaining MSVC gap is tool-side, not machine-side. **Since X86-2:** the `compiler msvc-*` rows report the driver the variant resolves to (with its bitness and why), so an installed toolchain is `ok` with no `cl` on PATH, and the `arch <variant>` row is the resolver's own sentence — `check` and `try` cannot disagree |
+| `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **the driver exists and is now chosen**: since X86-1 the machine can produce 32-bit COFF, and since X86-2 (2026-11-07) `arch = "x86"` resolves to `bin/x86/cl`, whose object measures 32-bit, with no `-m32`/`/arch:IA32` in its flags. What is not there yet is anything to score: a 32-bit MSVC benchmark variant is X86-4, and reading i386 COFF units is X86-3 |
 | `link` (whole-program, Phase 6) | tested on 64-bit ELF only (`check_phase6_link.py` measures `gcc-o0`); a 32-bit ELF relink is untested | untested for a 32-bit PE: it needs the x86 link form, i386 relocation reading, and a link that can be run |
 
 The four "32-bit" things people mean, and their state:
@@ -346,6 +346,59 @@ side: X86-2.
   toolchain **without invoking a compiler**; and that the 64-bit-object-against-32-bit-analysis
   refusal still fires when the driver *is* wrong (that safety net stays).
 * Not claimed: that any i386 candidate is any good yet. This phase makes one possible.
+
+**Done 2026-11-07.** `arch` is a machine fact and is read in one place now.
+
+*`decomp/toolchain.py`.* `msvc()` matches the driver's *file name*, so `toolchains/msvc/bin/x86/cl`
+is the same driver as a bare `cl` (measured before the change: a path-named `cl` was treated as a
+GCC driver and built with `g++ -m32`). New `arch_bitness` (moved out of `check.py`, which now
+delegates to it), `driver_bitness` — the target bitness comes from the *directory* a compiler lives
+in, `<prefix>/bin/x86/cl` or `VC/Tools/MSVC/<v>/bin/Hostx64/x86/cl.exe`, after resolving symlinks —
+`msvc_wrapper`, and `compiler_for(variant, *, prefix, prefix_from)` returning a `Driver` (name,
+bitness, how that bitness is known, why it was chosen, a `conflict`, what was `tried`, and a `gap`).
+Its order is: a driver the variant names **by path** (honoured; a contradiction with `arch` is a
+warning, because the object check must stay reachable) → a `[msvc] prefix` the project pins (its
+`bin/<arch>/cl`; PATH is not consulted behind a pin, because pinning is how a project names an era) →
+the `cl` on PATH when its directory is the requested bitness → the installed toolchain `decomp check`
+reports, named by path → otherwise a gap, in the same words `decomp check` prints for that machine.
+`build_flags` no longer turns `arch = "x86"` into anything for `cl`: `/arch:IA32` is gone (a variant
+that means "no SSE" can still put it in its own `cppflags`), only ISA levels produce `/arch:`, and
+GCC's `-m32` is untouched.
+
+*`decomp/config.py`* gained `msvc_prefix(cfg)` for `[msvc] prefix` (relative to the config file, like
+`cache_dir`). *`decomp/compile.py`*: `build`/`link` take `variant=`/`cfg=` and resolve the driver
+themselves; a refused variant returns `refused=True` with an empty command and **runs nothing**;
+`Build`/`Link` carry `driver`/`arch`/`why`, and `describe()` prints them first. *`decomp/cli.py`*:
+`try` and `link` pass the variant instead of a bare compiler, print the driver line, record
+`driver`/`driver_arch`/`driver_from` in `try --json` next to `flags`, stop with the gap before any
+compiler runs, and the bitness refusal at the object keeps working *with the cause
+named*. *`decomp/check.py`*: the `compiler <name>` rows report the driver `try` would resolve to
+(the two cannot disagree now), and an installed-but-off-PATH toolchain is a fact rather than a
+failure; `variant_arch_gap` returns the resolver's own sentence. *`Tests/eval.py`* no longer carries
+a copy of the flag rule: it calls `toolchain.build_flags`/`link_flags`/`compiler_for` (and its stale
+`/FS` and whole-string `is_msvc` went with it).
+
+Measured (`Tests/tools/check_msvc_x86_toolchain.py`, exit 0, all nine groups; and the same rules
+through real argv and exit codes in `Tests/tools/check_driver_resolution_cli.py`, exit 0):
+`build_flags({'compiler':'cl','arch':'x86'})` = `['/std:c++17','/Od','/W3','/EHsc','/nologo','/MT']`
+— no `-m32`, no `/arch:IA32`, and identical to the x64 variant's flags, because the difference is the
+driver; `arch = "x86"` resolves to `toolchains/msvc/bin/x86/cl` and the object it builds is **32-bit**
+(`extract.CandidateObject.bits == 32`), while `arch = "x86-64"` resolves to `bin/x64/cl` and 64; a
+variant that names `bin/x64/cl` but asks for `arch = "x86"` is honoured, warned about, and then
+refused at the object with "it was built with …/bin/x64/cl, which emits 64-bit code, while this
+variant asks for arch = \"x86\""; a config that pins a prefix with no x86 driver is refused with
+"its arch = \"x86\" cannot be built here (toolchain at …)" and `command == []` with nothing written.
+`decomp check --config Tests/project.toml` with **no `cl` on PATH** now says `compiler msvc-o0 ok —
+cl -> /…/toolchains/msvc/bin/x64/cl (not on PATH; the driver is named by path)` instead of the old
+`FAIL … not found on PATH` and `arch msvc-o0 … not reachable`.
+
+Not moved: `Tests/eval.py build --variant msvc-o0` still produces byte-identical code — `.text` is
+`133904` bytes with md5 `1e773b94118b0360ae5deaf23c68f948`, the same as before the flag rule was
+shared, and the answer key is still 89 units / selfcheck 89 cases. The `detect` probe driver is
+untouched (X86-5).
+
+Next: X86-3 (reading i386 COFF) and X86-4 (an `msvc-o0-x86` benchmark variant, which is where these
+drivers get scored).
 
 **X86-3: read COFF the way i386 spells it.** *MS-3's sibling.*
 

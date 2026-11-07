@@ -723,3 +723,42 @@ redundant. Still open, and unaffected by this: several `Tests/tools/*.py` script
 `g++`/`objdump`/`python -m decomp` rather than Wine today, so they answer; converting them to
 `decomp.spawn` is the same one-line change per call and is tracked as a follow-up.
 
+
+### 6.13 Which `cl` a variant actually gets (2026-11-07, X86-2)
+
+Nothing in this setup guide changes to make a 32-bit MSVC build work — §6.2's wrapper layout is the
+whole requirement — but how the tool *finds* a driver is worth stating, because it is the difference
+between "install cl" and "point the project at the toolchain".
+
+A variant's `arch` is a machine fact, and from X86-2 on it selects the **driver**, never a flag: for
+`cl`, `-m32` does not exist and `/arch:IA32` is not a bitness switch (it disables SSE). The target
+bitness is decided by the directory the compiler sits in — `<prefix>/bin/x86/cl`, or the toolset's own
+`VC/Tools/MSVC/<v>/bin/Hostx64/x86/cl.exe` — which is what `decomp.toolchain.driver_bitness` reads.
+
+`decomp.toolchain.compiler_for(variant)` answers it once, in this order:
+
+1. a driver the variant names **by path** (`[variants.*] compiler = "…/bin/x64/cl"`), honoured as
+   written; if that contradicts `arch` the build warns and the object-level bitness check is what
+   stops it — the safety net stays reachable on purpose;
+2. a toolchain the project pins with `[msvc] prefix = "../toolchains/msvc"` in its `project.toml`
+   (relative to the config file, like `cache_dir`): its `bin/<arch>/cl`. A pin is an answer about
+   *that* toolchain — PATH is not consulted behind it — so a project built against one era of the
+   compiler cannot drift to another by way of someone's shell;
+3. the `cl` on PATH, when the directory it lives in is the bitness the variant asked for (this is
+   what §6.3's `PATH=…/bin/<arch>` line is for, and it still works);
+4. the installed toolchain `decomp check` reports finding — an install that is present but off PATH is
+   used, and said to be used: `compiler msvc-o0 ok — cl -> /…/toolchains/msvc/bin/x64/cl (not on
+   PATH; the driver is named by path)`;
+5. nothing: then the answer is a sentence about which half is missing ("its arch = \"x86\" cannot be
+   built here (toolchain at …): …"), and **no compiler is run** to find that out.
+
+So the recommended setup is the one §6.2 already produces: leave `toolchains/msvc` where `install.sh`
+put it and add the `[msvc]` block to the project (Tests/project.toml does). `PATH` is then only
+needed for tools outside this one. `decomp check` and `decomp try` report the same driver, and
+`decomp try`/`decomp link` print it before compiling:
+
+```
+driver    /home/…/toolchains/msvc/bin/x86/cl - targets x86, the toolchain installed at
+          /home/…/toolchains/msvc has this target … (Docs/Setup.md §6.2)
+build: ok (2.31s) -> cache/ghproj/candidates/candidate_probe.obj
+```

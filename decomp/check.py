@@ -189,13 +189,25 @@ def check_all(cfg: dict, want_compilers: bool = True) -> Report:
 	except config.ConfigError as exc:
 		report.add("compilers", False, str(exc), "add a [variants.<name>] table")
 	else:
+		prefix, prefix_from = config.msvc_prefix(cfg)
 		for name, body in sorted(names.items()):
 			compiler = body.get("compiler", "g++")
-			problems = _compiler_problem(compiler)
-			message = "%s: %s" % (name, problems or "%s -> %s" % (compiler, shutil.which(compiler) or compiler))
+			# X86-2: a variant's `arch` picks the driver, and `decomp try` asks the resolver. So `check`
+			# reports the driver `try` would actually run - a pinned or installed toolchain's wrapper,
+			# named by path - rather than only what a shell PATH happens to hold. Otherwise the two
+			# disagree about whether a variant can be built, which is the disagreement this whole
+			# phase exists to remove.
+			driver = toolchain.compiler_for(body, prefix=prefix, prefix_from=prefix_from)
+			problems = _compiler_problem(driver.name or compiler)
+			off_path = bool(driver.name) and shutil.which(compiler) is None
+			message = "%s: %s" % (name, problems or "%s -> %s%s" % (compiler,
+				shutil.which(driver.name or compiler) or driver.name or compiler,
+				" (not on PATH; the driver is named by path)" if off_path else ""))
 			if problems:
 				report.add("compiler %s" % name, False, message,
-					"install %s, or point [variants.%s] compiler at one that exists" % (compiler, name),
+					"install %s, or point [variants.%s] compiler at one that exists; for an MSVC "
+					"variant the driver also comes from [msvc] prefix or the toolchain under "
+					"toolchains/ (Docs/Setup.md §6.2)" % (compiler, name),
 					fatal=want_compilers)
 			else:
 				report.add("compiler %s" % name, True, message)
@@ -740,12 +752,9 @@ def arch_bitness(value) -> str | None:
 	defaults to", which is the bitness of whichever driver gets chosen - so neither of those has
 	an answer here, and neither is contradicted by this check.
 	"""
-	text = str(value or "").strip().lower()
-	if text in ("x86", "i386", "i486", "ia32", "32"):
-		return "x86"
-	if text in ("x86-64", "x64", "amd64", "64"):
-		return "x64"
-	return None
+	# The table lives in `toolchain` from X86-2 on: the same spelling rule decides the flags
+	# (`-m32`) and the driver, and a check reading a second table could disagree with the build.
+	return toolchain.arch_bitness(value)
 
 
 def gcc_multilib(compiler: str, arch: str) -> tuple[bool, str]:
@@ -785,24 +794,18 @@ def variant_arch_gap(variant: dict) -> str:
 	if arch is None:
 		return ""
 	if toolchain.msvc(variant.get("compiler", "g++")):
-		targets = msvc_target_arches()
-		if not targets:
-			return ('its arch = "%s" needs an MSVC toolchain with that target, and this machine has '
-				"none - no cl on PATH and nothing under toolchains/ (Docs/Setup.md §6)" % arch)
-		prefix = Path(next(iter(targets.values()))["prefix"])
-		entry = targets.get(arch)
-		if entry is None:
-			return 'its arch = "%s" is not a target this toolchain knows anything about' % arch
-		if entry["can_build"] and entry["on_path"]:
-			return ""
-		if entry["can_build"]:
-			other = arch_on_path()
-			return ('its arch = "%s" is buildable here but not reachable: the driver for it is %s, '
-				"and that wrapper directory is not on PATH%s" % (arch, entry["wrapper"] or "unwrapped",
-					"; the cl on PATH is the %s target" % other if other and other != arch else ""))
-		return ('its arch = "%s" %s (toolchain at %s): %s' % (arch,
-			"is only half installed" if entry["compilers"] else "cannot be built here", prefix,
-			entry["detail"]))
+		# From X86-2 on this is the resolver's own answer, because it is the same sentence
+		# `compile.build` refuses with: `check` and `try` cannot disagree about whether a variant can
+		# be built, and there is one place that knows what "cannot" means here. Two cases that used to
+		# be gaps are not:
+		#   * "buildable here but not on PATH" - the resolver names that driver by path and says so,
+		#     which is what the `chosen` line of a build report prints;
+		#   * a variant that names its driver by path - honoured, and a disagreement with `arch` is a
+		#     warning about the object that comes back, not a refusal to try.
+		driver = toolchain.compiler_for(variant)
+		if driver.gap:
+			return driver.gap
+		return driver.conflict
 	ok, detail = gcc_multilib(str(variant.get("compiler", "g++")), arch)
 	return "" if ok else ("its arch = \"%s\" asks for that target and the compiler cannot do it: %s"
 		% (arch, detail))
@@ -850,10 +853,15 @@ def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> 
 		if prefix is not None:
 			# A different gap, and a much cheaper one: the toolchain is here, its wrappers are
 			# not on PATH. Say which PATH line fixes it, then still print what it can target.
-			report.add("msvc toolchain", False, "no `cl` on PATH, but %s is installed - a PE target "
-				"cannot be matched until its wrapper directory is reachable" % prefix,
-				"PATH=%s/bin/<arch>:$PATH (Docs/Setup.md §6.3); this toolchain's targets are listed below"
-				% prefix, fatal=fatal)
+			# Since X86-2 a variant does not need this on PATH: `toolchain.compiler_for` names the
+			# wrapper by path from the variant's arch. This stays a report row because a shell that
+			# runs `cl` itself, or a tool outside this project, still needs the PATH line.
+			report.add("msvc toolchain", True, "no `cl` on PATH, but %s is installed and usable: a "
+				"variant that asks for MSVC is resolved to its driver under that prefix by path"
+				% prefix,
+				"put a wrapper directory on PATH only for tools outside this one: "
+				"PATH=%s/bin/<arch>:$PATH (Docs/Setup.md §6.3); this toolchain's targets are below"
+				% prefix, fatal=False)
 			msvc_arch_report(report, prefix)
 			return
 		report.add("msvc toolchain", False, "no `cl` on PATH - a PE target cannot be matched by a candidate",

@@ -32,6 +32,13 @@ class Build:
 	seconds: float = 0.0
 	stderr_lines: int = 0
 	warnings: list[str] = field(default_factory=list)
+	# Which driver ran and what bitness it emits - the answer of `toolchain.compiler_for`, kept so the
+	# reader can see it (Docs/MSVC-x86-Plan.md X86-2). `refused` is the case where that resolver knew
+	# there is no driver for the variant's `arch`: no compiler was run, and `diagnostics` is why.
+	driver: str = ""
+	arch: str = ""
+	why: str = ""
+	refused: bool = False
 
 	@property
 	def failed(self) -> bool:
@@ -45,13 +52,45 @@ def object_name(sources: list[Path], stem: str = "candidate") -> str:
 	return "%s.o" % stem
 
 
-def build(sources: list[Path], object_path: Path, *, compiler: str, flags: list[str],
-	includes: list[Path] | None = None, timeout: int = 120) -> Build:
-	"""Compile one or more candidate sources to one object file. Never raises."""
+def resolve(variant: dict | None, cfg: dict | None):
+	"""The driver this variant runs, chosen by the one resolver (`toolchain.compiler_for`).
+
+	`cfg` is consulted only for an `[msvc] prefix` the project pins; with no such pin the resolver
+	falls back to whatever is on PATH and then to the toolchain `decomp check` reports finding. Used
+	by `build`/`link`, and by anything that wants to print the choice before a compiler runs.
+	"""
+	from . import config, toolchain
+
+	prefix, prefix_from = (None, "")
+	if cfg:
+		prefix, prefix_from = config.msvc_prefix(cfg)
+	return toolchain.compiler_for(variant or {}, prefix=prefix, prefix_from=prefix_from)
+
+
+def build(sources: list[Path], object_path: Path, *, compiler: str | None = None,
+		flags: list[str], includes: list[Path] | None = None, timeout: int = 120,
+		variant: dict | None = None, cfg: dict | None = None) -> Build:
+	"""Compile one or more candidate sources to one object file. Never raises.
+
+	Give it a `compiler`, or give it the `variant` (plus the `cfg` that may hold an `[msvc] prefix`)
+	and `toolchain.compiler_for` picks the driver. The second is the only way a variant's `arch`
+	reaches a compiler that emits that bitness, and the only way a variant that cannot be built here
+	is named *before* any compiler runs, instead of as a missing executable or a refused 64-bit
+	object (Docs/MSVC-x86-Plan.md X86-2). `Build.driver`/`.arch`/`.why` carry what was chosen.
+	"""
 	from . import toolchain
 
 	sources = [Path(source).expanduser() for source in sources]
 	object_path = Path(object_path)
+	driver = resolve(variant, cfg) if compiler is None else None
+	if compiler is None:
+		if driver.refused:
+			return Build(ok=False, command=[], object_path=object_path, refused=True,
+				diagnostics=driver.gap, arch=driver.arch, why=driver.why)
+		compiler = driver.name
+	if not compiler:
+		return Build(ok=False, command=[], object_path=object_path, refused=True,
+			diagnostics="no compiler is named for this variant and none could be resolved here")
 	missing = [str(source) for source in sources if not source.is_file()]
 	if missing:
 		return Build(ok=False, command=[compiler, *flags], object_path=object_path,
@@ -83,7 +122,9 @@ def build(sources: list[Path], object_path: Path, *, compiler: str, flags: list[
 		lines = lines[:_MAX_DIAGNOSTICS] + ["... %d more lines from the compiler" % hidden]
 	return Build(ok=process.returncode == 0, command=command, object_path=object_path,
 		diagnostics="\n".join(lines), seconds=round(time.time() - started, 2),
-		stderr_lines=len(lines))
+		stderr_lines=len(lines), driver=compiler,
+		arch=(driver.arch if driver is not None else toolchain.driver_bitness(compiler)[0]),
+		why=driver.why if driver is not None else "named by the caller")
 
 
 @dataclass
@@ -96,15 +137,20 @@ class Link:
 	output_path: Path
 	diagnostics: str = ""
 	seconds: float = 0.0
+	# As on a `Build`: the driver that ran, what it targets, and why it was picked.
+	driver: str = ""
+	arch: str = ""
+	why: str = ""
+	refused: bool = False
 
 	@property
 	def failed(self) -> bool:
 		return not self.ok
 
 
-def link(objects: list[Path], output_path: Path, *, compiler: str, flags: list[str],
-		linkflags: list[str] | None = None, extra: list[str] | None = None,
-		timeout: int = 180) -> Link:
+def link(objects: list[Path], output_path: Path, *, compiler: str | None = None,
+		flags: list[str], linkflags: list[str] | None = None, extra: list[str] | None = None,
+		timeout: int = 180, variant: dict | None = None, cfg: dict | None = None) -> Link:
 	"""Link objects into a program (Docs/byte-cleanup-plan.md, Phase 6). Never raises.
 
 	The objects are the loop's own; `flags` are the variant's build flags, which carry the arch, and
@@ -116,6 +162,15 @@ def link(objects: list[Path], output_path: Path, *, compiler: str, flags: list[s
 
 	objects = [Path(item).expanduser() for item in objects]
 	output_path = Path(output_path)
+	driver = resolve(variant, cfg) if compiler is None else None
+	if compiler is None:
+		if driver.refused:
+			return Link(ok=False, command=[], output_path=output_path, refused=True,
+				diagnostics=driver.gap, arch=driver.arch, why=driver.why)
+		compiler = driver.name
+	if not compiler:
+		return Link(ok=False, command=[], output_path=output_path, refused=True,
+			diagnostics="no linker driver is named for this variant and none could be resolved here")
 	missing = [str(item) for item in objects if not item.is_file()]
 	if missing:
 		return Link(ok=False, command=[compiler], output_path=output_path,
@@ -140,24 +195,44 @@ def link(objects: list[Path], output_path: Path, *, compiler: str, flags: list[s
 		lines = lines[:_MAX_DIAGNOSTICS] + [
 			"... %d more lines from the linker" % (len(lines) - _MAX_DIAGNOSTICS)]
 	return Link(ok=process.returncode == 0, command=command, output_path=output_path,
-		diagnostics="\n".join(lines), seconds=round(time.time() - started, 2))
+		diagnostics="\n".join(lines), seconds=round(time.time() - started, 2),
+		driver=compiler, arch=driver.arch if driver is not None else "",
+		why=driver.why if driver is not None else "named by the caller")
+
+
+def _driver_lines(result) -> list[str]:
+	"""Which compiler or linker driver ran, what it targets, and why it was picked.
+
+	First, because on this machine the same variant can be built by two different drivers and the
+	difference is the answer (Docs/MSVC-x86-Plan.md X86-2).
+	"""
+	if getattr(result, "refused", False):
+		return ["driver    none: %s" % result.diagnostics]
+	driver = getattr(result, "driver", "")
+	if not driver:
+		return []
+	return ["driver    %s - %s%s" % (driver, "targets %s, " % result.arch if result.arch else "",
+		getattr(result, "why", "") or "named by the caller")]
 
 
 def describe(result) -> list[str]:
-	"""A build or a link result as lines a reader can act on."""
+	"""A build or a link result as lines a reader can act on. Which driver ran comes first."""
+	if getattr(result, "refused", False):
+		return _driver_lines(result)
+	head = _driver_lines(result)
 	if isinstance(result, Link):
 		if result.ok:
 			lines = ["link: ok (%.2fs) -> %s" % (result.seconds, result.output_path)]
 			if result.diagnostics:
 				lines.append("  linker said:")
 				lines += ["    " + line for line in result.diagnostics.splitlines()[:20]]
-			return lines
+			return head + lines
 		lines = ["link: FAILED (%s)" % result.command[0]]
 		lines += ["  " + line for line in result.diagnostics.splitlines()[:40]] or [
 			"  the linker produced no output"]
-		return lines
+		return head + lines
 	if result.ok:
-		return ["build: ok (%.2fs) -> %s" % (result.seconds, result.object_path)] + (
+		return head + ["build: ok (%.2fs) -> %s" % (result.seconds, result.object_path)] + (
 			["  compiler said:%s" % ("\n" + "\n".join("  " + line for line in
 				result.diagnostics.splitlines()[:20]))] if result.diagnostics else [])
 	lines = ["build: FAILED (%s)" % result.command[0]]
@@ -165,4 +240,4 @@ def describe(result) -> list[str]:
 		lines += ["  " + line for line in result.diagnostics.splitlines()[:40]]
 	else:
 		lines.append("  the compiler produced no output")
-	return lines
+	return head + lines

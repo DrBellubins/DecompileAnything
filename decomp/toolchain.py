@@ -20,8 +20,11 @@ apart the candidates are.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import spawn
@@ -36,9 +39,17 @@ PROBE_TIMEOUT = 180
 # build flags (the [variants.*] table)
 
 
+# The driver names that mean "MSVC argument form", matched as a *file name* rather than as a
+# whole command: `toolchains/msvc/bin/x86/cl` is the same driver as a bare `cl`, and reading the
+# whole string instead (which is what this did until X86-2) handed a path-named `cl` to the GCC
+# flag rule and compiled the candidate with g++ -m32 (Docs/MSVC-x86-Plan.md X86-2 §3).
+_MSVC_NAMES = ("cl", "cl.exe", "clang-cl", "msvc", "icx", "icx-cl")
+
+
 def msvc(compiler) -> bool:
 	"""Is this an MSVC-style driver? Its argument form differs in every way that matters."""
-	return str(compiler or "").lower() in ("cl", "cl.exe", "clang-cl", "msvc", "icx", "icx-cl")
+	text = str(compiler or "").replace("\\", "/")
+	return text.rsplit("/", 1)[-1].lower() in _MSVC_NAMES
 
 
 def _std_year(std) -> str:
@@ -51,6 +62,227 @@ def _std_year(std) -> str:
 _MSVC_OPTIMIZE = {0: "/Od", 1: "/O1", 2: "/O2"}
 # `cl` has no -O3: the nearest it has is inlining every call.
 _MSVC_ABOVE_O2 = "/Ob2"
+
+
+# ---------------------------------------------------------------------------------------
+# what a variant's `arch` asks for, and which driver that is
+#
+# Until X86-2 `arch` was a string two places interpreted differently: the MSVC flag rule turned
+# it into `/arch:IA32` (which is not a bitness switch), the GCC rule turned it into `-m32`, and
+# nothing at all resolved it to the compiler that actually emits 32-bit code. A 32-bit MSVC
+# request therefore ended either in "compiler 'cl' not found" or in a 64-bit object refused by a
+# bitness check that could only describe the symptom (Docs/MSVC-x86-Plan.md §3).
+
+
+def arch_bitness(value) -> str | None:
+	"""Which target *bitness* a variant's `arch` asks for, or None when it asks for something else.
+
+	`arch` in a [variants.*] table does two jobs: it names a bitness (`"x86"`, `"x86-64"`), and for
+	`cl` it can name an ISA level that `build_flags` turns into `/arch:AVX2`, which is not a bitness
+	at all. Empty means "whatever the driver defaults to". This is the one table that separates the
+	two; `decomp check` asks the same question for the same reason.
+	"""
+	text = str(value or "").strip().lower()
+	if text in ("x86", "i386", "i486", "ia32", "32"):
+		return "x86"
+	if text in ("x86-64", "x64", "amd64", "64"):
+		return "x64"
+	return None
+
+
+def driver_bitness(driver) -> tuple[str, str]:
+	"""What target bitness this driver emits, and how that is known ("" for "it does not say").
+
+	By the *directory the compiler lives in*, never by a flag: an msvc-wine install is
+	`<prefix>/bin/<arch>/cl`, and the real toolset puts the target in its own path
+	(`VC/Tools/MSVC/<v>/bin/Hostx64/x86/cl.exe`). Both spellings are read here, and symlinks are
+	resolved first, because a wrapper that is a symlink lands in the toolset directory (Setup.md
+	§6.2, and the first trap of Docs/MSVC-x86-Plan.md §8).
+	"""
+	text = str(driver or "").strip()
+	if not text:
+		return "", ""
+	found = text if os.path.isabs(text) else (shutil.which(text) or "")
+	if not found:
+		return "", ""
+	parts = [item.lower() for item in Path(os.path.realpath(found)).parts]
+	if len(parts) < 3:
+		return "", ""
+	parent, grand = parts[-2], parts[-3]
+	if grand != "bin" and not grand.startswith("host"):
+		return "", ""
+	bitness = arch_bitness(parent)
+	if not bitness:
+		return "", ""
+	return bitness, "%s is the directory this driver is installed for" % "/".join(parts[-3:])
+
+
+def msvc_wrapper(prefix, arch: str) -> Path | None:
+	"""`<prefix>/bin/<arch>/cl`, the wrapper that runs a target toolset under Wine (Setup.md §6.2).
+
+	The wrapper is the only thing that can *run* a `cl.exe` here: it is what sets INCLUDE/LIB and
+	the Wine prefix. `VC/Tools/MSVC/<v>/bin/Host*/<arch>/cl.exe` on its own would not find a header.
+	"""
+	if not prefix:
+		return None
+	for name in ("cl", "cl.exe"):
+		path = Path(prefix) / "bin" / str(arch) / name
+		if path.is_file():
+			return path
+	return None
+
+
+def _best_wrapper(prefix) -> Path | None:
+	"""A driver for a variant that named no bitness: x64 if this prefix has one, else x86."""
+	for arch in ("x64", "x86"):
+		wrapper = msvc_wrapper(prefix, arch)
+		if wrapper is not None:
+			return wrapper
+	return None
+
+
+@dataclass
+class Driver:
+	"""The compiler a variant will actually run, chosen once, with the reason kept.
+
+	`name` is empty when nothing on this machine can serve the variant, and `gap` then says which
+	half is missing - no such compiler, or the wrong one installed (the operator's question in
+	Docs/MSVC-x86-Plan.md §1). That answer is available *before* a compiler runs, which is the whole
+	point: today a 32-bit request learns it from a missing executable, or from a bitness refusal
+	after a pointless compile.
+	"""
+
+	name: str = ""
+	arch: str = ""              # the bitness this driver emits, "" = it does not say
+	arch_from: str = ""         # how that is known (its directory, a -m32 flag, nothing)
+	why: str = ""               # how this driver was chosen
+	gap: str = ""               # why nothing here can build this variant ("" = something can)
+	conflict: str = ""          # the variant and a path-named driver disagree; honoured anyway
+	tried: list[str] = field(default_factory=list)
+
+	@property
+	def refused(self) -> bool:
+		"""No driver, and the reason is already known: do not spend a compile learning it."""
+		return not self.name and bool(self.gap)
+
+	def lines(self) -> list[str]:
+		"""Which driver, what it targets, and how that was decided - printed before any build."""
+		if self.refused:
+			return ["compiler  none: %s" % self.gap] + ["  looked    %s" % item
+				for item in self.tried]
+		if not self.name:
+			return []
+		out = ["compiler  %s (%s)" % (self.name, "target %s: %s" % (self.arch, self.arch_from)
+			if self.arch else "target bitness is this driver's own default")]
+		if self.why:
+			out.append("  chosen    %s" % self.why)
+		if self.conflict:
+			out.append("  warning   %s" % self.conflict)
+		return out
+
+
+def _msvc_gap(wanted: str | None, prefix=None) -> str:
+	"""Why no driver for this target exists, in the same words `decomp check` prints about the
+	same machine (X86-0). One set of facts, one set of sentences, so `check` and `try` cannot
+	disagree about whether a variant can be built (Docs/MSVC-x86-Plan.md X86-5's guard)."""
+	from . import check  # local: the per-target-arch probe lives in check.py today (X86-0)
+
+	if prefix is None:
+		prefix, _why = check.msvc_prefix()
+	if prefix is None:
+		return ("this variant needs an MSVC toolchain and this machine has none - no cl on PATH "
+			"and nothing under toolchains/ either (Docs/Setup.md §6)")
+	targets = check.msvc_target_arches(Path(prefix))
+	if wanted is None:
+		return ("no driver could be chosen: the toolchain at %s has no cl for a target this tool "
+			"knows (Docs/Setup.md §6)" % prefix)
+	entry = targets.get(wanted)
+	if entry is None:
+		return ('its arch = "%s" is not a target the toolchain at %s knows anything about' % (wanted, prefix))
+	if entry["can_build"]:
+		return ('its arch = "%s" is buildable with the toolchain at %s, but nothing runs it: %s'
+			% (wanted, prefix, entry["detail"]))
+	return ('its arch = "%s" %s (toolchain at %s): %s' % (wanted,
+		"is only half installed" if entry["compilers"] else "cannot be built here", prefix,
+		entry["detail"]))
+
+
+def compiler_for(variant: dict, *, prefix=None, prefix_from: str = "") -> Driver:
+	"""Which compiler this variant runs. Asked once, by whoever builds or links (X86-2).
+
+	The order, and why it is that order:
+
+	1. the variant names a driver *by path* - honoured, whatever it is, because a config that says
+	   which `cl.exe` to run is stating an era; a disagreement with `arch` is reported as a warning
+	   and left to the object-level bitness check, which is the safety net that must stay reachable;
+	2. a toolchain the project's config pins (`[msvc] prefix`) - its `bin/<arch>/cl` for the bitness
+	   the variant asks for. A pinned toolchain is an answer about *that* toolchain: PATH is not
+	   consulted behind its back, because pinning is how a project says "build with this era";
+	3. the `cl` on PATH, when its directory says the bitness that was asked for (this is today's
+	   behaviour, and the x64 path keeps taking exactly this branch);
+	4. the same toolchain `decomp check` reports finding, named by path - which is what an installed
+	   but off-PATH wrapper means. Nothing is invented here; the prefix is the one X86-0 probes.
+
+	If none of those yields a driver, the gap is the sentence `decomp check` would print, and no
+	compiler is run.
+	"""
+	compiler = str(variant.get("compiler") or "g++")
+	wanted = arch_bitness(variant.get("arch"))
+	if not msvc(compiler):
+		flag = {"x86": "-m32", "x64": "-m64"}.get(wanted or "")
+		return Driver(name=compiler, arch=wanted or "",
+			arch_from=("what a %s flag does on this driver" % flag if flag
+				else "not asked for: the variant names no bitness, so this is the driver's default"),
+			why="named by the variant%s" % (", with %s for its arch" % flag if flag else ""))
+
+	tried: list[str] = []
+	named = [item for item in Path(str(compiler).replace("\\", "/")).parts if item not in ("/", ".")]
+	if len(named) > 1:
+		bitness, how = driver_bitness(compiler)
+		driver = Driver(name=str(compiler), arch=bitness, arch_from=how,
+			why="named by path in the variant", tried=tried)
+		if wanted and bitness and wanted != bitness:
+			driver.conflict = ('the variant asks for arch = "%s" and this driver produces %s (%s). '
+				"The path the variant names is used anyway - the bitness of the object that comes back "
+				"is what stops the comparison" % (wanted, bitness, how))
+			tried.append(driver.conflict)
+		return driver
+
+	if prefix:
+		pinned = Path(os.path.expandvars(os.path.expanduser(str(prefix))))
+		where = prefix_from or "the [msvc] block in the project config"
+		wrapper = msvc_wrapper(pinned, wanted) if wanted else _best_wrapper(pinned)
+		if wrapper is not None:
+			bitness, how = driver_bitness(wrapper)
+			return Driver(name=str(wrapper), arch=bitness, arch_from=how,
+				why="%s pins %s, which has a driver for this target" % (where, pinned), tried=tried)
+		tried.append("%s pins %s, which has no driver for %s" % (where, pinned,
+			"%s targets" % wanted if wanted else "any target this tool knows"))
+		return Driver(arch=wanted or "", gap=_msvc_gap(wanted, pinned), tried=tried)
+
+	on_path = shutil.which(compiler)
+	if on_path:
+		bitness, how = driver_bitness(on_path)
+		if wanted is None or not bitness or bitness == wanted:
+			return Driver(name=on_path, arch=bitness, arch_from=how,
+				why="the `%s` on PATH" % compiler, tried=tried)
+		tried.append("the `%s` on PATH is %s, which produces %s, not %s"
+			% (compiler, on_path, bitness, wanted))
+	from . import check  # local: check.py owns the installed-toolchain probe (X86-0)
+
+	found, _why = check.msvc_prefix(on_path)
+	if found is not None:
+		wrapper = msvc_wrapper(found, wanted) if wanted else _best_wrapper(found)
+		if wrapper is not None:
+			bitness, how = driver_bitness(wrapper)
+			return Driver(name=str(wrapper), arch=bitness or wanted or "", arch_from=how,
+				why="the toolchain installed at %s has this target, and its wrapper directory is not "
+					"on PATH, so the driver is named by path (Docs/Setup.md §6.2)" % found, tried=tried)
+		tried.append("the toolchain at %s has no driver for %s" % (found,
+			"%s targets" % wanted if wanted else "any target"))
+	elif on_path is None:
+		tried.append("no `%s` on PATH" % compiler)
+	return Driver(arch=wanted or "", gap=_msvc_gap(wanted, found), tried=tried)
 
 
 def build_flags(variant: dict) -> list[str]:
@@ -66,6 +298,10 @@ def build_flags(variant: dict) -> list[str]:
 	adds nothing, which is what leaves `cl`'s defaults alone for a variant that does not
 	name them (Docs/MSVC-Plan.md MS-4: the flag set has to be able to say what the target's
 	was, not collapse it to /Od or /O2).
+
+	`arch` is not in that list on purpose. For `cl` it selects the *driver* (`compiler_for`),
+	not a flag; for GCC it is `-m32`, which is the same question asked the only way that
+	driver can answer it (Docs/MSVC-x86-Plan.md X86-2).
 	"""
 	if msvc(variant.get("compiler", "g++")):
 		level = int(variant.get("optimize", 0))
@@ -99,15 +335,19 @@ def build_flags(variant: dict) -> list[str]:
 			flags.append("/MD")
 		if str(variant.get("fp", "")).lower() in ("fast", "strict"):
 			flags.append("/fp:%s" % str(variant["fp"]).lower())
-		arch = str(variant.get("arch", ""))
-		if arch == "x86":
-			flags.insert(0, "/arch:IA32")
-		elif arch.upper() in ("AVX", "AVX2", "AVX512"):
-			flags.append("/arch:%s" % arch.upper())
+		# For `cl` a target *bitness* is never a flag. It is which `cl.exe` runs, decided by the
+		# directory that compiler lives in (`bin/Hostx64/x86` vs `bin/Hostx64/x64`) - see
+		# `compiler_for`. `/arch:IA32` used to be added here for `arch = "x86"`, and it is not a
+		# bitness switch: it turns SSE off and moves the codegen off the i386 default the target has
+		# (Docs/MSVC-x86-Plan.md X86-2). Only an ISA level belongs in this table; a variant that
+		# genuinely means "no SSE" can still put /arch:IA32 in its own cppflags.
+		if str(variant.get("arch", "")).upper() in ("AVX", "AVX2", "AVX512"):
+			flags.append("/arch:%s" % str(variant["arch"]).upper())
 		return flags + list(variant.get("cppflags", []))
 	flags = ["-std=%s" % variant.get("std", "c++17"), "-O%d" % int(variant.get("optimize", 0)),
 		"-Wall", "-Wextra"]
-	if variant.get("arch") == "x86":
+	# For GCC and clang the target bitness *is* a flag, and the driver does not change.
+	if arch_bitness(variant.get("arch")) == "x86":
 		flags.append("-m32")
 	return flags + list(variant.get("cppflags", []))
 

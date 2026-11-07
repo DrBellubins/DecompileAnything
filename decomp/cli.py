@@ -1048,8 +1048,11 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	name, body = config.variant(cfg, variant or meta.get("variant"))
 	flags = toolchain.build_flags(body)
 	object_path = (object_dir or (config.cache_dir(cfg) / "candidates")) / compile.object_name(sources)
-	result = compile.build(sources, object_path, compiler=body.get("compiler", "g++"),
-		flags=flags, includes=[*config.include_dirs(cfg, body),
+	# No compiler is named here on purpose: `arch` is what decides the driver, and only
+	# `toolchain.compiler_for` reads both (Docs/MSVC-x86-Plan.md X86-2). A 32-bit MSVC variant this
+	# machine cannot build stops with the reason, not with "compiler 'cl' not found".
+	result = compile.build(sources, object_path, flags=flags, variant=body, cfg=cfg,
+		includes=[*config.include_dirs(cfg, body),
 			*[Path(item) for item in (includes or [])]])
 	if gate and gate not in diff.GATE_MODES:
 		raise config.ConfigError("--gate %s: not a gate - use one of %s"
@@ -1066,7 +1069,15 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	outcome = {"variant": name, "flags": flags, "build": result, "object": object_path,
 		"warnings": [], "error": None, "error_code": EXIT_FAIL, "verdict": None,
 		"gate": require, "gate_from": gate_from, "waive": waiver, "waive_from": waiver_from,
-		"original": None, "candidate": None}
+		"original": None, "candidate": None,
+		# Which driver was chosen and what it targets, so --json says what the report says.
+		"driver": result.driver, "driver_arch": result.arch, "driver_from": result.why}
+	if result.refused:
+		outcome["error_code"] = EXIT_USAGE
+		outcome["error"] = ('this variant cannot be built here: %s. Nothing was compiled: the driver '
+			"comes from the variant's arch and the toolchains this machine has, and none of them "
+			"produce %s code" % (result.diagnostics, result.arch or "the requested"))
+		return outcome
 	if result.failed:
 		outcome["error"] = "the candidate did not compile"
 		return outcome
@@ -1106,9 +1117,18 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 		return outcome
 	bits = 64 if (language.split(":") + ["", ""])[2] == "64" else 32
 	if object_file.bits and object_file.bits != bits:
+		# The safety net stays: whatever the resolver thought, a build that reaches here with the
+		# wrong bitness is refused, because this is the one place both sides are known. What X86-2
+		# adds is the cause - the driver that ran, and the bitness it emits.
+		built_with = ("built with %s, which emits %s code" % (result.driver,
+			"64-bit" if result.arch == "x64" else "%s-bit" % result.arch) if result.driver
+			else "the driver that built it is not recorded")
 		outcome["error"] = ("the candidate object is %d-bit (%s) but the analysis of this target "
-			"is %s - compile it with the variant's arch (see [variants.%s] in %s)"
-			% (object_file.bits, object_file.path.name, language, name, cfg["path"]))
+			"is %s - it was %s, while this variant asks for arch = \"%s\". Use the driver that "
+			"emits the target's bitness (`decomp check` prints which toolchains can), or correct "
+			"[variants.%s] in %s"
+			% (object_file.bits, object_file.path.name, language, built_with,
+				body.get("arch") or "(nothing)", name, cfg["path"]))
 		outcome["error_code"] = EXIT_USAGE
 		return outcome
 	try:
@@ -1328,6 +1348,10 @@ def try_cmd(
 			"target": values.get("target_path"), "function": row["name"],
 			"entry": _hex(row["entry"]), "size": row["size"], "kind": row["kind"],
 			"variant": outcome["variant"], "flags": outcome["flags"],
+			# the driver `arch` resolved to, in the record too: which compiler produced these bytes is
+			# part of what a score means (decomp.toolchain.compiler_for, MSVC-x86 X86-2)
+			"driver": outcome.get("driver"), "driver_arch": outcome.get("driver_arch"),
+			"driver_from": outcome.get("driver_from"),
 			"gate": outcome["gate"], "gate_from": outcome["gate_from"],
 			"waive": outcome.get("waive", []), "waive_from": outcome.get("waive_from", ""),
 			"object": str(build.object_path), "build_ok": build.ok,
@@ -1493,7 +1517,15 @@ def link_cmd(
 	target_path = Path(str(meta.get("target_path") or ""))
 	offset = int(str(meta.get("address_offset") or "0") or 0)
 	language = str(meta.get("language_id") or "")
-	compiler = body.get("compiler") or "g++"
+	# One driver for the compiles and the link, resolved from the variant's arch - and refused here,
+	# before any compiler runs, when this machine has no driver for that target
+	# (Docs/MSVC-x86-Plan.md X86-2).
+	driver = compile.resolve(body, cfg)
+	if driver.refused:
+		raise Stop(EXIT_USAGE, "this variant cannot be linked here: %s" % driver.gap,
+			"the driver comes from [variants.%s] arch and the toolchains this machine has, and none of "
+			"them build %s code" % (name, driver.arch or "that"))
+	compiler = driver.name
 	if not object_ and not sources:
 		raise Stop(EXIT_USAGE, "nothing to link",
 			"pass the candidate sources: decomp link <file.cpp> ... --bin %s" % target_path,
@@ -1512,7 +1544,7 @@ def link_cmd(
 	if sources:
 		for item in sources:
 			result = compile.build([Path(item)], (out_dir / "objects"
-				/ compile.object_name([Path(item)])), compiler=compiler, flags=flags,
+				/ compile.object_name([Path(item)])), flags=flags, variant=body, cfg=cfg,
 				includes=[*[Path(part) for part in config.include_dirs(cfg, body)],
 					*[Path(part) for part in (include or [])]])
 			built.append(result)
@@ -1526,7 +1558,7 @@ def link_cmd(
 			raise Stop(EXIT_FAIL, "%d of %d candidate sources did not compile: the program cannot "
 				"be linked from them" % (len(bad), len(sources)))
 
-	link = compile.link(objects, out_path, compiler=compiler, flags=flags, linkflags=linkflags,
+	link = compile.link(objects, out_path, flags=flags, linkflags=linkflags, variant=body, cfg=cfg,
 		extra=[*(link_flag or ()), *(["-Wl,--unresolved-symbols=ignore-all"] if partial else [])])
 	for line in compile.describe(link):
 		echo(line)

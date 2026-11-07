@@ -7,6 +7,11 @@ per Docs/Setup.md §3:
 	install_dir = "/opt/ghidra"
 	cache_dir   = "cache/ghproj"
 	language    = ""
+
+A `[msvc]` block pins the MSVC toolchain a project is built with (`prefix = "../toolchains/msvc"`,
+relative to the config file, like `cache_dir`); `msvc_prefix` reads it and `toolchain.compiler_for`
+resolves a variant's `arch` to that toolchain's driver by path. Without the block, the toolchain a
+variant gets is the `cl` on PATH or the one `decomp check` reports finding — see Docs/Setup.md §6.13.
 """
 
 from __future__ import annotations
@@ -154,6 +159,30 @@ def application_properties(install_dir: Path) -> dict:
 def language(config: dict) -> str:
 	"""Empty means: let Ghidra auto-select the language."""
 	return str(config["raw"].get("ghidra", {}).get("language") or "")
+
+
+def msvc_prefix(config: dict) -> tuple[Path | None, str]:
+	"""The MSVC toolchain this project pins: `[msvc] prefix` in the config, or (None, why-not).
+
+	A project pins a toolchain when the era matters - the target was built by one compiler and a
+	candidate from another era is not comparable to it (Docs/MSVC-x86-Plan.md §8's era trap). Naming
+	a prefix also says where the drivers are: `<prefix>/bin/<arch>/cl`, which is what
+	`toolchain.compiler_for` resolves a variant's `arch` to instead of taking whatever `cl` a shell
+	happens to have on PATH. A relative path is relative to the config file, like `cache_dir` is.
+
+	Nothing is verified here beyond the path: whether that prefix can serve a given target is
+	`toolchain.compiler_for`'s answer (and `decomp check` prints the same facts per arch), because a
+	prefix that can do x64 but not x86 is a fact about the toolchain, not a broken config.
+	"""
+	table = config["raw"].get("msvc") or {}
+	value = table.get("prefix") if isinstance(table, dict) else None
+	if not value:
+		return None, "no [msvc] prefix in %s" % config["path"]
+	path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+	path = path if path.is_absolute() else (config["root"] / path)
+	# Normalised, because this path is printed in provenance lines: `<root>/Tests/../toolchains`
+	# names the same directory as `<root>/toolchains` and reads like a mistake.
+	return Path(os.path.normpath(path)), "[msvc] prefix in %s" % config["path"]
 
 
 def variants(config: dict) -> dict:

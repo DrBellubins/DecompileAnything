@@ -37,6 +37,17 @@ install_dir = ""             # empty = GHIDRA_INSTALL_DIR, then /opt/ghidra, the
 cache_dir = "../cache/ghproj"
 language = ""                # empty = let Ghidra auto-select (x86:LE:64:default here)
 
+# The MSVC toolchain the candidate builds use. A project pins one when the era matters: the
+# benchmark's MSVC target was built by a particular toolset, and a candidate from another era
+# regenerates prologues, constants and jump tables (Docs/MSVC-Plan.md §5). `prefix` is the root
+# that holds `bin/x86/cl` and `bin/x64/cl` (an msvc-wine install, Docs/Setup.md §6.2); a relative
+# path is relative to this file. A variant's `arch` then resolves to that driver *by path*, so
+# `decomp try` and eval.py need no `cl` on PATH - and an `arch = "x86"` variant cannot quietly be
+# built by the x64 compiler (Docs/MSVC-x86-Plan.md X86-2). Delete this table to let the tool
+# discover a toolchain instead (PATH first, then toolchains/, then Visual Studio installs).
+[msvc]
+prefix = "../toolchains/msvc"
+
 # The variant name is the build directory name under Tests/build/.
 # gcc -O0 x86-64 is the entry point of the progression in the design plan:
 # -O0 free functions -> class methods -> virtual dispatch -> -O2, with -m32 as the

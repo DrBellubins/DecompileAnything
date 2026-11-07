@@ -328,6 +328,55 @@ toolset / `for x64` and `for x86`; the x86 probe linked and its object read back
 rather than remember this machine - and the `decomp check` lines moved from
 `msvc target x86 warn` to `msvc target x86 ok ... Hostx64/x86/cl.exe`.
 
+## Which driver a variant gets (MSVC-x86 X86-2, 2026-11-07)
+
+A variant's `arch` selects the compiler. For `cl` that is a different executable per target bitness
+(`<prefix>/bin/x86/cl` vs `bin/x64/cl`) — never a flag — so `Tests/eval.py` and the `decomp` tool now
+ask one resolver (`decomp.toolchain.compiler_for`) instead of taking whatever `cl` a shell has.
+
+```sh
+.venv/bin/python Tests/tools/check_msvc_x86_toolchain.py     # nine groups, exit 0, ~2 min
+```
+
+The X86-2 groups are the ones that spend a compiler (groups 1–5 are the X86-0 report check):
+
+* **6** `build_flags({'compiler':'cl','arch':'x86'})` carries no `-m32` and no `/arch:IA32`, and is
+  identical to the x64 variant's flags; `/arch:AVX2` and GCC's `-m32` are unchanged; a path-named
+  `cl` is given `/c /Tp /Fo`, not `-c -o`.
+* **7** `arch = "x86"` resolves to `toolchains/msvc/bin/x86/cl` and **the object it builds measures
+  32-bit**; `arch = "x86-64"` resolves to `bin/x64/cl` and 64; the driver's directory and the object
+  agree. A variant that names its driver by path is honoured (with a warning, not a substitution), and
+  the rule order is checked with a real `PATH`: PATH first for the bitness it serves, then the
+  installed toolchain by path, with the ruled-out driver kept in the record.
+* **8** a config that pins an `[msvc] prefix` with no x86 driver gets `refused=True`, an **empty
+  command**, and no object file — the missing target is named before any compiler runs.
+* **9** the old safety net still fires: a 64-bit object against the cached 32-bit analysis is refused
+  as a usage error, now naming the driver and the bitness it emits as the cause.
+
+`decomp try` prints the driver it resolved before it compiles (`driver … - targets x86, <why>`), stops
+with that gap and exit 2 when there is no driver for a variant's `arch`, and `try --json` records
+`driver` / `driver_arch` / `driver_from` next to `flags` in every result; `decomp link` refuses the
+same variant before linking anything. That is `Tests/tools/check_driver_resolution_cli.py` (it drives
+the real argv and exit codes, and needs the cached `msvc-o0` / `gcc-o0-x86` targets):
+
+```sh
+.venv/bin/python Tests/tools/check_driver_resolution_cli.py    # ~3 min, exit 0
+```
+
+or by hand, the MS-3 path with the driver line on top:
+
+```sh
+.venv/bin/python -m decomp.cli try 0x140002910 Tests/TestBinary/TestFunctions/math.cpp \
+  --fn '?AbsDiff@CMathTests@@SAHHH@Z' --bin Tests/build/msvc-o0/da_tests.stripped \
+  --config Tests/project.toml --variant msvc-o0 | head -4
+```
+
+`Tests/project.toml` pins `[msvc] prefix = "../toolchains/msvc"`, so these checks and `eval.py` do not
+depend on the caller's `PATH`; delete the table to go back to discovery. Sharing the flag rule did not
+move the benchmark: `eval.py build --variant msvc-o0` still produces the same `.text` (133904 bytes,
+md5 `1e773b94118b0360ae5deaf23c68f948`) and the same 89-unit answer key. Its old extra `/FS` is gone —
+it serialises PDB writes and the benchmark builds objects one at a time.
+
 ## A check that never returns (MSVC stalls, 2026-11-07)
 
 ```sh

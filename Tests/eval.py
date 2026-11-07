@@ -34,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from decomp import spawn  # noqa: E402  (the bounded runner only, see the docstring)
+from decomp import spawn, toolchain  # noqa: E402  (the bounded runner, and the one flag/driver rule)
 
 TESTS_DIR = Path(__file__).resolve().parent
 SOURCE_DIR = TESTS_DIR / "TestBinary"
@@ -102,6 +102,8 @@ def load_config():
 			for key in ("std", "threshold", "cppflags", "linkflags"):
 				if key in raw:
 					config[key] = raw[key]
+			if "msvc" in raw:
+				config["msvc"] = raw["msvc"]
 			if "variants" in raw:
 				merged = dict(DEFAULT_VARIANTS)
 				merged.update(raw["variants"])
@@ -112,24 +114,53 @@ def load_config():
 
 
 def variant_flags(config, name):
-	variant = config["variants"][name]
-	compiler = variant.get("compiler", "g++")
-	extra = list(variant.get("cppflags", config.get("cppflags", [])))
-	arch = ["-m32"] if variant.get("arch") == "x86" else []
-	link = list(variant.get("linkflags", config.get("linkflags", [])))
-	if is_msvc(compiler):
-		# cl takes none of -std/-O/-Wall (Docs/MSVC-Plan.md §1); /nologo keeps the build log
-		# readable. Same rule as decomp.toolchain.build_flags - the benchmark and the tool have
-		# to build a candidate the same way.
-		level = "/O2" if int(variant.get("optimize", 0)) >= 2 else "/Od"
-		std = "/std:c++%s" % str(config["std"]).replace("c++", "").replace("gnu++", "") or "17"
-		return compiler, [level, std, "/EHsc", "/W3", "/nologo", "/FS"] + extra, link
-	return compiler, ["-std=%s" % config["std"], "-O%d" % variant.get("optimize", 0), "-Wall", "-Wextra"] + arch + extra, link
+	"""The compiler, build flags and link flags for a benchmark variant.
+
+	Asked of the tool, not kept here. Until X86-2 the benchmark carried its own copy of the MSVC
+	flag rules and the two had drifted (this file added `/FS`, and the tool's rule turned
+	`arch = "x86"` into a flag instead of a driver). One rule now - `decomp.toolchain` - because a
+	benchmark whose candidate is built differently from the tool's candidate is not measuring what
+	the tool does (Docs/MSVC-Plan.md §1, Docs/MSVC-x86-Plan.md X86-2).
+	"""
+	variant = dict(config["variants"][name])
+	# `build_flags`/`link_flags` read the variant's own keys; the config-wide fallbacks live here.
+	if "std" not in variant:
+		variant["std"] = config["std"]
+	for key, fallback in (("cppflags", "cppflags"), ("linkflags", "linkflags")):
+		if key not in variant and config.get(fallback):
+			variant[key] = list(config[fallback])
+	return (driver_for(variant, name, msvc_prefix(config)), toolchain.build_flags(variant),
+		toolchain.link_flags(variant))
 
 
-def is_msvc(compiler):
-	"""An MSVC driver - a different argument form in everything that matters."""
-	return str(compiler or "").lower() in ("cl", "cl.exe", "clang-cl", "msvc", "icx", "icx-cl")
+def msvc_prefix(config):
+	"""The toolchain this benchmark pins in `[msvc] prefix`, or None to let the tool discover one.
+
+	Same relative-path rule as the tool's own `config.msvc_prefix` (relative to this file), so the
+	benchmark and `decomp try` pin the same thing when they read the same file.
+	"""
+	value = (config.get("msvc") or {}).get("prefix")
+	if not value:
+		return None
+	path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+	path = path if path.is_absolute() else CONFIG_PATH.parent / path
+	return Path(os.path.normpath(path))
+
+
+def driver_for(variant, name="", prefix=None):
+	"""Which compiler this variant runs - the tool's resolver's answer, not a guess.
+
+	For `cl` that is a different executable per target bitness (`bin/x86/cl`, `bin/x64/cl`), so a
+	benchmark that asked the shell for a bare `cl` was building an x64 object for a 32-bit variant
+	and calling it the same test.
+	"""
+	driver = toolchain.compiler_for(variant, prefix=prefix,
+		prefix_from="[msvc] prefix in %s" % CONFIG_PATH if prefix else "")
+	if driver.refused:
+		raise SystemExit("variant %s cannot be built here: %s" % (name or "?", driver.gap))
+	if driver.conflict:
+		print("warning: %s" % driver.conflict)
+	return driver.name
 
 
 def is_pe(path):
@@ -798,7 +829,7 @@ def score_tokens(original, candidate):
 
 
 def compile_source(compiler, flags, source, output):
-	if is_msvc(compiler):
+	if toolchain.msvc(compiler):
 		# A bare `/home/…/x.cpp` reads as an option to cl, so the language is named (the same
 		# rule decomp.toolchain.driver_form follows).
 		sh([compiler] + flags + ["/c",
@@ -811,14 +842,14 @@ def compile_source(compiler, flags, source, output):
 def include_flags(compiler, directories):
 	"""The include-path arguments for this driver (`-I` vs `/I`; cl reads `-I` as an option
 	too, but spelling it the driver's own way keeps the command line copy-pasteable)."""
-	flag = "/I" if is_msvc(compiler) else "-I"
+	flag = "/I" if toolchain.msvc(compiler) else "-I"
 	return [x for directory in directories for x in (flag, str(directory))]
 
 
 def link_binary(compiler, flags, objects, linkflags, binary):
 	"""Link the benchmark. `cl` names the output with /Fe and passes the rest to the linker
 	after /link; a gcc driver uses -o (Docs/MSVC-Plan.md §7, MS-2)."""
-	if is_msvc(compiler):
+	if toolchain.msvc(compiler):
 		# /MAP is not in the config on purpose: the answer key needs the map next to the
 		# binary it describes, and only this function knows where that is.
 		sh([compiler] + ["/Fe:%s" % binary] + [str(o) for o in objects] +
@@ -868,7 +899,8 @@ def cmd_build(config, variants, capture=True):
 		if original_text.split("\n", 2)[2:] != stripped_text.split("\n", 2)[2:]:
 			raise RuntimeError("%s: .text differs after strip, addresses are not reusable" % variant)
 		try:
-			compiler_version = sh([compiler, "--version"] if not is_msvc(compiler) else [compiler, "/Bv", "/c"])
+			compiler_version = sh([compiler, "--version"] if not toolchain.msvc(compiler)
+				else [compiler, "/Bv", "/c"])
 		except RuntimeError as exc:  # cl /Bv exits non-zero: it has no source file, and that is fine
 			compiler_version = str(exc)
 		build_info = {
