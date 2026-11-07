@@ -17,7 +17,7 @@ Two layers: **system tools** (installed once, machine-wide, on `PATH`) and a **p
 | **clang / clang++** | 23.1.4 | alternate compiler for flag inference (Phase 3) |
 | **binutils** | 2.47 (`objdump -dr`, `nm --print-size`, `c++filt`, `strip`, `readelf`) | extracting and normalising instruction streams |
 | `capstone`, `pyelftools`, `pefile`, `click` | provided by the distro's site-packages | disassembly, `.o`/PE reading — reused by the venv |
-| MSVC `cl` | *not installed* (checked 2026-11-04: no `cl`, no `lld-link`, no Windows SDK/MSVC STL headers — `clang-cl` exists but cannot compile `#include <vector>`) | real PE/MSVC targets only; **§6** gives the setup steps for every toolchain era from VS2005 to VS2026, in both 32-bit and 64-bit form ([MSVC-Plan.md](MSVC-Plan.md) §5 and phase MS-2 are the why, §6 is the how) |
+| MSVC `cl` | *installed 2026-11-04 by §6.10*: `toolchains/msvc` — toolset v141 (`14.12.25827`) + Windows SDK 10.0.19041, driven through `toolchains/msvc/bin/x64/{cl,link,lib,dumpbin}` (`PATH=$PWD/toolchains/msvc/bin/x64:$PATH`, which is what the MSVC scripts set; a default shell has no `cl` and `decomp check` says so rather than saying there is no toolchain). **Target arches it can build: x64 only** — the tree holds `bin/Hostx64/x64` and `lib/x64`, with no `Hostx64/x86` and no `lib/x86`, while the SDK's x86 import libraries *are* present. `clang-cl` is still refused as an impostor (§6.8). | real PE/MSVC targets only; **§6** gives the setup steps for every toolchain era from VS2005 to VS2026, in both 32-bit and 64-bit form ([MSVC-Plan.md](MSVC-Plan.md) §5 and phase MS-2 are the why, §6 is the how). What is and is not 32-bit-capable today, per target arch, is what `decomp check` prints (§6.9); closing the toolset half is [MSVC-x86-Plan.md](MSVC-x86-Plan.md) X86-1 |
 | `objdiff-cli` | *not installed* | optional Phase 5 alternate diff backend |
 | `wine` | 9.21 Staging. `wine64` runs **64-bit** PE files (`x86_64-w64-mingw32-g++` probe prints, exit 0). It cannot start a **32-bit** PE: `/lib/ld-linux.so.2: could not open` — the Wine build does have 32-bit guests (`/usr/lib/wine/i386-windows` exists) but the host has no 32-bit ELF interpreter; `/usr/bin/wine` itself is that 32-bit ELF and fails to exec. | running `cl.exe`/`link.exe` for MSVC targets — `wine64` is enough for every toolset from VS2015 on (they all ship an x64-hosted `cl`), and *not* enough for the 32-bit-host tools of VS2013 and older; §6.7 fixes that |
 
@@ -497,6 +497,27 @@ Steps, for `<arch>` in `x86 x64` (both must pass for a toolset to back a variant
   and the toolset family they agree on, the impostors refused (`/usr/bin/link` = GNU coreutils,
   `clang-cl` = clang), whether the `cl` found is a Wine wrapper and whether Wine is there, and
   the state of the matching Windows SDK (`decomp/check.py`, `msvc_tools()`/`msvc_sdk()`).
+  Since X86-0 (2026-11-07) it also says **which target bitness the installed toolchain can
+  produce**, and finds a toolchain that is installed but off PATH:
+  * `msvc_prefix()` → the prefix, plus *how* it was found (from the `cl` on PATH, or from
+    `toolchains/msvc`, which is this machine's state - the old text reported "no `cl` on PATH"
+    about a compiler that was sitting in the repo).
+  * `msvc_target_arches(prefix)` → one `msvc target <arch>` line per arch in `x64 x86`: the
+    `VC/Tools/MSVC/<v>/bin/Host<h>/<arch>/cl.exe` found, the toolset's `lib/<arch>` CRT import
+    libraries, the Windows SDK's `Lib/<ver>/{ucrt,um}/<arch>`, the `<prefix>/bin/<arch>/cl`
+    wrapper, and whether that wrapper is on PATH. `can_build` is all three of the first set.
+    The bitness is read from the *directory*, because that is what carries it (§6.2, §6.7).
+  * `msvc_sdk(arch=…)` → the same SDK question per target arch (a bare call still means x64).
+    On this machine the x86 import libraries are installed and the x86 toolset half is not, so
+    conflating the two would have been wrong twice over.
+  * `variant_arch_gap(variant)` → a variant whose `arch` no installed driver can serve is named
+    *before* any work starts (`arch <name>` in the report, a warning unless a build was asked
+    for), naming which half is missing and which is present. `arch = "AVX2"` is an ISA level, not
+    a bitness, and is not contradicted; a GCC `arch = "x86"` variant is named only when `-m32`
+    actually fails (`gcc_multilib()`).
+  What this does **not** claim: any 32-bit MSVC *compiling*. The v141 tree here still has only
+  `Hostx64/x64` and `lib/x64`, and `decomp check` says so. Adding the target is X86-1
+  ([MSVC-x86-Plan.md](MSVC-x86-Plan.md) §5); picking it by `arch` is X86-2.
   Still not done: a 32-bit-host answer (§6.7) and a `#include <vector>` probe - that one is
   `Tests/tools/check_msvc_toolchain.py`'s link group, which needs the SDK.
 * `[msvc]` in `project.toml` next to `[ghidra]`: toolchain dir, expected `cl` version, target arch.

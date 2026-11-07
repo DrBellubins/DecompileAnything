@@ -30,7 +30,7 @@ Reading a 32-bit binary works. Matching one exists for GCC only. Per command, on
 | `analyze` / `find` / `show` / `status` | works (`x86:LE:32:default`, the ret-cut unit situation) | works — `deadrising2.exe` is analysed and listed |
 | `types` (structure recovery) | works (Design-Plan Phase 4; `this` from `8(%ebp)`) | works (MSVC-Plan MS-5: RTTI in absolute 4-byte addresses, `this` from `%ecx`, 769 classes in the game) |
 | `detect` | works | works **except** the `-O` inference: the x64 MSVC feature set reads zeros, and it refuses to probe ("cl is not installed here") |
-| `check` | the variant, its arch and the compiler agree | reports no `cl`, or the x64 one; `msvc_sdk()` would call the SDK complete because it looks at x64 paths only |
+| `check` | the variant, its arch and the compiler agree | *was:* reports no `cl`, or the x64 one; `msvc_sdk()` called the SDK complete because it looked at x64 paths only. **Since X86-0 (2026-11-07):** an installed-but-off-PATH toolchain is found and named as that, `msvc target x64` / `msvc target x86` state the bitness each installed toolchain can produce, `msvc_sdk(arch=…)` answers per arch, and an `arch = "x86"` MSVC variant is named before any work starts. What is still missing is the compiler itself, which the report now says plainly |
 | `try` | works, and is gated (a `MIN_EXACT` floor of 59 in `check_masked_bytes.py`) | **cannot reach a comparison** — no driver can produce 32-bit COFF, and the flag set it would use is wrong (§3) |
 | `link` (whole-program, Phase 6) | tested on 64-bit ELF only (`check_phase6_link.py` measures `gcc-o0`); a 32-bit ELF relink is untested | untested for a 32-bit PE: it needs the x86 link form, i386 relocation reading, and a link that can be run |
 
@@ -169,6 +169,49 @@ no x86-target `cl` exists.
   before and after X86-1** — before, by asserting that x86 is reported missing; after, by asserting
   it is reported present. That is deliberate: the claim is about the report, not about the tree.
 * Not claimed: anything about code generation. This phase only makes the gap visible.
+
+**Done 2026-11-07.** In `decomp/check.py`: `msvc_prefix()` (finds a prefix from the `cl` on PATH
+or from `toolchains/`, and says which), `msvc_target_arches(prefix)` and its helpers
+(`toolset_dirs`, `_arch_crt`, `_arch_sdk`, `arch_on_path`), `msvc_sdk(arch="x64")`,
+`arch_bitness()` (bitness values only — `AVX2` is not one), `gcc_multilib()` (a `-m32` probe, so
+a GCC x86 variant is not falsely reported as a gap) and `variant_arch_gap(variant)`, wired into
+`msvc_report()` and `check_all()` as `msvc target <arch>` and `arch <variant>` items.
+The bitness is read from the *directory* the `cl.exe` lives in, never from a flag (§8 first trap).
+
+Measured on this machine, before and after the change (`toolchains/msvc`, v141 `14.12.25827`):
+
+* `msvc_prefix()` → `toolchains/msvc`, "installed there, not on PATH". Previously the only MSVC
+  line was `msvc cl … not found on PATH`, i.e. the tool claimed there was no toolchain.
+* `msvc target x64` → `can build x64 candidates`, naming `VC/Tools/MSVC/14.12.25827/bin/Hostx64/x64/cl.exe`,
+  `lib/x64` + `lib/onecore/x64`, the SDK's x64 libraries, and `bin/x64/cl (not on PATH)`.
+* `msvc target x86` → `cannot build x86 candidates - x64 only: no 32-bit target from this toolchain`;
+  the toolset CRT half is named missing (`lib/x86` does not exist at all) while **the SDK half is
+  reported present**, because `Lib/10.0.19041.0/{ucrt,um}/x86` really are installed. Conflating
+  those two would have been wrong twice over, and it is why `msvc_sdk()` and the toolset probe are
+  separate.
+* A `[variants.msvc-o0-x86] arch = "x86"` variant is named as `arch msvc-o0-x86` *before* any
+  compile, naming the missing half and the install command that would add it (`--architecture x86 x64
+  --host-arch x64`, then `toolchains/msvc-wine/install.sh`). `arch = "x86-64"` and `arch = "AVX2"`
+  produce no gap; a `gcc` `arch = "x86"` variant produces none either, because `-m32` works here.
+
+`Tests/tools/check_msvc_x86_toolchain.py` (group 0): 38 checks, exit 0, run twice — default shell
+(`cl` off PATH) and the documented `PATH=$PWD/toolchains/msvc/bin/x64`. It measures the tree itself
+and compares, so it is not tied to this machine's answer: against a synthetic prefix that has
+`Hostx64/x86` + `lib/x86` + `bin/x86/cl`, the same report code prints `can build x86 candidates`,
+which is what X86-1 will produce. Exit 2 when there is no toolchain to judge.
+
+Nothing in §7 moved: `check_masked_bytes` (gcc-o0 79 exact, gcc-o2 78, **gcc-o0-x86 59** = its
+floor), `check_gate_tiers`, `check_diff_accounting`, `check_phase2_try`, `check_analysis_cache`,
+`check_msvc_toolchain` (its `eval.py selfcheck --variant msvc-o0` still `89 cases, 0 failures`) and
+`check_msvc_detect` all exit 0. `check_coff_candidate.py` exits 1 — **and did so identically with
+`decomp/check.py` stashed at HEAD**: 19 of the 89 units score 100.00 % with `bytes +0 {}` yet land
+at `structural` instead of `exact`. That is a pre-existing MS-3/MS-6 question, recorded here because
+X86-0 is the phase that noticed it.
+
+Docs: Setup.md §1's tool row now states the installed state and the x64-only target set; §6.9
+records what `decomp check` reports per arch; Tests/README.md gains the group-0 section and a
+Known-gaps bullet saying there is no 32-bit MSVC target here, and that any future 32-bit MSVC number
+belongs next to the `-m32` row (a 32-bit PE has no `.pdata` answer key).
 
 **X86-1: put a 32-bit target compiler on the machine.** *Machine-side.*
 

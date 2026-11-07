@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -201,6 +202,14 @@ def check_all(cfg: dict, want_compilers: bool = True) -> Report:
 					fatal=want_compilers)
 			else:
 				report.add("compiler %s" % name, True, message)
+			# X86-0: does this variant's target arch exist here at all? Asked per variant, before
+			# anything is compiled, so a 32-bit request is not answered with a 64-bit object.
+			gap = variant_arch_gap(body)
+			if gap:
+				report.add("arch %s" % name, False,
+					"variant %s: %s" % (name, gap),
+					"see the `msvc target <arch>` lines below, or Docs/Setup.md §6.7 / "
+					"Docs/MSVC-x86-Plan.md X86-1 for what would add it", fatal=want_compilers)
 		msvc_report(report, [body.get("compiler", "g++") for body in names.values()], want_compilers)
 		build_agreement(report, cfg, names)
 	return report
@@ -376,6 +385,435 @@ def msvc_tools() -> dict[str, Tool]:
 	return {name: Tool(name) for name in MSVC_TOOLS}
 
 
+# ---------------------------------------------------------------------------------------
+# what an installed toolchain can target, per *target* arch (Docs/MSVC-x86-Plan.md X86-0)
+
+# The target bitnesses worth asking about. `arm`/`arm64` appear in a real install and are
+# reported when this prefix happens to have them, but nothing in this tool builds for them
+# (Docs/MSVC-x86-Plan.md §9), so only these two are probed and only these two can make a
+# configured variant unbuildable.
+MSVC_TARGET_ARCHES = ("x64", "x86")
+
+# The toolset's own import libraries for a target arch: what `cl /MT` auto-links. They live in
+# `VC/Tools/MSVC/<v>/lib/<arch>/`, and for the libraries the desktop CRT payload leaves out in
+# `lib/onecore/<arch>/` (install_msvc.fill_missing_libs, Docs/Setup.md §6.10). Their absence is
+# a package the installer never asked for - a different answer, and a different fix, from a
+# missing compiler.
+MSVC_CRT_LIBS = ("libcmt.lib", "libvcruntime.lib", "libcpmt.lib")
+
+# The SDK side of a target arch. `Include/` is arch-independent, so the SDK half of a target
+# arch is only ever about these two libraries (the measured package-naming trap is on `msvc_sdk`).
+MSVC_SDK_LIBS = (("ucrt", "libucrt.lib"), ("um", "kernel32.lib"))
+
+
+def _dir_named(parent: Path, name: str) -> Path | None:
+	"""`VC` or `vc`, `Windows Kits` or `windows kits`: the payloads and msvc-wine's install.sh
+
+do not agree on case, and the second adds lowercase aliases of the first."""
+	if not parent.is_dir():
+		return None
+	wanted = name.lower()
+	try:
+		entries = sorted(parent.iterdir())
+	except OSError:
+		return None
+	for entry in entries:
+		if entry.name.lower() == wanted and entry.is_dir():
+			return entry
+	return None
+
+
+def toolset_dirs(prefix: Path) -> list[Path]:
+	"""`<prefix>/VC/Tools/MSVC/<version>` for every toolset under an installed prefix."""
+	vc = _dir_named(prefix, "VC")
+	if vc is None:
+		return []
+	found, seen, unique = [], set(), []
+	for spelling in ("Tools/MSVC", "tools/msvc"):
+		root = vc / spelling
+		if not root.is_dir():
+			continue
+		found += [p for p in sorted(root.iterdir()) if p.is_dir() and re.match(r"^\d+\.\d+", p.name)]
+	for path in found:
+		key = os.path.realpath(path)
+		if key not in seen:
+			seen.add(key)
+			unique.append(path)
+	return unique
+
+
+def _kits_dir(prefix: Path) -> Path | None:
+	"""`<prefix>/Windows Kits/10`, the SDK root, or None."""
+	kits = _dir_named(prefix, "Windows Kits")
+	return _dir_named(kits, "10") if kits is not None else None
+
+
+def _looks_like_prefix(path: Path) -> bool:
+	return bool(toolset_dirs(path)) or _kits_dir(path) is not None
+
+
+def _installed_prefixes() -> list[Path]:
+	"""Toolchain directories this repo's installer writes (Docs/Setup.md §6.1, §6.5).
+
+	`toolchains/` is gitignored and machine-local, so this is a probe, not an assumption: an
+	empty list just means the machine has no MSVC toolchain sitting in the repo.
+	"""
+	repo = Path(__file__).resolve().parents[1]
+	tools = repo / "toolchains"
+	if not tools.is_dir():
+		return []
+	candidates = [tools / "msvc"]
+	candidates += sorted(p for p in tools.iterdir() if p.is_dir())
+	for msvc in (tools / "msvc",):
+		if msvc.is_dir():
+			candidates += sorted(p for p in msvc.iterdir() if p.is_dir())
+	out, seen = [], set()
+	for candidate in candidates:
+		key = os.path.realpath(candidate)
+		if key in seen or not _looks_like_prefix(candidate):
+			continue
+		seen.add(key)
+		out.append(candidate)
+	return out
+
+
+def msvc_prefix(cl_path: str | None = None) -> tuple[Path | None, str]:
+	"""The root of an installed MSVC toolchain (`<prefix>/bin/<arch>/cl`, `<prefix>/VC`,
+	`<prefix>/Windows Kits`), or None with the reason there is none.
+
+	Two ways to find one, because they mean different things. An msvc-wine wrapper is
+	`<prefix>/bin/<arch>/cl`, so a `cl` on PATH has the prefix as an ancestor. When nothing is
+	on PATH, the directory `toolchains/install_msvc.py` installs into is still a fact about this
+	machine, and the two gaps it can show are different gaps: an installed toolchain that is not
+	on PATH needs one shell line, while a toolset with no 32-bit target needs a download
+	(Docs/MSVC-x86-Plan.md X86-0). Reporting only the first case is what made `decomp check`
+	say "no `cl` on PATH" about a toolchain that is in fact installed at `toolchains/msvc`.
+	"""
+	cl = cl_path or shutil.which("cl")
+	if cl:
+		resolved = Path(cl).resolve()
+		root = next((p for p in resolved.parents
+			if (p / "Windows Kits").is_dir() or (p / "VC").is_dir()), None)
+		if root is not None:
+			return root, "found from the cl on PATH (%s)" % resolved
+		reason = "the cl on PATH (%s) has no Windows Kits or VC directory above it" % resolved
+	else:
+		reason = "no cl on PATH"
+	for candidate in _installed_prefixes():
+		if candidate.is_dir():
+			return candidate, "%s is installed but not on PATH" % candidate
+	return None, reason + " - no toolchain under toolchains/ either"
+
+
+def _arch_sdk(prefix: Path, arch: str) -> dict:
+	"""The Windows SDK libraries for one target arch, as files on disk."""
+	out = {"root": None, "version": None, "present": [], "missing": []}
+	kits = _kits_dir(prefix)
+	if kits is None:
+		out["detail"] = "no Windows Kits/10 under %s" % prefix
+		return out
+	versions = sorted((kits / "Include").glob("10.*")) if (kits / "Include").is_dir() else []
+	versions += sorted((kits / "include").glob("10.*")) if (kits / "include").is_dir() else []
+	if not versions:
+		out["detail"] = "Windows Kits/10 has no Include/10.* - the SDK payload MSIs were never extracted"
+		return out
+	version = versions[-1]
+	libs = None
+	for spelling in ("Lib", "lib"):
+		candidate = kits / spelling / version.name
+		if candidate.is_dir():
+			libs = candidate
+			break
+	out["version"] = version.name
+	if libs is None:
+		out["detail"] = "Windows Kits/10/Lib/%s is missing" % version.name
+		return out
+	for part, name in MSVC_SDK_LIBS:
+		path = libs / part / arch / name
+		(out["present"] if path.is_file() else out["missing"]).append(str(path))
+	out["detail"] = ("all of them are there" if not out["missing"]
+		else "missing " + ", ".join(os.path.relpath(p, prefix) for p in out["missing"]))
+	return out
+
+
+def _arch_crt(prefix: Path, arch: str) -> dict:
+	"""The toolset's own CRT/STL import libraries for one target arch.
+
+	Both spellings are looked at: `lib/<arch>` is what `cl` searches, and `lib/onecore/<arch>` is
+	where the sibling CRT payload puts the libraries the desktop package does not ship -
+	`install_msvc.fill_missing_libs` symlinks those into `lib/<arch>`, but a toolchain installed
+	some other way has only the OneCore copy (Docs/Setup.md §6.10).
+	"""
+	out = {"dirs": [], "present": [], "missing": list(MSVC_CRT_LIBS)}
+	for toolset in toolset_dirs(prefix):
+		for directory in (toolset / "lib" / arch, toolset / "lib" / "onecore" / arch):
+			if not directory.is_dir():
+				continue
+			out["dirs"].append(str(directory))
+			lower = {p.name.lower(): p for p in directory.iterdir() if p.is_file()}
+			for name in MSVC_CRT_LIBS:
+				if name in lower and name in out["missing"]:
+					out["present"].append(str(lower[name]))
+					out["missing"] = [m for m in out["missing"] if m != name]
+	found = ", ".join(os.path.relpath(d, prefix) for d in out["dirs"])
+	out["detail"] = ("present in " + found if not out["missing"] else
+		"no " + ", ".join(out["missing"]) +
+		(" under " + found if found else " - this toolset has no lib/%s directory at all" % arch))
+	return out
+
+
+def msvc_target_arches(prefix: Path | None = None) -> dict[str, dict]:
+	"""What an installed MSVC toolchain can produce, per target arch.
+
+	A 32-bit or 64-bit MSVC build needs four things to line up for that target arch, and none
+	of them implies the next:
+
+	  * `VC/Tools/MSVC/<v>/bin/Host<h>/<arch>/cl.exe` - the target bitness is the *directory*
+	    the compiler lives in, never a flag (`/arch:IA32` disables SSE, it does not emit 32-bit
+	    code - Docs/MSVC-x86-Plan.md §8, Setup.md §6.2);
+	  * `VC/Tools/MSVC/<v>/lib/<arch>/` - the toolset's own CRT/STL import libraries;
+	  * `Windows Kits/10/Lib/<v>/{ucrt,um}/<arch>/` - the SDK's;
+	  * `<prefix>/bin/<arch>/cl`, the wrapper that runs it through Wine, and whether that
+	    directory is on PATH.
+
+	The halves are independent in practice, and that is the whole point of this function: on
+	this machine (v141, measured 2026-11-07) the SDK payload ships `ucrt/x86` and `um/x86`
+	libraries, while the toolset has `Hostx64/x64` only and no `lib/x86`. A probe that looks at
+	x64 paths alone - which is what `msvc_sdk` did until X86-0 - calls that toolchain complete.
+	"""
+	if prefix is None:
+		prefix, _ = msvc_prefix()
+	if prefix is None:
+		return {}
+	arches = list(MSVC_TARGET_ARCHES)
+	for other in _present_arches(prefix):
+		if other not in arches:
+			arches.append(other)
+	out: dict[str, dict] = {}
+	for arch in arches:
+		entry = {"arch": arch, "prefix": str(prefix), "compilers": [], "crt": _arch_crt(prefix, arch),
+			"sdk": _arch_sdk(prefix, arch), "wrapper": None, "on_path": False}
+		for toolset in toolset_dirs(prefix):
+			binroot = toolset / "bin"
+			if not binroot.is_dir():
+				continue
+			for host in sorted(p for p in binroot.iterdir() if p.is_dir()):
+				if not host.name.lower().startswith("host"):
+					continue		# `bin/` also holds the native-helper directories
+				cl = host / arch / "cl.exe"
+				if cl.is_file():
+					entry["compilers"].append({"path": str(cl), "host": host.name,
+						"toolset": toolset.name})
+		for wrapper in (prefix / "bin" / arch / "cl", prefix / "bin" / arch / "cl.exe"):
+			if wrapper.is_file():
+				entry["wrapper"] = str(wrapper)
+				break
+		entry["can_build"] = bool(entry["compilers"]) and not entry["crt"]["missing"] \
+			and not entry["sdk"]["missing"]
+		entry["on_path"] = _on_path(arch)
+		entry["summary"], entry["detail"], entry["fix"] = _arch_sentence(prefix, entry, out.get("x64"))
+		out[arch] = entry
+	return out
+
+
+def _present_arches(prefix: Path) -> list[str]:
+	"""Target arches this prefix can *compile for*, beyond the two asked about.
+
+	Deliberately the toolset's own directories only: a Windows SDK ships import libraries for
+	every arch Microsoft sells, so counting those would list arm/arm64 on every machine and say
+	nothing.
+	"""
+	found = set()
+	for toolset in toolset_dirs(prefix):
+		binroot = toolset / "bin"
+		if binroot.is_dir():
+			for host in binroot.iterdir():
+				if host.name.lower().startswith("host") and host.is_dir():
+					found |= {p.name for p in host.iterdir()
+						if (p / "cl.exe").is_file()}
+		lib = toolset / "lib"
+		if lib.is_dir():
+			found |= {p.name for p in lib.iterdir() if p.name.lower() != "onecore" and p.is_dir()}
+	return sorted(found)
+
+
+def arch_on_path() -> str | None:
+	"""Which target arch the `cl` on PATH would produce, or None when there is no `cl` there.
+
+	Judged by the wrapper directory, because that is what carries the bitness: an msvc-wine
+	install is `<prefix>/bin/<arch>/cl`, and the target arch is the directory the real `cl.exe`
+	lives in (`Hostx64/x86`), never a flag (Docs/Setup.md §6.2). A driver reached through a
+	symlink resolves out of its real directory, which is why this resolves first.
+	"""
+	cl = shutil.which("cl")
+	if cl is None:
+		return None
+	resolved = Path(cl).resolve()
+	if resolved.parent.parent.name.lower() != "bin":
+		return None
+	return resolved.parent.name.lower()
+
+
+def _on_path(arch: str) -> bool:
+	"""Is a driver for this target arch reachable through PATH?"""
+	return arch_on_path() == arch
+
+
+def _arch_sentence(prefix: Path, entry: dict, x64: dict | None) -> tuple[str, str, str]:
+	"""The one line a human needs about one target arch, and the command that would change it.
+
+	Paths inside the prefix are printed relative to it: `decomp check` names the prefix in the
+	line above, and the parts that matter here are `bin/Hostx64/x86` versus `bin/Hostx64/x64`
+	and `lib/x86` versus `lib/x64`, which a shared absolute prefix only buries.
+	"""
+	arch = entry["arch"]
+
+	def shown(path):
+		return os.path.relpath(path, prefix) if str(path).startswith(str(prefix) + os.sep) else str(path)
+
+	hosts = sorted({c["host"] for c in entry["compilers"]})
+	parts = []
+	if entry["compilers"]:
+		parts.append("cl for %s targets: %s (host %s, toolset %s)" % (arch,
+			shown(entry["compilers"][0]["path"]), "/".join(hosts),
+			", ".join(sorted({c["toolset"] for c in entry["compilers"]}))))
+	elif arch == "x86" and x64 and x64["compilers"]:
+		parts.append("x64 only: no 32-bit target from this toolchain - it has %s, not a Host*/x86"
+			% "/".join(sorted({os.path.dirname(shown(c["path"])) for c in x64["compilers"]})))
+	else:
+		parts.append("no cl.exe for %s targets under %s" % (arch, " or ".join(
+			str(t / "bin") for t in toolset_dirs(prefix)) or str(prefix)))
+	parts.append("toolset CRT libraries for %s: %s" % (arch, entry["crt"]["detail"]))
+	parts.append("Windows SDK libraries for %s: %s" % (arch, entry["sdk"]["detail"]))
+	if entry["wrapper"]:
+		parts.append("wrapper %s%s" % (shown(entry["wrapper"]),
+			" (on PATH)" if entry["on_path"] else " (not on PATH)"))
+	else:
+		parts.append("no wrapper at %s/bin/%s/cl - re-run toolchains/msvc-wine/install.sh for this prefix"
+			% (prefix, arch))
+	wrapper_dir = os.path.join(str(prefix), "bin", arch)
+	if entry["can_build"] and not entry["on_path"] and entry["wrapper"]:
+		fix = ("put %s on PATH - the target arch is the wrapper directory, not a flag "
+			"(Docs/Setup.md §6.2)" % wrapper_dir)
+	elif entry["can_build"] and not entry["on_path"]:
+		fix = ("this prefix has the toolset and the libraries for %s but no wrapper: re-run "
+			"sh toolchains/msvc-wine/install.sh %s, which generates %s/cl" % (arch, prefix, wrapper_dir))
+	elif entry["compilers"]:
+		fix = ("the toolset has this target but not everything it needs: fetch the missing "
+			"packages named above (the toolset CRT libraries are a Microsoft.VisualC.…CRT.<arch>… "
+			"payload, the SDK ones are a Windows SDK payload) and re-run "
+			"sh toolchains/msvc-wine/install.sh %s" % prefix)
+	elif arch == "x86":
+		fix = ("add the 32-bit target of this toolset: re-run the install for it with "
+			"`--architecture x86 x64 --host-arch x64` (Docs/Setup.md §6.3), then re-run "
+			"sh toolchains/msvc-wine/install.sh %s, which generates %s/cl. A 32-bit target needs no "
+			"32-bit Wine - an x64-host cl emits i386 code; only *running* a 32-bit PE does "
+			"(Docs/Setup.md §6.7)" % (prefix, wrapper_dir))
+	else:
+		fix = "install a toolset that targets %s (Docs/Setup.md §6)" % arch
+	return ("can build %s candidates" % arch if entry["can_build"]
+		else "cannot build %s candidates" % arch), "; ".join(parts), fix
+
+
+def arch_bitness(value) -> str | None:
+	"""Which target *bitness* a variant's `arch` asks for, or None when it asks for something else.
+
+	`arch` in a [variants.*] table is doing two jobs today (Docs/MSVC-x86-Plan.md §4.2): it names
+	a bitness (`"x86"`, `"x86-64"`), and for `cl` it can name an ISA level that `build_flags`
+	turns into `/arch:AVX2`, which is not a bitness at all. Empty means "whatever the driver
+	defaults to", which is the bitness of whichever driver gets chosen - so neither of those has
+	an answer here, and neither is contradicted by this check.
+	"""
+	text = str(value or "").strip().lower()
+	if text in ("x86", "i386", "i486", "ia32", "32"):
+		return "x86"
+	if text in ("x86-64", "x64", "amd64", "64"):
+		return "x64"
+	return None
+
+
+def gcc_multilib(compiler: str, arch: str) -> tuple[bool, str]:
+	"""Can this GCC-family driver really emit this target arch? Asked, not assumed.
+
+	For GCC, `arch = "x86"` is a `-m32` flag, and the flag is only half of it: without the 32-bit
+	multilib the driver fails on headers or `crt1.o`. One empty translation unit decides it in
+	~0.1 s, which is cheap enough to ask on every `decomp check`.
+	"""
+	flag = {"x86": "-m32", "x64": "-m64"}.get(arch)
+	if flag is None or not shutil.which(compiler):
+		return True, "not asked"
+	try:
+		with tempfile.TemporaryDirectory(prefix="decomp-multilib-") as directory:
+			proc = subprocess.run([compiler, flag, "-x", "c", "-c", "-o",
+				str(Path(directory) / "probe.o"), "-"], input="", capture_output=True,
+				text=True, timeout=120)
+	except (OSError, subprocess.SubprocessError) as exc:
+		return False, "%s could not be run (%s)" % (compiler, exc)
+	if proc.returncode == 0:
+		return True, "%s accepts %s" % (compiler, flag)
+	detail = " ".join((proc.stderr or proc.stdout or "").split())[:200]
+	return False, "%s does not have a %s multilib: %s" % (compiler, arch, detail)
+
+
+def variant_arch_gap(variant: dict) -> str:
+	"""Why this variant's `arch` cannot be served by the toolchains here, or "" for nothing to say.
+
+	This is the same principle as `build_agreement` (byte-cleanup-plan Phase 7): name the gap
+	before any bytes are spent. A 32-bit request that reaches a compiler learns the gap as an
+	environment error or, worse, as a 64-bit object refused afterwards; here it is a sentence
+	about which half is missing - no such driver, or the wrong one installed (the operator's
+	question in Docs/MSVC-x86-Plan.md §1).
+	"""
+	arch = arch_bitness(variant.get("arch"))
+	if arch is None:
+		return ""
+	if toolchain.msvc(variant.get("compiler", "g++")):
+		targets = msvc_target_arches()
+		if not targets:
+			return ('its arch = "%s" needs an MSVC toolchain with that target, and this machine has '
+				"none - no cl on PATH and nothing under toolchains/ (Docs/Setup.md §6)" % arch)
+		prefix = Path(next(iter(targets.values()))["prefix"])
+		entry = targets.get(arch)
+		if entry is None:
+			return 'its arch = "%s" is not a target this toolchain knows anything about' % arch
+		if entry["can_build"] and entry["on_path"]:
+			return ""
+		if entry["can_build"]:
+			other = arch_on_path()
+			return ('its arch = "%s" is buildable here but not reachable: the driver for it is %s, '
+				"and that wrapper directory is not on PATH%s" % (arch, entry["wrapper"] or "unwrapped",
+					"; the cl on PATH is the %s target" % other if other and other != arch else ""))
+		return ('its arch = "%s" %s (toolchain at %s): %s' % (arch,
+			"is only half installed" if entry["compilers"] else "cannot be built here", prefix,
+			entry["detail"]))
+	ok, detail = gcc_multilib(str(variant.get("compiler", "g++")), arch)
+	return "" if ok else ("its arch = \"%s\" asks for that target and the compiler cannot do it: %s"
+		% (arch, detail))
+
+
+def msvc_arch_report(report: "Report", prefix: Path | None) -> None:
+	"""Print the per-target-arch table (Docs/MSVC-x86-Plan.md X86-0).
+
+	Nothing here is a failure on its own: a toolchain that can only do x64 is a fact, not a
+	fault, and a variant that asks for x86 is reported against it by `check_all`. Warn rather
+	than fail so that `decomp check` stays a report of the machine.
+	"""
+	if prefix is None:
+		return
+	targets = msvc_target_arches(prefix)
+	for arch in MSVC_TARGET_ARCHES:
+		entry = targets.get(arch)
+		if entry is None:
+			continue
+		report.add("msvc target %s" % arch, entry["can_build"], "%s - %s" % (entry["summary"], entry["detail"]),
+			entry["fix"], fatal=False)
+	extra = [a for a in targets if a not in MSVC_TARGET_ARCHES]
+	if extra:
+		report.add("msvc other targets", True,
+			"this prefix also has %s; nothing in this tool builds for them" % ", ".join(sorted(extra)),
+			fatal=False)
+
+
 def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> None:
 	"""Add the MSVC toolchain items.
 
@@ -385,12 +823,22 @@ def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> 
 	"""
 	tools = msvc_tools()
 	asked = any(toolchain.msvc(name) for name in variant_compilers)
-	if not asked and not tools["cl"].found:
+	prefix, why = msvc_prefix(tools["cl"].path)
+	if not asked and not tools["cl"].found and prefix is None:
 		return
 	fix = ("install a toolset of the target's era with msvc-wine into toolchains/msvc and put "
 		"its bin/<arch> on PATH (Docs/Setup.md §6, Docs/MSVC-Plan.md §5)")
 	cl = tools["cl"]
 	if not cl.found:
+		if prefix is not None:
+			# A different gap, and a much cheaper one: the toolchain is here, its wrappers are
+			# not on PATH. Say which PATH line fixes it, then still print what it can target.
+			report.add("msvc toolchain", False, "no `cl` on PATH, but %s is installed - a PE target "
+				"cannot be matched until its wrapper directory is reachable" % prefix,
+				"PATH=%s/bin/<arch>:$PATH (Docs/Setup.md §6.3); this toolchain's targets are listed below"
+				% prefix, fatal=fatal)
+			msvc_arch_report(report, prefix)
+			return
 		report.add("msvc toolchain", False, "no `cl` on PATH - a PE target cannot be matched by a candidate",
 			fix, fatal=fatal)
 		return
@@ -419,7 +867,8 @@ def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> 
 	undname = tools["undname"]
 	if undname.found and undname.vendor == "msvc":
 		report.add("msvc undname", True, undname.describe() + " (display only - decorated names stay the key)")
-	sdk = msvc_sdk()
+	msvc_arch_report(report, prefix)
+	sdk = msvc_sdk(cl.path)
 	report.add("windows sdk", bool(sdk.get("complete")),
 		"%s%s (%s)" % (sdk.get("root"), "" if not sdk.get("version") else " SDK " + sdk["version"],
 				 sdk.get("detail")),
@@ -428,14 +877,20 @@ def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> 
 		fatal=fatal)
 
 
-def msvc_sdk(cl_path: str | None = None) -> dict:
-	"""The Windows SDK that goes with an msvc-wine style toolchain prefix.
+def msvc_sdk(cl_path: str | None = None, arch: str = "x64") -> dict:
+	"""The Windows SDK that goes with an msvc-wine style toolchain prefix, for one target arch.
 
 	`cl` finds its headers through the wrapper's environment, so the honest question is not
 	"is there a directory" but "is there a C runtime and a Win32 import library to link
-	against": `<version>/um/windows.h`, `<version>/ucrt/x64/libucrt.lib` and
-	`<version>/um/x64/kernel32.lib`. A toolchain prefix with an empty placeholder (which is
+	against": `<version>/um/windows.h`, `<version>/ucrt/<arch>/libucrt.lib` and
+	`<version>/um/<arch>/kernel32.lib`. A toolchain prefix with an empty placeholder (which is
 	what a machine that cannot extract the SDK payload MSIs ends up with) answers no.
+
+	`arch` is a parameter because these libraries are per target arch, and hardcoding x64 is the
+	reporting bug X86-0 exists to fix: it let `decomp check` call an SDK complete while saying
+	nothing about a 32-bit target. Measured here (v141 + SDK 10.0.19041, 2026-11-07): the SDK
+	half of the 32-bit gap is *already* satisfied - `ucrt/x86/libucrt.lib` and `um/x86/kernel32.lib`
+	are both present - so a missing 32-bit build is the toolset's, not the SDK's.
 
 	Measured on SDK 10.0.19041 as served by the VS2017 channel: `um/windows.h` and
 	`kernel32.lib` are NOT in the payload MSIs named "Windows SDK Desktop Headers/Libs x64"
@@ -444,34 +899,34 @@ def msvc_sdk(cl_path: str | None = None) -> dict:
 	same Windows Kits trees. `oldnames.lib`, which an earlier version of this probe asked for,
 	is a VC toolset library and is not in the SDK at all (Docs/Setup.md §6.11).
 	"""
-	path = cl_path or shutil.which("cl")
-	out = {"root": None, "version": None, "detail": "no cl on PATH - cannot locate a toolchain prefix"}
-	if not path:
-		return out
-	resolved = Path(path).resolve()
-	# An msvc-wine wrapper is <prefix>/bin/<arch>/cl, so the prefix is an ancestor.
-	root = next((p for p in resolved.parents
-		if (p / "Windows Kits").is_dir() or (p / "VC").is_dir()), None)
+	out = {"arch": arch, "root": None, "version": None,
+		"detail": "no cl on PATH and no installed toolchain - cannot locate a toolchain prefix"}
+	root, why = msvc_prefix(cl_path)
 	if root is None:
-		out["detail"] = "no Windows Kits directory above %s" % resolved
+		out["detail"] = why
 		return out
 	out["root"] = str(root)
-	kits = root / "Windows Kits" / "10"
-	include_versions = sorted(p.name for p in (kits / "Include").glob("10.*")) if (kits / "Include").is_dir() else []
-	if not include_versions:
-		out["detail"] = "Windows Kits/10 has no Include/10.* - the SDK payload MSIs were never extracted"
+	probe = _arch_sdk(root, arch)
+	out["version"] = probe.get("version")
+	if not probe.get("present") and not probe.get("missing"):
 		out["complete"] = False
+		out["detail"] = probe.get("detail", "the SDK of this prefix cannot be read")
 		return out
-	version = include_versions[-1]
-	include, libs = kits / "Include" / version, kits / "Lib" / version
-	wanted = [str(include / "um/windows.h"), str(libs / "ucrt/x64/libucrt.lib"),
-		str(libs / "um/x64/kernel32.lib")]
-	missing = [w for w in wanted if not Path(w).is_file()]
-	out["version"] = version
-	out["complete"] = not missing
-	out["detail"] = ("ucrt/um libraries present" if not missing
-		else "headers for %s are there but %s are not - this is a placeholder, not a usable SDK"
-		% (version, ", ".join(Path(m).name for m in missing)))
+	include = _kits_dir(root)
+	headertests = []
+	if include is not None and out["version"]:
+		for spelling in ("Include", "include"):
+			candidate = include / spelling / out["version"] / "um/windows.h"
+			if candidate.is_file():
+				headertests.append(candidate)
+				break
+	no_headers = not headertests
+	missing = [Path(p).name for p in probe["missing"]]
+	out["complete"] = not missing and not no_headers
+	out["detail"] = ("ucrt/um libraries for %s present" % arch if out["complete"] else
+		("headers for %s are there but %s are not - this is a placeholder, not a usable SDK"
+			% (out["version"], ", ".join(missing)) if missing else
+			"the ucrt/um libraries for %s are there but %s/um/windows.h is not" % (arch, out["version"])))
 	return out
 
 

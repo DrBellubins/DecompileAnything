@@ -268,6 +268,33 @@ the count from each source and falls back to symbol spacing for the extents it c
 * **`/link` comes last.** `/Fe:` and the objects precede it; an object after `/link` is
   `cl : Command line error D8003 : missing source filename`.
 
+## Which target bitness the installed MSVC toolchain can build (MSVC-x86 X86-0)
+
+```sh
+.venv/bin/python Tests/tools/check_msvc_x86_toolchain.py   # exit 0 = the report matches the tree
+```
+
+No compiler runs here, and nothing is built: this is the report check that [MSVC-x86-Plan.md](../Docs/MSVC-x86-Plan.md)
+X86-0 asked for, and it is meant to pass **both before and after X86-1**. For each target arch in
+`x64 x86` it measures the tree itself - `VC/Tools/MSVC/<v>/bin/Host*/<arch>/cl.exe`, the toolset's
+`lib/<arch>` CRT import libraries, the SDK's `Lib/<ver>/{ucrt,um}/<arch>`, the `<prefix>/bin/<arch>/cl`
+wrapper - and asserts that what `decomp check` prints agrees with it, that `can_build` is only true
+when the first three all hold, and that `on_path` is judged by the wrapper directory. It also asserts
+the two things the operator asked for directly: an x64-only toolchain is called x64-only and comes
+with the install command that would add the 32-bit target, and a `[variants.*] arch = "x86"` MSVC
+variant is named **before any work starts** (`arch <name>`, a warning, naming which half is missing
+and which is present) while `arch = "AVX2"` - an ISA level, not a bitness - is not contradicted. A
+GCC `arch = "x86"` variant is named only when `g++ -m32` really fails. Exit 2 means there is no
+MSVC toolchain here to judge.
+
+Measured 2026-11-07, on the v141 tree this machine has (`toolchains/msvc`, `Hostx64/x64`, `lib/x64`,
+SDK x86 import libraries present, `lib/x86` absent): 38 checks, exit 0, run twice - once with a
+default shell (`cl` off PATH) and once with the documented `PATH=$PWD/toolchains/msvc/bin/x64`.
+Both report `msvc target x64 ok`, `msvc target x86 warn - x64 only: no 32-bit target from this
+toolchain`. `check_msvc_toolchain.py` and `check_msvc_detect.py` still exit 0; `check_coff_candidate.py`
+exits 1 the same way it did before this change (19 units land at `structural` at 100% bytes - see
+the MS-3 section), which was verified by running it with `decomp/check.py` stashed.
+
 ## Scoring a COFF candidate against a PE target (MS-3)
 
 With the benchmark built (`msvc-o0`) and analysed once, the whole loop runs on a PE:
@@ -520,6 +547,15 @@ which is the half that matters: the tool does not raise a toolchain gap where th
   addressing forms only. A real `msvc-*` variant of this benchmark (PE/COFF, `cl`, an answer key
   from `.pdata` and `link /MAP` instead of `nm --print-size`) has been in and passing since MS-2;
   `try` against a COFF candidate is MS-3 of [../Docs/MSVC-Plan.md](../Docs/MSVC-Plan.md).
+* **There is no 32-bit MSVC target installed here** (stated outright since
+  [../Docs/MSVC-x86-Plan.md](../Docs/MSVC-x86-Plan.md) X86-0, which is also what added the reporting).
+  The v141 toolchain under `toolchains/msvc` has `bin/Hostx64/x64` and `lib/x64` only - the Windows
+  SDK's x86 import libraries are installed, the toolset's 32-bit half is not - so `arch = "x86"` with
+  `compiler = "cl"` cannot be built, and `decomp check` now says so per arch (`msvc target x64` /
+  `msvc target x86`) and per variant (`arch <name>`) before any work starts. Two consequences for
+  how any future 32-bit MSVC number is read: a 32-bit PE has no `.pdata`, so there is no
+  compiler-authored answer key (symbol spacing or `link /MAP` instead), and its numbers belong next
+  to the `-m32` row, never next to `msvc-o0`'s.
 * **Goldens are per-variant, not portable.** `crosscheck` treats a same-arch difference as
   a bug (there are none) and x87-vs-SSE float differences as expected: `-m32` computes
   `SineApprox` and `InitVehicleDescriptor`'s grip in float registers with different
