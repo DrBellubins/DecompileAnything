@@ -709,7 +709,56 @@ Until then: keep the shape the operands prove (widened comparison, two return po
 `lea`), accept the `structural`-or-worse tier on units like this, and do not treat the placeholder
 count as a ceiling.
 
-## 28. 293 of this image's bodies open with an EH4 frame, and its second operand is a compiler-generated thunk (2026-11-08) #x86-32 #eh #slot
+## 30. A 32-bit call to `free()` can point at an 11-byte forwarder, and the analysis gives that no name — fixed at read time (2026-11-08) #x86-32 #thunk #naming
+
+Symptom, from reading a unit that had nothing else wrong with it. `0x4384d0` (11 bytes) is
+`movl 8(%ecx),%eax / pushl %eax / calll 0x4afc55 / popl %ecx / retl`, and `0x4afc55` is:
+
+```
+8b ff            movl %edi,%edi
+55               pushl %ebp
+8b ec            movl %esp,%ebp
+5d               popl  %ebp
+e9 56 f5 ff ff   jmpl  0x4af1b0        ; which the analysis names `_free`
+```
+
+So the source says `free(p)`. The analysis leaves `0x4afc55` as a body of its own, unnamed
+(`FUN_004afc55`, `kind=function`), and `functions.thunk_target` is empty for it — so the call reads
+as a call to an anonymous helper, a candidate's `call _free` cannot pair with it, and the unit cannot
+reach `exact` no matter what the source says. **107 bodies call that one forwarder**; 129 units call
+one of the nine bodies of this shape in the image.
+
+Three forms exist, and only one kind is a problem:
+
+* `e9 rel32` alone (5 bodies): the analysis *does* classify these (`kind=thunk`, named
+  `thunk_FUN_…`), and they are 2–4-caller oddities. No change needed.
+* `ff 25 <abs>` through a pointer slot (5 bodies): also already named — `CharToOemA`, `OemToCharA`,
+  `CharLowerW`, `RtlUnwind`, `GetCurrentProcessId`. §20's import-table reading covers these.
+* `8b ff 55 8b ec 5d e9 rel32` (4 bodies): **not** classified, **not** named. These are the ones that
+  cost matches: `_free` (107 callers), `_atol` (6), `_clearerr_s` (1), and one to an unnamed body.
+
+Fix (`decomp/extract.py`, `_forwarded_call`, called from `original_bindings.build`): when a referenced
+body is *nothing but* an unconditional jump — optionally behind the six-byte `mov edi,edi /
+push ebp / mov esp,ebp / pop ebp` no-op — follow it and take the destination's name, kind and size.
+At read time, so no re-analysis and the existing cache is enough; the file's own bytes answer it.
+
+Deliberately **not** followed: a body that adjusts `this` before jumping
+(`movl -0x10(%ebp),%ecx / addl $8,%ecx / jmp <destructor>`, ~540 bodies whose last instruction is a
+jump). Those are constructor and destructor thunks — a real unit with its own address, which is what
+a source-level call really targets, and the immediate in it is a *member offset*, i.e. layout
+evidence. Jumping through one would invent a callee the source does not name and throw that evidence
+away. Making those pair is the phase-6 question of "can the tool reproduce a compiler-generated
+thunk", not a naming gap.
+
+Verified on the unit above, with the fix: the report line reads
+`SYM12 original: _free  candidate: _free  ok (name)` and the unit is **`exact` PASS**
+(`AutoBuffer::~AutoBuffer`, 11 vs 11 bytes). Before the fix the same source reached `structural` at
+80 % with that one reference unpaired. (The 80 % run also caught a mistake of mine rather than the
+tool's: I had the class's heap member at `+4`; the bytes say `8(%ecx)`, so the layout needs a member
+or gap at `+0x04` — §24's rule that an operand's offset is the layout evidence, in miniature.)
+
+
+## 31. 293 of this image's bodies open with an EH4 frame, and its second operand is a compiler-generated thunk (2026-11-08) #x86-32 #eh #slot
 
 While reading 0x401a70 (104 bytes, 94 callers - a member that hands two heap fields back to the
 allocator) I found that its first two instructions are not a prologue I can write:
@@ -780,7 +829,7 @@ first 11 instructions are a frame should probably be reported as "frame not mode
 counting ten missing and ten extra instructions, which is what makes an EH4 unit read as a wrong
 decompilation when only the frame's bookkeeping differs.
 
-## 29. CRT code inlined from a header looks exactly like a program function, and it is the busiest unit in the image (2026-11-08) #x86-32 #crt
+## 32. CRT code inlined from a header looks exactly like a program function, and it is the busiest unit in the image (2026-11-08) #x86-32 #crt
 
 0x4a5f50 is 27 bytes with **129 callers**, which makes it rank 5th in `tools/march_winrar.jsonl` - the
 importance order built from the call graph. It is not the program's code. Reading the bytes:
@@ -818,3 +867,28 @@ Two things for the tool:
 * It is also a reminder that "129 callers" is a statement about the *program's* use of formatted
   printing, which is useful context for the report even when the unit is not the program's source:
   this is where WinRAR's format strings go.
+
+## 33. Two ways to read the wrong table without an error: the cache's id/address keys, and a map built for another image (2026-11-08) #tool #analysis-cache
+
+Both of these produced confident, wrong statements in this project's notes, and neither one fails
+loudly:
+
+* **`refs.fn` is a `functions.id`; `refs.to_address` and `functions.entry` are addresses.** Joining
+  them without translating gives an empty result, which reads as "no unit calls this". One survey of
+  which functions call the `_free` forwarder printed `0`, and then `0` again, until the id→entry map
+  was applied; the answer was 129 units (§30). `cache.refs()`, `xref.py` and `map.py` all translate;
+  hand-written queries have to.
+* **`tools/map.py` output is keyed to one image.** `map.jsonl` in `Tests/Proprietary/wrar411-recovered/`
+  was built from the SFX stub (`4.1.1_wrar411.exe`, 460 functions, entry `0x40a33a`). Sorting it by
+  fan-in and reading the first rows gave a "next functions by importance" list whose addresses do not
+  exist in `Tests/Proprietary/wrar411/WinRAR.exe` (2,724 functions, entry `0x4b3f66`) — the numbers
+  were plausible, the units were not the target's. `map_winrar.jsonl` is the real one, and `disasm.py`
+  or `map.py` both say `0x… is not a function entry` when a stale map is being quoted. Rule: rebuild
+  the map whenever the analysed file changes, and print the analysis key next to any order derived
+  from one.
+
+The reachability half of that map is worth recording too, because it bounds "what matters": of the
+2,724 bodies, **1,662 (507,396 bytes) are reachable along call edges from the entry point and 1,062
+are not** — the program is callback- and vtable-driven, so a call-graph order under-rates the parts
+reached only through a function pointer (`map.py`'s docstring measures the six such edges in the
+smaller image, one of which is the dialog procedure passed to `DialogBoxParamW`).

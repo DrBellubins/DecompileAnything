@@ -908,6 +908,41 @@ def _unit_size(conn: sqlite3.Connection, image, entry: int) -> int | None:
 	return None
 
 
+def _forwarded_call(conn: sqlite3.Connection, image, row) -> sqlite3.Row | None:
+	"""The body a forwarding body jumps to, if this one is nothing but a jump.
+
+	MSVC puts calls to some of its own helpers behind a small forwarding body: `jmp rel32`, sometimes
+	behind a `mov edi,edi / push ebp / mov esp,ebp / pop ebp` no-op, or `jmp *[abs]` through a
+	pointer. The analysis on i386 leaves such a body as a function of its own with no name, so a call
+	that is `free()` in the source reads as a call to an unnamed 11-byte body, and a candidate's
+	`call _free` can never pair with it (Docs/x86-32bit-issues.md §30). The jump's own bytes say
+	where it goes, which the file answers without re-analysing anything.
+
+	Only a body that is *nothing but* the jump is followed. A body that adjusts `this` first
+	(`movl -0x10(%ebp),%ecx / addl $8,%ecx / jmp <dtor>`) is a constructor or destructor thunk: a
+	unit with its own address, and the thing a source-level call really targets. Jumping through that
+	would invent a callee the source never names, and lose the member offset the thunk records.
+	"""
+	if row is None:
+		return None
+	body = row["bytes"] if "bytes" in row.keys() else None
+	entry = int(row["entry"])
+	if not body and image is not None:
+		body = image.read(entry, 16)
+	if not body:
+		return None
+	for prefix in (b"", b"\x8b\xff\x55\x8b\xec\x5d"):
+		fill = len(prefix)
+		if len(body) != fill + 5 or not body.startswith(prefix) or body[fill] != 0xE9:
+			continue          # a real body that happens to begin with a jump is not a forwarder
+		offset = int.from_bytes(body[fill + 1:fill + 5], "little", signed=True)
+		landed = entry + fill + 5 + offset
+		target = conn.execute("SELECT id, entry, name, size, kind, bytes FROM functions"
+			" WHERE entry=?", (landed,)).fetchone()
+		return target if target is not None and int(target["entry"]) != entry else None
+	return None
+
+
 def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 	image: TargetImage | None = None, structures=None) -> tuple[callable, list[Ref]]:
 	"""A `bind(instruction)` for the tokeniser, built from the resolved references.
@@ -968,10 +1003,23 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		if kind == "address":
 			name = ""
 		function = functions.get(to_address)
+		forwarded = _forwarded_call(conn, image, function)
+		if forwarded is not None:
+			# The call in the source is to what the forwarder jumps to, and the file says so; the
+			# forwarder's own body stays visible as the address the instruction encodes.
+			to_address = int(forwarded["entry"])
+			function = forwarded
+			if to_address not in functions:
+				functions[to_address] = forwarded
+			kind = "function"
 		ref = Ref(kind=kind, raw=item["to_name"] or "", name=name, address=to_address,
 			section=item["section"] or "")
 		describe_object(ref)
 		if function is not None:
+			if forwarded is not None:
+				name = clean_symbol(function["name"] or "")
+				ref.name = name
+				ref.kind = "function"
 			# a body's bytes are not comparable (in a `.o` the references inside it are
 			# still placeholders), but its size is, and that is what catches "same shape,
 			# different helper" - so it has to be the size the compiler said, from the file's
