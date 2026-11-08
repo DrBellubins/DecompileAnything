@@ -6,12 +6,14 @@ Read this only when editing the tool, the test binary or the benchmark, not when
 
 ```sh
 python3 eval.py build --variants gcc-o0,gcc-o2,gcc-o0-x86   # once per session
+python3 eval.py build --variants msvc-o0,msvc-o2,msvc-o0-x86  # MSVC variants (needs the toolchain; x86 needs bin/x86)
 python3 eval.py units                                       # what is in the binary
 python3 eval.py self                                        # recompile the untouched original and score it
 python3 eval.py selfcheck                                   # must print "0 failures"
 python3 eval.py crosscheck                                  # must show no same-arch differences
 ```
 
+- A 32-bit MSVC build is built with the `bin/x86` driver, but *running* it (goldens, `selfcheck`) needs wibo or a Wine with an i386 guest. `decomp check` shows this as `run 32-bit PE`; a build with no way to run it is a fact about the machine, not a failure of the build.
 - After any edit to `TestBinary`: `eval.py build`, then `selfcheck` (0 failures), then `crosscheck` (no same-arch differences).
 - The 89 hand-checked expectations are the ground truth. If a `Want*` disagrees with the code, work out which one is wrong; do not edit the expectation to match the run.
 - Before blaming a candidate or the tool, run `eval.py self`. It is the ceiling: 99.5% at gcc-o0 and 98.3% at gcc-o2 on the reference machine. A unit scoring far below the ceiling for every candidate is a harness or fixture problem.
