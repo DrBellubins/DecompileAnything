@@ -1,6 +1,6 @@
 ---
 name: decompileanything
-description: Turn compiled software into human-readable source that is byte-matched to the original. Given a request like "decompile the input system in this game binary" or "decompile the malicious file access in this binary", find the code that implements it, recover it function by function as clean C/C++ that recompiles to the same bytes (scored by the `decomp` CLI, which combines Ghidra analysis with compile-and-diff), keep iterating until each function reaches the project's match threshold (98%, 70%, whatever the project sets), and deliver a small codebase plus an honest match report. Also covers fast reverse engineering when the user only wants to understand a target: Electron/JS bundles, Mach-O/ELF/PE, Go/Rust/.NET/Flutter/WASM, APKs, SQLite, pcaps, firmware, websites. Use for any request to decompile, reverse, inspect, match, recreate or explain behaviour in a binary, bundle or app, even if no tool is named and even if the user describes a feature rather than naming functions.
+description: 'Turn compiled software into human-readable source that is byte-matched to the original. Given a request like "decompile the input system in this game binary" or "decompile the malicious file access in this binary", find the code that implements it, recover it function by function as clean C/C++ that recompiles to the same bytes (scored by the `decomp` CLI, which combines Ghidra analysis with compile-and-diff), keep iterating until each function reaches the project''s match threshold (98%, 70%, whatever the project sets), and deliver a small codebase plus an honest match report. Also covers fast reverse engineering when the user only wants to understand a target: Electron/JS bundles, Mach-O/ELF/PE, Go/Rust/.NET/Flutter/WASM, APKs, SQLite, pcaps, firmware, websites. Use for any request to decompile, reverse, inspect, match, recreate or explain behaviour in a binary, bundle or app, even if no tool is named and even if the user describes a feature rather than naming functions.'
 ---
 
 # Decompiling binaries into matching, readable source
@@ -26,6 +26,7 @@ Pure "how does X work?" questions do not need all of this. Pick the mode first.
 |---|---|---|
 | source for a feature or functions that compiles back to the same bytes | **Match** (the default for "decompile ...") | The five steps below |
 | to know what it is, how a feature works, what versions or dependencies it has, what changed between builds, or to rebuild a feature | **Understand** | Rules, then Understand mode |
+| the whole program ("decompile everything", "full decompilation of this binary") | **Whole-binary** | The five steps, but ordered by *Whole-binary mode* below, not by Step 2's feature scoping |
 
 Match jobs begin with a short Understand pass (inventory, strings, imports) to find the right functions. Understand mode is also the right tool for targets that are not native compiled code (JS bundles, .NET, APKs), where byte-matching does not apply.
 
@@ -71,6 +72,7 @@ decomp analyze <bin> --variant <name> -C project.toml   # runs Ghidra once (~10 
 - For a **statically linked** target, narrow the sample with `--range 0xLO-0xHI` over the program's own code, otherwise the answer is mostly libc's flags (the tool warns when this happens).
 - Re-running `analyze` on the same bytes is a no-op; `--force` rebuilds. Rebuild an older cache to get new tables.
 - With several targets cached, pass `--bin <file>` or `--key <key>` (see `decomp status`).
+- **Pass `-v <variant>` on every `try`, `ledger` and `link`.** They default to the variant `analyze` recorded. If that was a placeholder (for example `gcc-o0` on a PE), an un-flagged `try` silently builds with the wrong compiler, compares an ELF object to a PE, can never pass, and never writes to the ledger. Check `decomp status` for the recorded variant; if it is wrong, `analyze --force -v <right variant>`. `decomp ledger` prints the variant it is showing, and other variants' pair counts, so a ledger that looks empty may just be the wrong variant.
 
 ## Step 2: Scope the request into a function list
 
@@ -107,7 +109,7 @@ In a stripped binary there are no names: start from a string or an address and l
 
 - **Include** the code that implements the behaviour: its entry points, its helpers, and the classes it uses.
 - **Exclude and name** library code, CRT, compiler thunks and anything the feature merely calls (for example `memcpy`). List them as excluded so the user can see the boundary.
-- If the scope is large (roughly 30+ functions) or the boundary is a judgment call, say so, show the list, and propose a priority order (entry points and the most characteristic functions first) instead of silently truncating or silently expanding.
+- If the scope is large (roughly 30+ functions) or the boundary is a judgment call, say so, show the list, and propose a priority order (entry points and the most characteristic functions first) instead of silently truncating or silently expanding. That priority order is for what you *show the user*. It is not the recovery order: recovery is always leaves-first (Step 3). Never work entry-point-outward, because every caller then has unreproduced callees and cannot reach `semantic`. For a whole program, use *Whole-binary mode* instead of this step.
 - Ask the user a question only when the request cannot be mapped to any foothold.
 
 ## Step 3: Recover each function
@@ -123,7 +125,7 @@ In a stripped binary there are no names: start from a string or an address and l
 
 **Done** (per function) when it reaches the project's **gate tier** - `[gate] require` in `project.toml`, default `semantic`. Tiers, lowest first: **structural** = same length, same operations, same targets (`opcode`, `relocation`, `missing`, `extra` all 0); **semantic** = that plus every operand right, plus the two streams identical once register names are folded; **exact** = that plus the bytes equal, with the fields the link writes zeroed on both sides (a candidate's come from its own relocation table, the original's from the address-carrying operands of its instructions) - so a call's displacement or a global's address is never what fails a unit, while opcodes, immediates and the length of each encoding are. A unit that reaches `exact` can be called byte-matched; say which tier, and when it falls short of `exact` the report names the first byte offset where the encodings differ and the instruction it falls in. The match percentage is progress only - 97 % of a wrong function is still a wrong function, and one wrong callee or table hides inside it. `try` exits 0 only when the unit reaches the gate tier, and its report leads with `tier <name> PASS/FAIL (gate: <name>)` and names what is missing. `--gate <tier>` overrides the tier for one run and `--waive unverified` waives that one check for one run.
 
-**Remembering what passed.** A unit that reaches the gate writes what it proved into the match ledger (`--no-learn` skips this): its own symbol at that address, and the candidate's names for anonymous globals it reaches. Later units are scored against it, so a callee proven once cannot be named differently in the next unit. `decomp ledger` lists the pairs and, more usefully, the *frontier*: the callees the reproduced units reach most often that have no name yet. That is the answer to "what next". If a reference is `UNVERIFIED` because the only evidence is "both bodies are the same size", decompile that callee first and let the ledger name it.
+**Remembering what passed.** A unit that reaches the gate writes what it proved into the match ledger (`--no-learn` skips this): its own symbol at that address, and the candidate's names for anonymous globals it reaches. Later units are scored against it, so a callee proven once cannot be named differently in the next unit. `decomp ledger` lists the pairs and, more usefully, the *frontier*: the callees the reproduced units reach most often that have no name yet. That is the answer to "what next" for a *feature-scoped* job whose ledger is already non-empty. It only counts callees of units already in the ledger, so early on it shows a handful of CRT functions called once each, and on an empty ledger it ranks every callee in the binary (`memcpy`, `free`, `__security_check_cookie` first). Do not `try` library or CRT code because the frontier or its `next:` line names it; for a whole program use the ready-set query in *Whole-binary mode*. If a reference is `UNVERIFIED` because the only evidence is "both bodies are the same size", decompile that callee first and let the ledger name it.
 
 **Stuck** (three tries with no change in the match or the categories): re-read the `show` assembly around the first differing instruction and change your hypothesis, not the syntax. If only `register:` differences remain and the report says "allocation only", stop: they are not fixable from source. Otherwise record the best candidate with its remaining diff categories and move on. Do not loop on one function; the rest of the scope is waiting.
 
@@ -189,6 +191,44 @@ End with a `MATCH_REPORT.md` and a short summary in your reply. Be plain about s
 - State the gate tier the project uses (`[gate] require`) and the tier each function reached; state the variant (compiler and `-O`) and its `detect` confidence.
 - Separate **seen** from **inferred** for names and for the claim that the scope list is complete. "I found no other callers" is **unknown** about code reached through function pointers or vtables you did not enumerate.
 - For security-oriented requests ("malicious file access"), describe what the recovered code does as observed in the static code, and say clearly that it was never executed.
+
+## Whole-binary mode: ordering thousands of functions
+
+Steps 1-5 still apply per function. What changes is how work is chosen, because a whole program has thousands of units and the order decides whether anything can pass. A unit reaches `semantic` only when every callee it reaches is either named on both sides (an import, a CRT function with a symbol) or already in the ledger. A callee that is an anonymous `FUN_xxxxxxxx` is checked by size alone, is counted `UNVERIFIED`, and caps its caller at `structural`. So the rule is: **never attempt a function before the anonymous functions it calls are reproduced or excluded.**
+
+**W1. Fix the project first (Step 1).** Right variant, passed with `-v` every time. Read `detect`'s fidelity block. If it reports `/GL` + `/LTCG`, say up front that `exact` is not available and set the gate to `semantic`. For a toolset or era gap, `exact` is not claimed; pin the matching toolchain with `[msvc] prefix` only if the bytes matter. Try `decomp symbols <bin>` for a PE: a published PDB names the library code and acts as an answer key.
+
+**W2. Draw the program boundary once, and write it down.** Find where the program's own code ends and statically linked library code begins. In a typical PE or static ELF the CRT, STL and third-party code sit in one contiguous address range (often the end of `.text`). Use the PDB or symbols if you have them. Otherwise use named functions (`_free`, `_memcpy`, `__SEH_prolog4`, `__security_check_cookie`), strings from library code, and where named entries cluster in `decomp find` output. Record the range as `LIB_LO`-`LIB_HI` in `SCOPE.md` and mark everything in it **excluded**, including unnamed `FUN_` entries inside it. Do not `try` excluded code, and do not let `ledger`'s frontier or `next:` line send you there. Check a few addresses either side of the boundary with `decomp show` before trusting it.
+
+**W3. Compute the ready set; do not guess it.** A function is *ready* when every callee is outside the program range (excluded) or already in the ledger for this variant. Query the cache read-only (path from `decomp status`, key from `--bin`), substituting the boundary and variant:
+
+```sql
+-- sqlite3 <cache_dir>/<key>/analysis.db
+SELECT entry, size, name FROM (
+  SELECT f.entry, f.size, f.name,
+    (SELECT count(*) FROM calls c JOIN functions g ON g.id = c.callee
+      WHERE c.caller = f.id AND g.entry <> f.entry
+        AND g.entry < :LIB_LO
+        AND g.entry NOT IN (SELECT entry FROM matches WHERE variant = :VARIANT)) AS pending
+  FROM functions f
+  WHERE f.kind = 'function' AND f.entry < :LIB_LO
+    AND f.entry NOT IN (SELECT entry FROM matches WHERE variant = :VARIANT))
+WHERE pending = 0 ORDER BY size LIMIT 50;
+```
+
+Adjust the bounds if the program range does not start at 0 or the library sits below it. The call graph comes from Ghidra and misses indirect calls (vtables, function pointers), so a function can be ready by this query and still reach an unreproduced vtable method; the diff will say so. Self-recursion is skipped. Mutual recursion never becomes ready: when the ready set is empty but unmatched functions remain, pick the smallest function in each strongly connected group and do them together.
+
+**W4. Work the ready set smallest first.** The tiny functions (getters, one-line wrappers, thunks, destructors) are the bulk of any binary and the cheapest to pass, and each one that passes unlocks its callers. Per function use the Step 3 loop with a hard cap: write from `decomp show`'s pseudo-code and assembly, `try -v <variant>`, at most three fixes, then record it as partial with its remaining diff categories and move on. Re-run the ready query after each batch. This is "most-called first" done correctly: callers are scored against names the ledger already holds.
+
+**W5. Group classes.** Run `decomp types --write <dir>` early and include the header. Do constructors, destructors and vtable slots of one class together; field offsets stop being `operand` diffs once the layout is in the header. Methods reached only through vtables are not in the call graph, so take them from `decomp find <vtable> --table`.
+
+**W6. Parallelise.** Ready functions do not depend on one another. Give each worker a batch of 10-20 from the ready query with a short brief: the `--bin`, the `-v <variant>`, the excluded range, the gate, the three-fix cap, and the output convention (one candidate file per function, results to a shared table). Do not give workers the whole skill. Ledger writes are SQLite transactions, so if concurrent writers hit a lock, stagger them. The coordinator re-runs the ready query between batches.
+
+**W7. Large functions last.** Largest functions have the most callees, the most inlining and the hardest diffs, and they depend on everything below them. Reading the ten largest *early* is a good Understand-style pass to find subsystems and shared helpers; matching them early is not. Once their callees are in the ledger, time-box each large function and mark failures partial.
+
+**W8. Measure throughput and stop on stalls.** After each batch report: units attempted, units at the gate, ledger size for the variant, and the ready-set size. If a batch passes almost nothing, do not scale up. Check, in order: the variant, the program boundary, the era or `/GL` finding, and whether the failures share a diff category. If all failures show the same `relocation` difference on one callee, fix that callee (or the name mismatch behind it) once, rather than in every caller. Names that Ghidra and the compiler spell differently (for example `__alloca_probe` against `__chkstk`) can cause this.
+
+**W9. Report the whole binary honestly (Step 5).** Give counts by status over the *program range* (matched, partial, not attempted) and the excluded range, with its size, as a separate line. Do not report a percentage of the file: library code is a large share of most binaries, and "0.045% decompiled" against total file size says nothing until the denominator is the program's own code.
 
 ## When matching is not possible
 
