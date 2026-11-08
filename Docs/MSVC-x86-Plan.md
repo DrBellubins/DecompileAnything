@@ -811,6 +811,88 @@ the largest and the least certain.
   rewritten to whatever the new number is.
 * Not claimed: that the ceiling disappears. It moves, and the new number is stated.
 
+**Done 2026-11-08.** The i386 absolute reference is one thing on both sides. Both 32-bit paths
+moved, and x86-64 did not.
+
+*Four gaps, all found by measuring a unit rather than reading the code that produces it.*
+
+1. **Three of the four i386 spellings of "reach something outside the body" had no slot.**
+   `[disp32 + index*scale]` only got one when the displacement was non-zero — so the image's
+   `flds 0x804a2c0(, %eax, 4)` had a slot and the object's `flds (, %eax, 4)` (the same field, with
+   the link's placeholder in it) had none. `[reg + disp32]` never got one at all, on either side —
+   which is the `movb 0x41fa74(%ecx)` / `movb (%ecx)` pair X86-3 had already named. And nothing in
+   the shape tells a placeholder `disp32` from an operand with no displacement field: capstone prints
+   `(%ecx)` for both `movl (%ecx), %eax` (two bytes) and `movl 0x0(%ecx), %eax` (six). The length
+   does, so the length is what is used (`normalize._DISP32_MIN`), and `field_span` accepts only a
+   four-byte field for a `[reg + disp]` operand — which is also what stops a one-byte frame offset
+   like `0x8(%ebp)` from being read as an address that happens to encode it.
+2. **Nothing on the original side stated a reference the analysis had not attached.** For
+   `subss 0x41f488(, %eax, 4)` Ghidra records the *elements* it inferred (0x41f48c, 0x41f490) and
+   not the base, and for `movb 0x41fa74(%ecx)` it records nothing. So `original_bindings` now asks
+   the file: an absolute operand whose value falls inside one of the image's own data sections
+   (`TargetImage.data_sections`) is a data reference, with `read_data` for the bytes and the
+   analysis' symbol for that exact address as its display name when it has one. A `[reg + disp]`
+   displacement is a field offset *until the file says otherwise* — the same evidence rule
+   `position_dependent` already applied to an immediate.
+3. **A `.rel` record's offset is in the field it sits on.** LIEF reports addend 0 for a
+   section-symbol `R_386_32` (SHT_REL carries no explicit addend), and a non-PIE 32-bit object writes
+   `movzbl 0x44(%eax)` against the `.rodata` section symbol for "the object 0x44 bytes into that
+   section". Taking the addend as 0 is exactly what the Phase 4 note called *"anchored on the nearest
+   symbol instead of the offset the relocation addresses"*: every pool window in a `-m32` candidate
+   began at the section's first symbol, so a reference that paired correctly was then **refuted** by
+   comparing the wrong bytes. Reading the in-place value fixes the name, the identity and the content
+   at once; pc-relative records are left alone (their in-place value already has P subtracted out).
+   The same rule, pointed the other way: a section-relative offset that is a *function* entry is a
+   function reference — that is how a non-PIE 32-bit object pushes its `qsort` comparator.
+4. **`@name@N` on x86.** `cl` decorates the CRT's fastcall cookie handler as
+   `@__security_check_cookie@4`; the `@`-suffix rule ate the whole name rather than the decoration,
+   which made `clean_symbol` non-idempotent and `canonical_name` compare `""` against the other
+   side's `__security_check_cookie`. Six units' only difference was that `@`. The pattern is narrow —
+   a COFF pseudo-relocation name (`@comp.id`) has a `.` and a C++ decoration starts with `?`, whose
+   own `@`-clauses stay part of the key (§8).
+
+*One thing the tokeniser had to stop guessing.* For an absolute operand, the literal replaced is the
+one that **encodes the slot's value**, not the first number in the operand: `(, %eax, 4)` contains a
+number — the index scale — and replacing it produced `movl arr(, %eax, DAT0), %eax`. When nothing
+there states the value, the token goes in front of the operand, which is what makes the image's
+`subss 0x41f488(%ecx)` and the object's `subss (%ecx)` print the same line.
+
+*One false positive the new slots created, caught by the x86-64 regression bar.* `lea 0x0(,%rax,4)`
+compiles `rax*4`; with an `abs` slot on it, the candidate-side "symbol at offset 0 of this section"
+lookup invented a reference to whatever function begins the section, and four `-O0`/`-O2` units moved
+from `exact` to `structural`. A memory operand that encodes address 0 with no relocation on it names
+nothing; a *branch* whose target is 0 is the first function of the section, which the non-PIE
+`callq 0` really is. That distinction is in the code and the numbers came back.
+
+*Measured — the acceptance bar, and the floors raised in the same commit.*
+
+| | before | after |
+|---|---|---|
+| `gcc-o0-x86` | `{exact 59, structural 19, none 11}`, 12 units in `KNOWN_GAPS`, "87% ceiling" | **`{exact 67, structural 21, none 1}`**, `MIN_EXACT` 67, `KNOWN_GAPS` one unit (`MATH-32`), no *pairing* gap left |
+| `msvc-o0-x86` | mean 99.75 %, masked-identical 86/89, `{exact 66, structural 17, none 6}`, 66 past the gate | **mean 100.00 %, masked-identical 89/89, `{exact 70, structural 19}`, 70 past the gate**, floor `{extents 89, pass 70, mean 100.00}` |
+| `gcc-o0`, `gcc-o2` | 79 and 78 exact | **79 and 78 exact**, unchanged `KNOWN_GAPS` |
+
+The acceptance the phase asked for is asserted by a new group in
+`Tests/tools/check_msvc_x86_candidate.py` (group 5, run for both 32-bit toolchains because the phase
+is one phase): the benchmark's float table `k_lodDistances`, reached as `subss 0x41f488(%ecx)` /
+`flds DAT0` on the target side and as a `DIR32`/`R_386_32` against the array symbol on the candidate
+side, asserted to give references that `diff.ref_evidence` agrees on with real evidence ("bytes") and
+two spellings that tokenise to one line. `check_masked_bytes.py` gained the decoder-level half of the
+same claim, at both bitnesses: an unreferenced `[reg + disp]` is not masked, the same operand resolved
+is masked at its width, a placeholder `disp32` is found at the end of its encoding, an operand with no
+displacement field stays out, and `[disp32 + index*scale]` carries a field even at 0 — with the
+encodings themselves asserted, so the test cannot drift into testing a made-up instruction.
+
+*Not claimed.* The ceiling moved, it did not disappear. `MATH-32` at `-m32` is now paired and still
+refuted, because the target's reference names an *element* of the table while the candidate relocates
+against its base with the index in a register — an array-base-versus-element identity question
+(byte-cleanup-plan Phase 6), not i386 reading. 21 `-m32` and 19 `msvc-o0-x86` units stop at
+`structural` at 100.00 % with their masked bytes identical, capped only by references neither side can
+describe: callees a stripped binary does not name (matched on "both bodies are the same size"), and
+objects with no bytes anywhere to compare — `___security_cookie` in `.bss`, and a table of *function
+pointers* (`g_stateTable`), which is a relocation placeholder in the object and a final address in the
+image. Neither is the 32-bit addressing gap any more.
+
 **X86-7 (optional): a real 32-bit MSVC target used as a project.** `deadrising2` through
 `starter_config` → `try` → a first scope banked. Not a byte-matching promise — a shipped Havok-heavy
 game at an unknown `/O` built by a toolchain era this machine may not have (§8). It is included as

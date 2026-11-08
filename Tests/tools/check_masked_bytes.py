@@ -131,6 +131,39 @@ def encodings() -> int:
 	check("pushl $_ZTI... (32-bit, non-PIE): the relocation sits on an immediate", fields,
 		[(1, 4)])
 
+	# --- X86-6: an address wearing a base register is a field only when something resolves it ---
+	# `cl` writes `array[i]` as `mov al, array[i]`: `movb 0x41fa74(%ecx)` in the image, and in the
+	# `.obj` a `DIR32` on those four bytes with the placeholder reading `movb (%ecx)`. `movl
+	# 0x40(%ebp), %eax` is a frame slot, and hiding it would hide a real field-offset change - so
+	# the field is masked on the strength of the *binding*, never of the shape.
+	data = bytes([0x8a, 0x81]) + struct.pack("<I", 0x41fa74)
+	instructions, _blocks, fields = fields_of(X86_32, data, 0x1000, nothing_bind)
+	check("movb disp32(%ecx) (32-bit): the encoding is the one named",
+		normalize.format_instruction(instructions[0].mnemonic, instructions[0].operands),
+		"movb 0x41fa74(%ecx), %al")
+	check("movb disp32(%ecx) (32-bit): an unreferenced [reg + disp] is not masked", fields, [])
+	_instructions, _blocks, fields = fields_of(X86_32, data, 0x1000, ref_bind("data"))
+	check("movb disp32(%ecx) (32-bit): the same operand, resolved, is masked at its width", fields,
+		[(2, 4)])
+	# the object-file half of that operand: the placeholder is four zero bytes, and capstone prints
+	# `(%ecx)` both for it and for an operand with no displacement field at all. Only the length
+	# tells them apart, and getting it wrong loses the reference (or invents one).
+	data = bytes([0x8b, 0x81]) + b"\x00" * 4
+	instructions, _blocks, fields = fields_of(X86_32, data, 0x1000, ref_bind("data"))
+	check("movl disp32(%ecx) at 0 (32-bit, .o placeholder): the encoding prints no displacement",
+		normalize.format_instruction(instructions[0].mnemonic, instructions[0].operands),
+		"movl (%ecx), %eax")
+	check("movl disp32(%ecx) at 0 (32-bit, placeholder disp32): the field is the trailing four bytes",
+		fields, [(2, 4)])
+	data = bytes([0x8b, 0x01]) + bytes([0xc3])
+	_instructions, _blocks, fields = fields_of(X86_32, data, 0x1000, ref_bind("data"))
+	check("movl (%ecx),%eax (32-bit): an operand with no displacement field stays out", fields, [])
+	# and the `[disp32 + index*scale]` form with the placeholder not yet filled in - the base of a
+	# table looked up by index, which is one of the two ways this benchmark reaches a table.
+	data = bytes([0x8b, 0x04, 0x85]) + b"\x00" * 4
+	_instructions, _blocks, fields = fields_of(X86_32, data, 0x1000, nothing_bind)
+	check("movl 0(,%eax,4) (32-bit, .o): the absolute base is a field even at 0", fields, [(3, 4)])
+
 	# a jump to a label inside the body is not the link's: the bytes say where the layout put it,
 	# and if the candidate's layout differs that is a real difference
 	body = bytes([0xeb, 0x03]) + bytes([0x90, 0x90, 0x90]) + bytes([0xc3])
@@ -278,20 +311,27 @@ def tiers() -> int:
 # Tests/tools/check_phase5_ledger.py measures the same units reaching `exact` once the helpers they
 # call have been reproduced. Measured: 87 -> 79 at -O0 (10 units capped: MATH-13/24/27/29,
 # STR-04/07/08, STRUCT-21/22/25), 84 -> 78 at -O2, 63 -> 59 at -m32.
-MIN_EXACT = {"gcc-o0": 79, "gcc-o2": 78, "gcc-o0-x86": 59}
+MIN_EXACT = {"gcc-o0": 79, "gcc-o2": 78, "gcc-o0-x86": 67}
 # the units that do not reach the gate at all, and why (the same list check_phase2_try.py owns).
 # MATH-24 and MATH-27 left this list in Phase 5: they are not reference mismatches, they are the
 # same-size-callee case, and they are reported with the units a ledger would unblock.
 KNOWN_GAPS = {
 	"gcc-o2": ["STRUCT-22", "STRUCT-23", "STRUCT-24"],
 	"gcc-o0-x86": [
-		# Phase 4 opened two of these by comparing the bytes a 32-bit access reads (MATH-21, and
-		# MATH-27, which since Phase 5 is capped by the same-size rule instead). They are not the
-		# candidate's doing - at i386 the candidate's window in a plain `.rodata` double pool is
-		# anchored on the nearest symbol rather than the offset the relocation addresses. Open tool
-		# bug, named here so a new one still fails this check.
-		"MATH-11", "MATH-13", "MATH-19", "MATH-20", "MATH-21", "MATH-22", "MATH-23",
-		"MATH-32", "STR-18", "STR-19", "STRUCT-20", "STRUCT-25"],
+		# X86-6 raised this list from twelve units to one. The eleven that left it were the 32-bit
+		# normalisation gap: an absolute operand (`movzbl 0x80dd6a4(%eax)`, `fldl 0x804a2c4`) and the
+		# relocation that fills that field in a `.rel` object are now one reference, the placeholder
+		# forms (`(, %eax, 4)`, `(%ecx)`) are seen as that field before the link, and a
+		# section-symbol relocation's offset is read out of the field it sits on instead of being taken
+		# as 0 - which is what had been anchoring every pool window on the section's first symbol.
+		#
+		# The one that remains is not a pairing gap: both sides state the table and pair the same
+		# operand, but the target's reference names an *element* of it (`fldl 0x804a2c8`) while the
+		# candidate relocates against its base with the index in a register, so the four bytes compared
+		# at that width are two different elements. An array base against one of its elements is a
+		# data-identity question (byte-cleanup-plan Phase 6), not i386 reading.
+		"MATH-32",
+	],
 }
 
 

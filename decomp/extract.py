@@ -898,6 +898,19 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 	seen: dict[str, Ref] = {}
 	used: list[Ref] = []
 
+	def describe_object(ref: Ref) -> None:
+		"""Name a reference by the object the file's own data says is there (Phase 4)."""
+		if structures is None or ref.address is None or ref.kind == "function":
+			return
+		object_ = structures.object_at(ref.address)
+		if not object_:
+			return
+		# the file's own name for this object, as the candidate's symbol names it
+		ref.name = object_["name"] or ref.name
+		ref.identity = "%s@%s" % (object_["role"], _hexkey(object_["address"]))
+		ref.size = ref.size or object_["size"]
+		ref.content = None   # a vtable is pointers; its bytes are never comparable
+
 	def build(item: sqlite3.Row) -> Ref:
 		key = "%s:%s" % (item["ref_type"], item["to_address"])
 		if key in seen:
@@ -910,14 +923,7 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		function = functions.get(to_address)
 		ref = Ref(kind=kind, raw=item["to_name"] or "", name=name, address=to_address,
 			section=item["section"] or "")
-		if structures is not None and to_address is not None and kind != "function":
-			object_ = structures.object_at(to_address)
-			if object_:
-				# the file's own name for this object, as the candidate's symbol names it
-				ref.name = object_["name"] or ref.name
-				ref.identity = "%s@%s" % (object_["role"], _hexkey(object_["address"]))
-				ref.size = ref.size or object_["size"]
-				ref.content = None   # a vtable is pointers; its bytes are never comparable
+		describe_object(ref)
 		if function is not None:
 			# a body's bytes are not comparable (in a `.o` the references inside it are
 			# still placeholders), but its size is, and that is what catches "same shape,
@@ -940,9 +946,47 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		used.append(ref)
 		return ref
 
+	# --- the file's own data, for a reference the analysis never attached -----------------
+	# On i386 every reference to something outside the body is a four-byte address written into the
+	# instruction, and a disassembler does not always record a reference for it: for
+	# `subss 0x41f488(, %eax, 4)` Ghidra names the elements it inferred (0x41f48c, 0x41f490) and not
+	# the base, and for `movb 0x41fa74(%ecx)` it names nothing at all. The section and the bytes there
+	# are the file's own answer, and they are what lets that operand be compared with a candidate's
+	# `DIR32`/`R_386_32` against the same object - the whole of Docs/MSVC-x86-Plan.md X86-6. The
+	# address has to be *inside a data section of this file*: a displacement off a base register is a
+	# frame or field offset until the file says otherwise, so a `[reg + disp]` operand is only ever
+	# hidden or tokenised when the file agrees it names an object.
+	data_ranges: list[tuple[int, int, str]] = [(start, start + int(size), name)
+		for name, start, size in image.data_sections() if size]
+
+	def reaches_file(slot) -> Ref | None:
+		if slot.value is None:
+			return None
+		key = "file:%s" % _hex(int(slot.value))
+		if key in seen:
+			return seen[key]
+		address = int(slot.value)
+		hit = next((item for item in data_ranges if item[0] <= address < item[1]), None)
+		if hit is None:
+			return None
+		_end, section = hit[1], hit[2]
+		symbol = cache.symbol_rows(conn, addresses=[address], limit=1)
+		name = symbol[0]["name"] if symbol and int(symbol[0]["address"]) == address else ""
+		ref = Ref(kind="data", raw=name or _hex(address),
+			name=clean_symbol(name) if name else "", address=address, section=section)
+		describe_object(ref)
+		if ref.content is None:
+			# read no further than the section does; the width of the access is what
+			# `diff.content_window` compares when neither side can name the object (Phase 4)
+			ref.size = min(_PROBE, _end - address) or None
+			ref.content = image.read_data(address, _PROBE)
+		seen[key] = ref
+		used.append(ref)
+		return ref
+
 	def bind(instruction) -> dict[int, Ref]:
 		here = by_address.get(int(instruction.address), [])
-		if not here or not instruction.slots:
+		if not instruction.slots:
 			return {}
 		chosen: dict[int, Ref] = {}
 		slots = list(instruction.slots)
@@ -959,6 +1003,10 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		for slot in slots:
 			if slot.value is None:
 				continue
+			if slot.kind == "disp" and reaches_file(slot) is None:
+				# a `[reg + disp]` displacement is a field offset, not a reference, unless the file
+				# says it is an object at that address
+				continue
 			# a reference with no address (an import) is not the same thing as an operand that
 			# encodes address 0, so the comparison is made only on real addresses
 			match = sorted((item for item in here if item["to_address"] is not None
@@ -969,11 +1017,21 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		# then anything left over, only when the pairing is unambiguous
 		left = [item for item in here if item["to_address"] is not None and not any(
 			int(item["to_address"]) == slot.value for slot in slots if slot.value is not None)]
-		free = [slot for slot in slots if slot.operand not in chosen and slot.kind != "imm"]
+		free = [slot for slot in slots if slot.operand not in chosen and slot.kind != "imm"
+			and not (slot.kind == "disp" and reaches_file(slot) is None)]
 		if not free:
-			free = [slot for slot in slots if slot.operand not in chosen]
+			free = [slot for slot in slots if slot.operand not in chosen
+				and not (slot.kind == "disp" and reaches_file(slot) is None)]
 		if left and len(left) == 1 and len(free) == 1:
 			chosen[free[0].operand] = claim(free[0], build(left[0]))
+		# and last, an absolute operand that nothing in the analysis explains: the file describes the
+		# object itself, so the reference is stated rather than left as a bare number
+		for slot in slots:
+			if slot.operand in chosen or slot.kind not in ("abs", "disp"):
+				continue
+			ref = reaches_file(slot)
+			if ref is not None:
+				chosen[slot.operand] = claim(slot, ref)
 		return chosen
 
 	return bind, used
@@ -1013,6 +1071,9 @@ class CandidateObject:
 		self._sections: dict[str, bytes] = {}
 		self._writable: set[str] = set()
 		self._by_section_address: dict[tuple[str, int], CandidateSymbol] = {}
+		# which of those addresses are *function* entries: what a section-relative reference naming
+		# one reaches, rather than an object it is an offset inside
+		self._function_keys: set[tuple[str, int]] = set()
 		self._all_symbols: dict[str, tuple[str, int, int, bool]] = {}
 		self._relocs: dict[str, list[tuple[int, str, str, int, str]]] = {}
 		# the (section, address, length) of the last function handed back by `function()`, which
@@ -1196,6 +1257,7 @@ class CandidateObject:
 					simple=normalize.simple_name(demangled), value=value, size=size, section=section)
 				self.functions.append(symbol)
 				self._by_section_address[(section, value)] = symbol
+				self._function_keys.add((section, value))
 			elif name and not name.startswith(".:"):
 				# `.LC0` and friends are size-less local symbols, but they are what a
 				# relocation against a section names, so they are indexed too
@@ -1227,11 +1289,31 @@ class CandidateObject:
 					symbol_section = ""
 					if item.has_symbol and item.symbol.section is not None:
 						symbol_section = str(item.symbol.section.name)
+					addend = int(item.addend)
+					if not addend and (not symbol_name or symbol_name in self._sections) and not (
+							pc_relative(str(item.type))):
+						# A `.rel` (SHT_REL) record carries no explicit addend: the offset is the value
+						# already sitting in the field the relocation is on. A non-PIE 32-bit object says
+						# `movzbl 0x44(%eax)` against the `.rodata` section symbol for "the object 0x44
+						# bytes into that section", and taking the addend as 0 gives every such reference
+						# the first object in the section - the wrong name, the wrong identity, and the
+						# wrong bytes to compare (Docs/MSVC-x86-Plan.md X86-6). A pc-relative record is
+						# left alone: its in-place value already has P subtracted out of it, which is a
+						# different sum from the one `_target` is asked for.
+						addend = self._field_value(str(item.section.name), int(item.address),
+							relocation_width(str(item.type)) or 4)
 					self._relocs.setdefault(str(item.section.name), []).append(
-						(int(item.address), str(item.type), str(symbol_name), int(item.addend),
+						(int(item.address), str(item.type), str(symbol_name), addend,
 							symbol_section))
 				except Exception:  # noqa: BLE001
 					continue
+
+	def _field_value(self, section: str, offset: int, width: int) -> int:
+		"""What the bytes a relocation sits on currently say (the in-place addend of a `.rel`)."""
+		data = self._sections.get(section) or b""
+		if width <= 0 or offset < 0 or offset + width > len(data):
+			return 0
+		return int.from_bytes(data[offset:offset + width], "little")
 
 	def _coff_symbol_table(self, binary) -> dict[int, tuple[str, str, int]]:
 		"""COFF symbol-table index -> (name, this object's section key, value).
@@ -1450,8 +1532,15 @@ class CandidateObject:
 				# or taking that helper's address. The analysis resolves the same target from
 				# the reference Ghidra recorded, so both sides have to name it.
 				for slot in slots:
-					if slot.kind == "imm":
-						continue          # with no relocation to fix it up, an immediate is a constant
+					# An immediate with no relocation on it is a constant, and a `[reg + 0]` operand means
+					# the pointer held in that register - not address 0 of this section. A memory operand
+					# that encodes address 0 with nothing to fill it in is the same kind of nothing:
+					# `lea 0x0(,%rax,4)` computes `rax*4`, and the function that happens to sit at offset 0
+					# of this section is not what it refers to. A branch or call is different - capstone
+					# resolves its target to a section-relative address, and 0 there is the first function
+					# of the section, which is the call `callq 0` in a non-PIE object really is.
+					if slot.kind in ("imm", "disp") or (slot.kind == "abs" and not slot.value):
+						continue
 					named = self._in_section(function, slot.value) if slot.value is not None else ""
 					if named:
 						chosen[slot.operand] = reference(slot.value, "in-section", named, 0,
@@ -1546,6 +1635,15 @@ class CandidateObject:
 			# CRT's, not an offset in `.text$mn` - so when it names one, the object at that offset
 			# is not what the instruction reaches.
 			display = self._nearest_in(section_named, addend)
+			# A section-relative reference can name a *function* too: a non-PIE 32-bit object pushes
+			# the address of its `qsort` comparator as an `R_386_32` against the `.text` section symbol
+			# with the function's offset in the field. Classing that as data makes the two sides
+			# disagree about what kind of thing the reference reaches.
+			owner = self._by_section_address.get((section_named, addend))
+			if owner is not None and (section_named, addend) in self._function_keys:
+				return {"kind": "function", "address": addend, "section": section_named,
+					"size": owner.size or None, "content": None, "display": display,
+					"name": display, "identity": "%s+0x%x" % (section_named, addend)}
 			# the object defined at that offset is what the instruction reads, so it is the name
 			# to compare - `.data.rel.ro+0x18` is a section, and the other side has no such thing
 			return {"kind": "data", "address": addend, "section": section_named, "size": None,

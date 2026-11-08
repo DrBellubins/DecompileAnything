@@ -86,6 +86,15 @@ _SYNTHETIC = (
 # `_ZN10CMathTests8AbsDiffEii+0x15`, `strlen@plt`, `foo@@GLIBC_2.2.5`, `.LC0-0x18`.
 _ADDEND = re.compile(r"[-+](0x)?[0-9a-f]+$")
 _AT = re.compile(r"@@?[A-Za-z0-9_.-]*$")
+# An x86 `__fastcall`/`__stdcall` name as `cl` decorates it: a leading `@` and a trailing `@N`
+# (the bytes of arguments). `__security_check_cookie` is declared fastcall in the CRT headers, so a
+# 32-bit MSVC object relocates against `@__security_check_cookie@4` while the same CRT helper in the
+# linked file - and in an x86-64 object, where there is no such decoration - is `__security_check_cookie`.
+# Without this the two are one leading `@` apart and a unit that calls the cookie handler can never
+# name its callee (Docs/MSVC-x86-Plan.md X86-6). The pattern is deliberately narrow: a COFF
+# pseudo-relocation name (`@comp.id`, `@comp.stub`) has a `.` and is not a callee's name, and a C++
+# decoration starts with `?`, whose own `@`-clauses are part of the key (MSVC-Plan §8).
+_STDCALL_MARKER = re.compile(r"^@([A-Za-z_][A-Za-z0-9_]*)(@\d+)?$")
 
 
 def demangle(names: list[str]) -> dict[str, str]:
@@ -225,6 +234,13 @@ def clean_symbol(text: str) -> str:
 		if object_name:
 			_clean_cache[text] = object_name
 			return object_name
+	marked = _STDCALL_MARKER.match(text)
+	if marked:
+		# and before the `@`-suffix trimming, which on this shape eats the whole name: the marker is
+		# decoration, the name inside it is what both sides have (`clean_symbol` is also expected to
+		# be idempotent, and eating it made the second pass in `canonical_name` return "")
+		_clean_cache[text] = marked.group(1)
+		return marked.group(1)
 	name = _AT.sub("", _ADDEND.sub("", text))
 	name = name.replace("@plt", "").replace("@PLT", "")
 	if name.startswith("_Z"):
@@ -596,6 +612,11 @@ def _instruction(handle: Cs, instruction) -> Instruction:
 
 _BRANCH = re.compile(r"^(j[a-z]{0,3}|loop[a-z]*|call[a-z]*|jmp|ret)$")
 
+# The shortest encoding that can carry a `[reg + disp32]` operand: an opcode, a ModRM byte, and
+# the four bytes. Used to tell "the link has not filled in the displacement yet" from "there is no
+# displacement here" - capstone prints both as `(%ecx)`.
+_DISP32_MIN = 6
+
 
 def _slots(handle: Cs, instruction) -> list[Slot]:
 	"""Which operands carry an address, and what address they encode.
@@ -623,9 +644,28 @@ def _slots(handle: Cs, instruction) -> list[Slot]:
 				# capstone prints the raw displacement; the address it means is here:
 				value = instruction.address + instruction.size + mem.disp
 				slots.append(Slot(index, "rip", value, instruction.size - 4, touching))
-			elif mem.base == 0 and (mem.index == 0 or mem.disp):
-				# absolute addressing (32-bit code) and `*table(, %rax, 4)` jump tables
+			elif mem.base == 0:
+				# absolute addressing (32-bit code) and `*table(, %rax, 4)` jump tables. The
+				# displacement is the address whatever else the operand has, and it is *nothing* in an
+				# object file - `movl 0x804a2c4(,%eax,4)` in the image is `(,%eax,4)` in the `.o` with
+				# an `R_386_32`/`DIR32` on those four bytes - so requiring a non-zero displacement threw
+				# away exactly the operand that carries the relocation (Docs/MSVC-x86-Plan.md X86-6).
 				slots.append(Slot(index, "abs", mem.disp, instruction.size - 4, touching))
+			elif mem.disp or (mem.base and instruction.size >= _DISP32_MIN):
+				# `[reg + disp]` and `[reg + index*scale + disp]`. Almost all of these are a frame or
+				# struct offset and stay exactly as written; but on i386 a four-byte displacement whose
+				# value lands in the file's own data is an absolute reference wearing a base register -
+				# what `cl` writes for `array[i]` as `mov al, array[i]`: `movb 0x41fa74(%ecx)` in the
+				# image, `movb (%ecx)` in the object. Nothing here can tell the two apart, so this only
+				# records the field: `position_dependent` asks the binder, and the operand is hidden or
+				# tokenised solely on the side that resolves that displacement to an object.
+				#
+				# The zero case is the object-file half of the same operand: `mod=10` always carries a
+				# disp32, and when the link has not filled it in yet capstone prints nothing at all, so
+				# the shape test cannot see it. The length can: a `[reg + disp32]` encoding is never
+				# shorter than six bytes. An operand with no displacement field of its own stays out of
+				# the slot list - `movl (%ecx), %eax` is two bytes and means what it says.
+				slots.append(Slot(index, "disp", mem.disp, instruction.size - 4, touching))
 		elif operand.type == CS_OP_IMM and control:
 			kind = "call" if is_call else "branch"
 			slots.append(Slot(index, kind, operand.imm, 1))
@@ -644,6 +684,30 @@ def _slots(handle: Cs, instruction) -> list[Slot]:
 
 
 _LITERAL = re.compile(r"-?(?:0x[0-9a-f]+|\d+)")
+
+
+def _literal_for(text: str, slot) -> re.Match | None:
+	"""Which literal in one operand's text is the address this slot carries.
+
+	For an absolute (`abs`) or base-relative (`disp`) memory operand the answer is the literal that
+	*encodes that value*, not the first number in the operand: `(, %eax, 4)` has a number in it -
+	the index scale - and replacing that is what turns `movl arr(, %eax, 4), %eax` into
+	`movl arr(, %eax, DAT0), %eax`. When nothing there says the value, there is nothing to
+	replace: an object file left those bytes to the link, and capstone prints no zero displacement,
+	so the token goes in front of the operand instead.
+	"""
+	if slot.kind in ("abs", "disp"):
+		if slot.value is None:
+			return None
+		for match in _LITERAL.finditer(text):
+			try:
+				if int(match.group(0), 0) == int(slot.value):
+					return match
+			except ValueError:  # pragma: no cover - the pattern only matches numbers
+				continue
+		return None
+	return _LITERAL.search(text)
+
 _REGISTER = re.compile(
 	r"\b(e[a-d]x|[a-d][sl][pi]|r[abcd]x|r\d{1,2}[wdb]?|sip|dil|sil|bpl|spl|al|cl|dl|bl|"
 	r"xmm\d+|ymm\d+|st\(\d\)|mm\d+)\b")
@@ -740,11 +804,11 @@ def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruct
 				refs.append(ref)
 			if replacement is None:
 				continue
-			match = _LITERAL.search(text)
+			match = _literal_for(operands[start:stop], slot)
 			if match is not None:
 				operands = (operands[:start + match.start()] + replacement
 					+ operands[start + match.end():])
-			elif slot.kind in ("rip", "abs"):
+			elif slot.kind in ("rip", "abs", "disp"):
 				# capstone writes a zero displacement as nothing: `movss (%rip), %xmm0` is
 				# what a relocation-backed reference looks like before the link
 				operands = operands[:start] + replacement + operands[start:]
@@ -832,10 +896,12 @@ def field_span(instruction, slot) -> tuple[int, int] | None:
 	# also "matches" as a one-byte zero if the short forms are tried first), then any other field
 	# of the width that form always has
 	order = [(slot.enc_offset, length - slot.enc_offset)]
-	if slot.kind in ("rip", "abs"):
+	if slot.kind in ("rip", "abs", "disp"):
 		# a pc-relative or absolute displacement is a fixed 4-byte field wherever the encoding puts
 		# it: `cmpb $0, x(%rip)` is `80 3d disp32 00`, with the immediate after the displacement,
-		# so the trailing-bytes rule would miss it
+		# so the trailing-bytes rule would miss it. For a `[reg + disp]` operand that is also the
+		# only width an address can have on x86, which is what keeps a one-byte frame offset like
+		# `0x8(%ebp)` from being read as an address field that happens to encode it.
 		order += [(offset, 4) for offset in range(1, length - 3)]
 	else:
 		order += sorted([(length - width, width) for width in _FIELD_WIDTHS
@@ -864,6 +930,12 @@ def position_dependent(instruction, slot, ref, block) -> bool:
 	if slot.kind in ("rip", "abs"):
 		# a pc-relative or absolute address is the linker's choice wherever it appears
 		return True
+	if slot.kind == "disp":
+		# a displacement off a base register is a constant (a frame slot, a field offset) unless
+		# something resolves it to an object - on i386, a `DIR32`/`R_386_32` on those four bytes, or
+		# the analysis resolving the address the linked file has there. Evidence is required in both
+		# directions: hiding every `[reg + disp32]` field would hide a real field-offset change.
+		return ref is not None
 	if slot.kind == "imm":
 		# an immediate is a constant unless something resolves it to an object: in a non-PIE
 		# 32-bit object `pushl $_ZTI14CVehicleEntity` is an R_386_32 sitting on an immediate

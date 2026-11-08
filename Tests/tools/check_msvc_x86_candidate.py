@@ -60,20 +60,20 @@ NEGATIVE_CONTROLS = [
 # extent read out of a COFF object equals the extent the original side is compared over, for every
 # unit.
 #
-# 23 of the 89 units stop at `structural` or below. They fall into two families, and neither is an
-# i386 COFF reading gap - both are already known, named, and owned by another phase:
+# 19 of the 89 units stop at `structural`. After X86-6 none of them has an operand or byte
+# difference left - all 19 are at 100.00% with the masked bytes identical, and each is capped by a
+# reference neither side can describe. They fall into two families, both known and owned elsewhere:
 #
-# * 15 reach 100.00% and identical masked bytes, but a callee or object they reach cannot be named
-#   on either side (a stripped i386 PE gives `FUN_004076e0`, the candidate gives
-#   `?ToLowerChar@@YADD`), which caps the tier at `structural`. That is the PDB/ledger naming gap
-#   (`decomp symbols` reads the fetched PDB's `S_PUB32` rows today and nothing consumes them).
-# * 8 have real operand differences, and 7 of those are one shape: the original reads a global as
-#   `subss 0x41f488(%ecx), %xmm0` where the object has `subss (%ecx), %xmm0`, because in the `.obj`
-#   the base of that address is a relocation placeholder (0) and in the image it is the final
-#   address. The bytes are masked; the operand text is not. That is X86-6, "the i386 normalisation
-#   both 32-bit paths share", and it is the same set of units that caps `gcc-o0-x86`.
+# * a callee the stripped image does not name and the candidate does (`FUN_00402ff0` against
+#   `?Vec3LengthSq@…`), matched on nothing stronger than "both bodies are the same size" - the
+#   ledger/PDB naming gap (`decomp symbols` reads the fetched PDB's `S_PUB32` rows and nothing
+#   consumes them yet).
+# * an object neither side can read: `___security_cookie` lives in `.bss` on both sides, so there are
+#   no bytes anywhere to compare, and a table of *function pointers* (`g_stateTable`) is a relocation
+#   placeholder in the object and a final address in the image - the data-side pairing that
+#   byte-cleanup-plan Phase 6 owns.
 FLOORS: dict[str, dict[str, float]] = {
-	"msvc-o0-x86": {"extents": 89, "pass": 66, "mean": 99.75},
+	"msvc-o0-x86": {"extents": 89, "pass": 70, "mean": 100.00},
 }
 
 
@@ -92,11 +92,12 @@ def _objects_for(store: cache.Cache, suffix: str = "") -> Path:
 	return store.root / ("candidates-x86-%s%s" % (VARIANT_NAME, suffix))
 
 
-def object_for(source: Path, work: Path) -> tuple[Path, str]:
+def object_for(source: Path, work: Path, variant_body: dict | None = None) -> tuple[Path, str]:
 	"""Build one translation unit with this variant's own driver and flags (the resolver's choice)."""
+	body = variant_body if variant_body is not None else VARIANT
 	object_path = work / ("%s.obj" % source.stem)
-	built = build_.build([source], object_path, flags=toolchain.build_flags(VARIANT),
-		includes=config.include_dirs(CONFIG, VARIANT), variant=VARIANT, cfg=CONFIG)
+	built = build_.build([source], object_path, flags=toolchain.build_flags(body),
+		includes=config.include_dirs(CONFIG, body), variant=body, cfg=CONFIG)
 	if not built.ok:
 		print("  %s" % "\n  ".join(build_.describe(built)))
 		print("  %s did not compile: %s" % (source.name,
@@ -379,6 +380,116 @@ def controls(answer: dict, failures: list[str]) -> None:
 	expect(bad == 0, "the wrong candidates are still classified correctly on an i386 PE", failures)
 
 
+# X86-6's acceptance, in one sentence: the *same object* in the benchmark has to be reached two
+# ways - by a 32-bit absolute operand on the target side and by a `DIR32`/`R_386_32` on the candidate
+# side - and produce a reference the two sides agree on. MATH-32 (`NearestTableIndex`) is that case:
+# it reads `k_lodDistances` as `subss 0x41f488(%ecx)` / `subss 0x41f488(, %eax, 4)` in the image and
+# as `subss (%ecx)` / `subss (, %eax, 4)` with a relocation on those four bytes in the object. Both
+# 32-bit paths are asked, because the phase is about the bitness and not the toolchain: the COFF half
+# is this script's own variant, the ELF half is `gcc-o0-x86`.
+TABLE_UNITS = {"MATH-32": "NearestTableIndex - reads a global float table by index"}
+OTHER_32 = "gcc-o0-x86"
+
+
+def reached_twice(variant_name: str, failures: list[str]) -> None:
+	"""One table, one reference: the target's absolute operand and the candidate's relocation."""
+	from decomp import diff as diff_
+	build = TESTS / "build" / variant_name
+	answer_path = build / "answer_key.json"
+	if not answer_path.is_file():
+		print("   %s is not built (Tests/eval.py build --variant %s)" % (variant_name, variant_name))
+		return
+	key = cache.target_key(build / "da_tests.stripped")["key"]
+	if not cache_store.status(key).get("complete"):
+		print("   %s is not analysed (decomp analyze … --variant %s)" % (variant_name, variant_name))
+		return
+	conn = cache.open_readonly(Path(cache_store.db_path(key)))
+	meta = cache.meta(conn)
+	offset = int(meta.get("address_offset") or 0)
+	handle = normalize.capstone_for(meta.get("language_id") or "", detail=True)
+	answer = json.loads(answer_path.read_text())
+	try:
+		judge_name, judge = config.variant(CONFIG, variant_name)
+	except config.ConfigError as exc:
+		print("   no variant %s in Tests/project.toml: %s" % (variant_name, exc))
+		return
+	for unit in answer["units"]:
+		if unit["id"] not in TABLE_UNITS:
+			continue
+		row = cache.resolve_function(conn, hex(unit["address"] + offset))
+		if not row:
+			failures.append("%s: no cached function at %s" % (unit["id"], hex(unit["address"])))
+			continue
+		original = extract.original_function(conn, meta, row[0])
+		image = extract.TargetImage(build / "da_tests.stripped", offset)
+		bind_o, _refs_o = extract.original_bindings(conn, meta, row[0], image)
+		object_path, problem = object_for(TESTS / "TestBinary" / unit["file"],
+			_objects_for(cache_store, "table"), variant_body=judge)
+		if problem:
+			failures.append("%s: %s" % (unit["id"], problem))
+			continue
+		candidate = extract.CandidateObject(object_path)
+		try:
+			function = candidate.function(unit["mangled"])
+		except extract.SymbolNotFound as exc:
+			failures.append("%s: %s" % (unit["id"], exc))
+			continue
+		bind_c, _refs_c = candidate.bindings(function)
+
+		def absolute(func, bind, boundaries=None):
+			"""Every operand this side reaches through an absolute 32-bit field, with its Ref."""
+			out = []
+			for instruction in normalize.decode_function(handle, func.address, func.bytes,
+					boundaries, None):
+					bound = bind(instruction) or {}
+					for slot in instruction.slots:
+						if slot.kind not in ("abs", "disp"):
+							continue
+						ref = bound.get(slot.operand)
+						if ref is not None and ref.cls == "data":
+							out.append((instruction, slot, ref))
+			return out
+
+		left = absolute(original, bind_o, [(int(a), int(b)) for a, b in
+			json.loads(row[0]["ranges"] or "[]")] or None)
+		right = absolute(function, bind_c)
+		expect(bool(left) and bool(right), "%s %s: both sides state the absolute data reference "
+			"(%d on the target, %d in the object)" % (variant_name, unit["id"], len(left),
+				len(right)), failures)
+		if not left or not right:
+			continue
+		# pair by position, not any-to-any: the two sides state their absolute data references in the
+		# same order (that is what the unit's diff asserts), and pairing them freely would compare two
+		# different instructions that happen to reach the same object
+		found = None
+		for (instruction, _slot, one), (other_instruction, _other_slot, two) in zip(left, right):
+			ok, _why, evidence = diff_.ref_evidence(one, two)
+			if ok and evidence in ("bytes", "name", "string", "size"):
+				found = (one, two, evidence, instruction, other_instruction)
+				break
+		expect(found is not None, "%s %s: one table reached two ways is the same reference (%s; "
+			"target %s, candidate %s)" % (variant_name, unit["id"], TABLE_UNITS[unit["id"]],
+				left[0][2].raw or hex(left[0][2].address or 0), right[0][2].raw), failures)
+		if found:
+			one, two, evidence, instruction, other_instruction = found
+			# and the two spellings have to tokenise to one line, which is what the unit's tier
+			# rests on
+			vocab = normalize.Vocabulary()
+			tokens_o = normalize.normalize_function(vocab, "original", [instruction], bind_o,
+				original.address, original.size)
+			tokens_c = normalize.normalize_function(vocab, "candidate", [other_instruction], bind_c,
+				function.address, function.size)
+			expect(tokens_o and tokens_c and tokens_o[0].text == tokens_c[0].text,
+				"%s %s: the two spellings tokenise to one line: %r / %r" % (variant_name, unit["id"],
+					tokens_o[0].text if tokens_o else "", tokens_c[0].text if tokens_c else ""),
+				failures)
+			print("   %s %s: %s <- target %s (%s) | candidate %s (%s) - agreed on %s"
+				% (variant_name, unit["id"], tokens_o[0].text,
+					one.raw or hex(one.address or 0), one.section, two.raw, two.identity or two.section,
+					evidence))
+	conn.close()
+
+
 VARIANT: dict = {}
 VARIANT_NAME = ""
 CONFIG: dict = {}
@@ -466,6 +577,11 @@ def main() -> int:
 	if not args.no_controls:
 		print("\n=== 4. the deliberately wrong candidates ===")
 		controls(answer, failures)
+	print("\n=== 5. one table, reached two ways (X86-6's acceptance) ===")
+	reached_twice(VARIANT_NAME, failures)
+	if VARIANT_NAME == "msvc-o0-x86":
+		# the same rule on the other 32-bit toolchain - X86-6 is one phase, not two
+		reached_twice(OTHER_32, failures)
 
 	if failures:
 		print("\nFAILURES (%d):" % len(failures))

@@ -844,22 +844,33 @@ which is the half that matters: the tool does not raise a toolchain gap where th
   STRUCT-21 at -O0/-O2 (data neither side can describe), and at -m32 the thunks whose import the
   stripped binary does not name. Reproducing the object (structures-plan) lifts them; so does the
   project saying `[gate] waive = "unverified"`.
-* **-m32 normalisation is weak** (87% ceiling): 32-bit addressing forms (`movl 0x804a2c4`,
-  `$displ,%eax` + `R_386_*`) are not all mapped to names. x86 is *not* a stand-in for MSVC
-  either - "-m32 as the closer match to the 32-bit MSVC targets" in `project.toml` is about
-  addressing forms only. A real `msvc-*` variant of this benchmark (PE/COFF, `cl`, an answer key
-  from `.pdata` and `link /MAP` instead of `nm --print-size`) has been in and passing since MS-2;
-  `try` against a COFF candidate is MS-3 of [../Docs/MSVC-Plan.md](../Docs/MSVC-Plan.md).
+* **32-bit absolute references are normalised** (was: "-m32 normalisation is weak, 87% ceiling",
+  closed by [../Docs/MSVC-x86-Plan.md](../Docs/MSVC-x86-Plan.md) X86-6, 2026-11-08). An absolute
+  operand (`movl 0x804a2c4`, `movzbl 0x80dd6a4(%eax)`, `flds 0x804a2c0(,%eax,4)`) and the
+  `R_386_32`/`DIR32` that fills the same field in a `.o` are now one reference, reached from either
+  side; the placeholder spellings (`(%ecx)`, `(, %eax, 4)`) are read as that field before the link,
+  and a `.rel` record that names a *section* takes its offset from the field it sits on instead of
+  from 0 — that was anchoring every pool window on the section's first symbol. The floor moved:
+  `gcc-o0-x86` is **67 of 89 `exact`** (was 59) with `check_masked_bytes.py`'s `MIN_EXACT` raised to
+  67, and its `KNOWN_GAPS` list is down from twelve units to one (`MATH-32`: both sides state the
+  table and pair the same operand, but one names an *element* and the other the base plus an index,
+  so the four bytes compared at that width are two elements). x86-64 is untouched: `gcc-o0` 79 and
+  `gcc-o2` 78 exact, same `KNOWN_GAPS`. What still caps 21 `-m32` units is the same thing that caps
+  the x86-64 ones — callees and objects neither side can name (the two bullets above), not 32-bit
+  addressing. x86 is still *not* a stand-in for MSVC: "-m32 as the closer match to the 32-bit MSVC
+  targets" in `project.toml` is about addressing forms only.
 * **32-bit MSVC is a first-class variant now** ([../Docs/MSVC-x86-Plan.md](../Docs/MSVC-x86-Plan.md)
   X86-1…X86-4, all 2026-11-07): the toolset has `bin/Hostx64/x86` + `lib/x86` and
   `bin/x86/{cl,link,lib,ml,…}` wraps them; `arch = "x86"` resolves to that driver (X86-2);
   `_COFF_FIELD_WIDTH` reads the `I386_*` spellings (X86-3); and `[variants.msvc-o0-x86]` is built,
-  analysed, scored (`check_msvc_x86_candidate.py`, floor `{extents 89, pass 66, mean 99.75}`) and
+  analysed, scored (`check_msvc_x86_candidate.py`, floor `{extents 89, pass 70, mean 100.00}`) and
   *run* (X86-4: wibo, `89 cases, 0 failures`, goldens captured, `crosscheck` clean). A 32-bit
   *target* needed none of the Wine work; a 32-bit *guest* needed Setup.md §6.7's Option B.
   `decomp check` keeps the two facts apart (`msvc target x86` vs `run 32-bit PE`).
-  What is still open in that plan is X86-6 (the normalisation ceiling below, which the two 32-bit
-  paths share); X86-5 closed the same day — an i386 shape profile measured on this `cl` means
+  X86-6 closed the last phase of that plan on 2026-11-08, which is what took `msvc-o0-x86` from
+  `{exact 66, structural 17, none 6}` / mean 99.75% to **`{exact 70, structural 19}` at a 100.00%
+  mean with all 89 units' masked bytes identical**; the 19 are capped only by references neither side
+  can describe. X86-5 closed the same day — an i386 shape profile measured on this `cl` means
   `detect` answers `-O` for a 32-bit MSVC file, probes with the driver of that bitness, and states
   the toolset-era gap inside the answer (see *What a 32-bit MSVC build is* above).
   Two rules for reading any 32-bit MSVC number: a 32-bit PE has no `.pdata`, so its answer key is
