@@ -564,6 +564,18 @@ def _parse_range(text: str) -> tuple[int, int] | None:
 	raise Stop(EXIT_USAGE, "--range wants 0xLO-0xHI or 0xSTART+0xLEN, got %r" % text)
 
 
+def _driver_label(value) -> str:
+	"""A driver name, printed where the reader decides what to install. Inside the directory the
+	tool is run from, the path is shown relative to it, because `bin/x86/cl` versus `bin/x64/cl`
+	is the part that says which bitness answered (Docs/MSVC-x86-Plan.md X86-5). Nothing is cut off
+	the front: the last 40 characters of a toolchain path end at the driver and start inside the
+	name of the project, which names no tool."""
+	try:
+		return str(Path(str(value)).relative_to(Path.cwd()))
+	except ValueError:
+		return str(value)
+
+
 def detect_target(target: Path, *, range_text: str = "", sample: str = "", conn=None,
 	levels: tuple[int, ...] = (0, 1, 2, 3), probe: bool = True, cfg: dict | None = None) -> dict:
 	"""Everything `decomp detect` reports, in one call (the benchmark check uses it too).
@@ -780,7 +792,8 @@ def detect(
 			if item["why"]:
 				echo("    chosen: %s" % item["why"])
 		for item in ranked[:8]:
-			echo("  %-40s -O%d  distance %.3f  next %.3f" % (str(item.get("compiler"))[-40:],
+			# The row names the driver that answered, the same one `probe cl -> …` above names.
+			echo("  %-40s -O%d  distance %.3f  next %.3f" % (_driver_label(item.get("compiler")),
 				item["optimize"], item["distance"], item.get("runner_up", item["distance"])))
 		echo()
 		answer = str(guess["optimize"])

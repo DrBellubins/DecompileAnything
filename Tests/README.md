@@ -670,7 +670,10 @@ function table, so the analysis is the only sample whose bodies start at real bo
 ret-cut sample ranks `/O1` first and says so in the same sentence. Finally the dialect guards: no
 `-fstack-protector` finding for a `built by msvc` file (it gets `/GS`), no x86-64 ISA claim for a
 32-bit image, and `fidelity.version_agreement` naming an **x64 driver against a 32-bit file** as a
-bitness gap — the one answer `check`, `try` and `detect` all read.
+bitness gap — the one answer `check`, `try` and `detect` all read. And the ranked `-O` rows are
+required to name the driver that measured: the label the tool prints must open the same file as the
+resolved driver (printing the last 40 characters of the path read
+`mpileAnything/toolchains/msvc/bin/x86/cl`, which names nothing).
 
 By hand:
 

@@ -458,6 +458,16 @@ def check_i386(work: Path) -> None:
 	if not driver.name:
 		return
 
+	# The ranked `-O` rows print this name. Slicing its last 40 characters left
+	# `mpileAnything/toolchains/msvc/bin/x86/cl`, which names no driver, so whatever the tool
+	# prints for a probe has to be a path that still opens the file it names.
+	label = cli._driver_label(driver.name)
+	try:
+		opens = Path(label).samefile(driver.name)
+	except OSError:
+		opens = False
+	expect(opens, "the label `detect` prints for a probe driver is that driver: %s" % label)
+
 	signatures, problems = toolchain.probe_signatures(driver.name, 32, levels=(0, 1, 2),
 		work_dir=work)
 	expect(len(signatures) == 3,

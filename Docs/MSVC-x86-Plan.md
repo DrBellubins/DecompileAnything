@@ -743,6 +743,12 @@ the last column is the X86-4 build, made here at `/Od`, so it is a known answer:
 * **The dialect guards** (§4's trailing bug) are in `fidelity.flag_findings`: an MSVC file gets a
   `/GS` finding, never `-fstack-protector`; the x86-64 ISA spellings sit behind `bits == 64`. The
   `deadrising2.exe` output now says `/GS` under its own shape block and `/guard:cf is x64-only`.
+* **A probe row names the compiler that answered.** The ranked `-O` rows printed `str(name)[-40:]`,
+  and an absolute toolchain path sliced that way begins inside the project's own name
+  (`mpileAnything/toolchains/msvc/bin/x86/cl`), which names no driver — exactly where X86-5 started
+  printing absolute driver paths. `cli._driver_label` shows the path relative to the directory the
+  tool is run from, or as given when it is elsewhere, and asserts nothing: group 7 opens the printed
+  label and requires it to be the same file as the resolved driver.
 * **Sampling, in the same sentence.** `confidence()` ends every branch with `sample_caveat()`, so a
   ret-cut sample is named in the answer itself, and `detect` names the better sample where one
   exists (`sample.hint`). The consequence is measured, not asserted away: on
@@ -758,12 +764,13 @@ the last column is the X86-4 build, made here at `/Od`, so it is a known answer:
   `starter_config` writes the same warning in the config it produces, and keeps the
   "`--major 15 --msvc-version 15.5`" install line only for a file whose era the table can name.
 
-**Measured (the acceptance bar).** `Tests/tools/check_msvc_detect.py` is now seven groups, 68 checks,
+**Measured (the acceptance bar).** `Tests/tools/check_msvc_detect.py` is now seven groups, 69 checks,
 exit 0. The x64 group's probe shapes and `notepad.exe`'s target shape are identical to the run
 before this change (0.537/1.0/0.111 and 0.118/0.037/0.156). Group 7 asserts: the x64 set reads
 0.000 on i386 at every level; the i386 set separates `/Od` from `/O1|/O2` (a frame reading 78 points
 wider) and `/O1` from `/O2` only by 0.890; the i386 `/GS` reading is non-zero at `/Od` and `/O1`;
-the probe for a PE32 is a `bin/x86/cl`; the shipped 32-bit target's readings are non-zero (1 515
+the probe for a PE32 is a `bin/x86/cl` and is printed as a path that opens that driver; the shipped
+32-bit target's readings are non-zero (1 515
 bodies) and the era gap is inside the answer; the `/Od` benchmark build is detected as `/Od`,
 `strong`, from the analysis sample; and the x64-driver-against-32-bit-file gap fires there and not
 for the x86 driver. Regression, one suite at a time: `check_masked_bytes`/`check_gate_tiers`
