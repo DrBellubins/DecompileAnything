@@ -132,6 +132,15 @@ class Verdict:
 	# what gates `exact`: two bodies that reach the same things in the same order differ in those
 	# bytes whatever the source said, because the link wrote them.
 	bytes_equal_masked: bool = False
+	# `match_percent` counts instructions whose *text* is identical, register names included. That
+	# is a byte statement in disguise (identical text assembles to identical bytes, and the fields
+	# the link writes are compared separately), but it weighs every instruction the same. These
+	# three weigh it in bytes instead: the bytes of the original covered by an instruction the
+	# candidate reproduces exactly, over the longer body. A project that sets a byte-match bar per
+	# function (90 %) wants this one; Docs/x86-32bit-issues.md §35.
+	bytes_matched: int = 0
+	bytes_matched_over: int = 0
+	byte_percent: float = 0.0
 	bytes_comparable: bool = False   # both bodies are known, so the byte test can be run at all
 	bytes_masked: bool = False       # False = no field lists were given, so the test is unmasked
 	masked_byte_fields: dict = field(default_factory=dict)
@@ -605,7 +614,12 @@ def _align(original: list, candidate: list, ledger: dict[int, list[dict]] | None
 						"original_address": a.address, "candidate_address": b.address,
 						"why": "the lines match but not what they reach: " + why, "hidden": True})
 	categories["relocation"] += hidden
-	return {"matched": sum(block.size for block in matcher.get_matching_blocks()),
+	blocks = matcher.get_matching_blocks()
+	return {"matched": sum(block.size for block in blocks),
+		# which stretches of the two streams line up exactly, in token indices: the count of
+		# matched instructions is what `match %` divides, and the stretches themselves are what
+		# makes a *byte*-weighted figure possible (see `byte_percent` in compare())
+		"blocks": [(block.a, block.b, block.size) for block in blocks],
 		"replaced": replaced, "hidden": hidden, "categories": categories, "diff": diff,
 		"original_instructions": len(left), "candidate_instructions": len(right)}
 
@@ -619,6 +633,48 @@ def _fold_registers(tokens: list, side: str, vocabulary) -> list[Token]:
 	"""
 	return [Token(text=abstract_registers(token.text, vocabulary, side), mnemonic=token.mnemonic,
 		address=token.address, refs=token.refs) for token in tokens]
+
+
+def _instruction_lengths(tokens: list, body_len: int) -> list[int]:
+	"""How many bytes each token's instruction occupies, from the addresses the tokens carry.
+
+	The two sides number their instructions differently - the original by load address, a candidate
+	object from its own start - so this is done per side, and only differences between neighbours
+	are used. The last instruction runs to the end of the body, which is the only place its length
+	can come from.
+	"""
+	if not tokens or body_len <= 0:
+		return []
+	offsets = [token.address - tokens[0].address for token in tokens]
+	lengths = []
+	for index, offset in enumerate(offsets):
+		next_offset = (offsets[index + 1] if index + 1 < len(offsets)
+			else max(offset, body_len - (tokens[0].address - tokens[0].address)))
+		lengths.append(max(0, next_offset - offset))
+	if offsets:
+		covered = sum(lengths)
+		span = body_len - (tokens[0].address - tokens[0].address)
+		if covered < span:            # the body runs past the last instruction the analysis listed
+			lengths[-1] += span - covered
+	return lengths
+
+
+def _matched_bytes(original: list, blocks, original_len: int, candidate_len: int) -> tuple[int, int]:
+	"""Bytes of the original an exact instruction match accounts for, and the denominator.
+
+	Only stretches the two bodies agree on are counted, so a unit that misaligns at the start does
+	not lose credit for the instructions it reproduces after that - which the positional byte
+	comparison does, and unfairly: one extra push at offset 0 makes every later byte of a correct
+	body read as a mismatch. Bytes the candidate does not have (a missing instruction) count against
+	it through the denominator, which is the longer of the two bodies.
+	"""
+	lengths = _instruction_lengths(original, original_len)
+	if not lengths and candidate_len:
+		# No original body to weigh (a synthetic comparison): fall back to instruction counts.
+		matched = sum(size for _a, _b, size in blocks)
+		return matched, max(len(original), candidate_len, 1)
+	got = sum(sum(lengths[a:a + size]) for a, _b, size in blocks)
+	return got, max(original_len, candidate_len, 1)
 
 
 def compare(original: list, candidate: list, vocabulary, *, threshold: float,
@@ -704,6 +760,10 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 	# `exact` makes; bytes equal outright imply it
 	verdict.bytes_equal_masked = bool(original_bytes) and (
 		verdict.bytes_equal or byte_check["equal"])
+	verdict.bytes_matched, verdict.bytes_matched_over = _matched_bytes(
+		original, strict["blocks"], len(original_bytes), len(candidate_bytes))
+	verdict.byte_percent = (round(100.0 * verdict.bytes_matched / verdict.bytes_matched_over, 2)
+		if verdict.bytes_matched_over else 0.0)
 	verdict.unverified, verdict.unverified_refs = len(unverified), unverified
 	verdict.waive = [name for name in waive if name in WAIVABLE]
 	verdict.tier = tier_for(categories, abstract["categories"], verdict.bytes_equal_masked,
@@ -759,6 +819,15 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 				"absolute addresses): %s" % (fields.get("original", 0), fields.get("candidate", 0),
 					"IDENTICAL" if verdict.bytes_equal_masked else
 					"differ - " + verdict.byte_gap))
+	# The byte-weighted figure, next to the instruction-count one. A unit whose every instruction is
+	# reproduced except two scores near 100 % here and a few percent there; the difference is which
+	# one weighs bytes. Both are reported because they answer different questions: "are the
+	# operations identical" (that one) and "how much of the original did this source reproduce"
+	# (this one).
+	if verdict.bytes_matched_over:
+		lines.append("  bytes reproduced %d/%d = %.2f%% (instructions matched exactly, weighed by "
+			"their length)" % (verdict.bytes_matched, verdict.bytes_matched_over,
+				verdict.byte_percent))
 	lines.append("  instructions %d vs %d (%+d)  categories: %s" % (
 		verdict.original_instructions, verdict.candidate_instructions, verdict.size_delta_instructions,
 		", ".join("%s %d" % (name, verdict.categories[name]) for name in CATEGORIES)))

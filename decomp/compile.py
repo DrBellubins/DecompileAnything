@@ -39,6 +39,9 @@ class Build:
 	arch: str = ""
 	why: str = ""
 	refused: bool = False
+	# Set when the driver was aborted by the loader that runs it and the compile was retried once
+	# (see `loader_aborted`). Anyone reading a build that succeeded is entitled to know it ran twice.
+	retried: str = ""
 
 	@property
 	def failed(self) -> bool:
@@ -65,6 +68,31 @@ def resolve(variant: dict | None, cfg: dict | None):
 	if cfg:
 		prefix, prefix_from = config.msvc_prefix(cfg)
 	return toolchain.compiler_for(variant or {}, prefix=prefix, prefix_from=prefix_from)
+
+
+_LOADER_ABORT = ("reached missing import", "cannot load", "image is not valid", "unimplemented")
+
+
+def loader_aborted(returncode, stderr: str = "", stdout: str = "") -> bool:
+	"""Did the *loader* give up on the compiler, rather than the compiler reject the source?
+
+	On this box an MSVC driver is a Windows PE run through a loader (there is no i386 Wine guest,
+	Docs/x86-32bit-issues.md §4), and that loader sometimes reaches an import it never bound and
+	aborts: the only output is its own line (e.g. `wibo: call reached missing import lstrcatW from
+	kernel32`), the process dies by signal or with a shell-level status >= 128, and no object is
+	produced (§38). It is intermittent, and it says nothing about the candidate source - a tool that
+	reported it as "the candidate did not compile" would be stating a false fact about the program.
+	A real compile error exits 1 or 2 with the compiler's own diagnostics, which is the common case
+	this must not mistake for an abort.
+	"""
+	if returncode is not None and 0 <= returncode < 128:
+		return False                     # the driver judged the source and said why
+	text = "%s\n%s" % (stderr or "", stdout or "")
+	if any(marker in text for marker in _LOADER_ABORT):
+		return True
+	# died without a compiler's verdict: killed by a signal (a negative status, or no status at
+	# all), or exited through a shell trap (>= 128). Neither is a statement about the source.
+	return returncode is None or returncode < 0 or returncode >= 128
 
 
 def build(sources: list[Path], object_path: Path, *, compiler: str | None = None,
@@ -103,7 +131,15 @@ def build(sources: list[Path], object_path: Path, *, compiler: str | None = None
 
 	object_path.parent.mkdir(parents=True, exist_ok=True)
 	started = time.time()
-	finished = spawn.run(command, timeout=timeout)
+	retried = ""
+	for attempt in (0, 1):
+		finished = spawn.run(command, timeout=timeout)
+		if (attempt == 0 and not finished.timed_out
+				and loader_aborted(finished.returncode, finished.stderr, finished.stdout)):
+			retried = ("the driver was aborted before it reported anything (its loader, not the "
+				"source); ran it once more")
+			continue
+		break
 	if finished.returncode is None and not finished.timed_out:
 		return Build(ok=False, command=command, object_path=object_path,
 			diagnostics=("compiler %r not found - set [variants.*] compiler in project.toml" % compiler
@@ -122,7 +158,8 @@ def build(sources: list[Path], object_path: Path, *, compiler: str | None = None
 		lines = lines[:_MAX_DIAGNOSTICS] + ["... %d more lines from the compiler" % hidden]
 	return Build(ok=process.returncode == 0, command=command, object_path=object_path,
 		diagnostics="\n".join(lines), seconds=round(time.time() - started, 2),
-		stderr_lines=len(lines), driver=compiler,
+		stderr_lines=len(lines), driver=compiler, retried=retried,
+		warnings=([retried] if retried else []),
 		arch=(driver.arch if driver is not None else toolchain.driver_bitness(compiler)[0]),
 		why=driver.why if driver is not None else "named by the caller")
 
@@ -233,9 +270,12 @@ def describe(result) -> list[str]:
 		return head + lines
 	if result.ok:
 		return head + ["build: ok (%.2fs) -> %s" % (result.seconds, result.object_path)] + (
+			["  note: %s" % result.retried] if getattr(result, "retried", "") else []) + (
 			["  compiler said:%s" % ("\n" + "\n".join("  " + line for line in
 				result.diagnostics.splitlines()[:20]))] if result.diagnostics else [])
 	lines = ["build: FAILED (%s)" % result.command[0]]
+	if getattr(result, "retried", ""):
+		lines.append("  note: %s" % result.retried)
 	if result.diagnostics:
 		lines += ["  " + line for line in result.diagnostics.splitlines()[:40]]
 	else:

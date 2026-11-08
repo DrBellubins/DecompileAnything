@@ -892,3 +892,220 @@ The reachability half of that map is worth recording too, because it bounds "wha
 are not** — the program is callback- and vtable-driven, so a call-graph order under-rates the parts
 reached only through a function pointer (`map.py`'s docstring measures the six such edges in the
 smaller image, one of which is the dialog procedure passed to `DialogBoxParamW`).
+
+## 34. `decomp try` asked this project for a variant it never had, because of how the analysis was cached (2026-11-08) #tool #variant
+
+Re-running the WinRAR.exe target in a new project directory (`Tests/Proprietary/winrar-reverse`),
+the first `decomp try` failed before compiling anything:
+
+```
+Tests/Proprietary/winrar-reverse/project.toml: no [variants.gcc-o0] (configured: msvc-o0-x86, msvc-o1-x86, msvc-o2-x86)
+```
+
+`try` defaults its variant to "the one the analysis was run with" (`meta.variant`), and that
+analysis was cached when the binary was analysed with `Tests/project.toml` in force, whose variant
+name is `gcc-o0`. The record is per-file, not per-config, so the target's own config - which
+correctly defines three v90 x86 variants - is asked for a variant invented by a different project's
+config, on a 32-bit MSVC target that could never be built by `gcc -O0`.
+
+Not fixed, and the fix is not obvious: guessing the variant from the config would silently change
+which build a unit is scored at, which is exactly what the field exists to prevent. The message is
+already good (it names the configured variants), and `decomp status` prints the recorded variant
+next to each target, so the diagnosis is one command away. What *is* worth doing sometime: have
+`decomp analyze` warn when the config in force at analysis time does not define the variant it is
+about to record against the file, because that is where the mismatch is created and it is invisible
+afterwards.
+
+What the run does instead: `tests/Proprietary/winrar-reverse/tools/da` pins
+`-v msvc-o2-x86` for `try` and `link`, with a comment saying why, so no command in the project's
+notes can accidentally score a unit at the wrong `-O`.
+
+Related papercut from the same first run, mine not the tool's: `include_dirs = [...]` written
+*after* a `[table]` header in a TOML file is that table's key, not a top-level one, so the config
+was read as "no include directories" and a candidate died on `C1083 Cannot open include file`.
+`decomp check` does report the include directories it found, so the answer was visible - but a
+candidate build that fails on a quoted include could say "0 include directories are configured for
+this target" rather than only showing the compiler's error.
+
+## 35. "byte-match %" was not a byte figure — added one (fixed, 2026-11-08) #tool #metric
+
+A unit of this target, 0x455790 (71 bytes), was reproduced instruction-for-instruction except for
+five instructions: eight opcode differences, six operand, one register, six missing. Its candidate
+was 57 bytes. The report said:
+
+```
+match 12.50% - progress only, the tier is what gates (the old threshold was 90%)
+```
+
+and that number is not a byte count and never was. `match_percent` is
+`matched_instructions / max(instruction counts)` where *matched* means the instruction **text** is
+identical down to the register names. So:
+
+* it is a byte statement in disguise in one direction - an identical text assembles to identical
+  bytes, which is why the `exact` tier implies 100 % - but it weighs every instruction the same,
+  so a 1-byte `pushl` and a 6-byte `cmpw` count alike;
+* it says nothing at all about how much of the original's bytes a near miss reproduces, and a
+  candidate whose only fault is that VC 9 chose `%ecx` where the target used `%edi` reads as a
+  handful of percent, which is honest about the bytes (those encodings *are* different bytes) but
+  not a description of how close the reading was.
+
+The project the user set for this target is a **90 % byte-match bar per function**, so the run
+needs a byte figure. `compare_bytes` already answers the yes/no question ("are these bodies the
+same bytes with the link-written fields masked"), which is what gates `exact`, and a positional
+byte count is not usable: with a `pushl %edi` at offset 0 in the original and nothing there in the
+candidate, *every* later byte of an otherwise identical body shifts, and the positional comparison
+reported 3/71 = 4.23 % for the unit above.
+
+What `decomp/diff.py` does now: the aligner already computes the stretches where the two streams
+match exactly (`difflib` matching blocks); `compare()` weights those stretches by the length of
+each instruction (lengths come from the addresses the tokens carry, per side, since a candidate
+object numbers its instructions from its own start) and reports
+
+```
+bytes reproduced 8/71 = 11.27% (instructions matched exactly, weighed by their length)
+```
+
+next to the instruction-count figure. Bytes the candidate does not have are counted against it
+through the denominator (the longer body). It is deliberately still "matched exactly": the tier
+stays the judge of correctness, and this number is the one a byte-match bar can be read against.
+Nothing that gates a tier changed - `bytes_equal_masked` and the tier rules are untouched.
+
+Regression, one suite at a time (they share the analysis cache, per the note in Tests/README.md):
+`check_phase2_try` OK, `check_diff_accounting` (285 verdicts) all groups passed, `check_gate_tiers`
+all groups passed, `check_masked_bytes` all groups passed, `check_phase4_evidence` 47 checks,
+`check_pe_target` OK, `check_phase5_ledger` 55 checks, `check_msvc_x86_candidate` OK.
+`check_coff_candidate` still exits 1 with `{'exact': 70, 'structural': 19}`, mean 100.00 % -
+identical to the pre-existing §22 baseline (its `KNOWN_GAPS` expectation is stale), so it is
+unchanged by this: re-ran it at this commit precisely so that claim is a measurement.
+
+For the project's own use: `Tests/Proprietary/winrar-reverse/tools/score.py` records that figure
+per unit in `scores.jsonl` and its "at the bar" count means **≥ 90 % of the unit's bytes *and*
+the configured tier**, both, with the reason printed for anything below.
+
+## 36. Three more codegen tells from the same image, all of them deciding a declaration (2026-11-08) #x86-32 #codegen
+
+Measured with the v90 driver on this target, in the new project; each changed a tier.
+
+* **`testl %e,%e / jbe` is `if (x > 0)` on an unsigned, and `je` is `if (x != 0)`.** The two
+  `strCopyN` bodies (0x46f500, 0x46f4c0) are byte-identical to the candidate except for that one
+  instruction when the count test is written `!= 0`: 54/54 bytes, 22/22 instructions, and
+  `match 95.45 %` at tier `none` on a single opcode difference. Writing `if (cch > 0)` inverts to
+  `jbe` and both units become `exact`. The count parameter is `unsigned` in the mangled names the
+  ledger carries for them (`...I@Z`), which agrees.
+* **A `bool` result that is held across a call is a local, not two `return`s.** 0x477bc0
+  (`ConvertToAnsi`, 53 bytes) keeps the constant 1 in `%bl` across the API call and has two exit
+  blocks. `if (!call) return false; return true;` compiles to a branchless `setne %al` (42 bytes,
+  tier none). `bool ok = true; if (!call) ok = false; return ok;` is 53/53 `exact`. An
+  `int ok = 1` local is 57 bytes with three opcode differences. The probe is
+  `Tests/Proprietary/winrar-reverse/probe/conv_variants.cpp`; it is worth keeping because the
+  three spellings differ only in how the result value is named.
+* **A value read from `.rdata` rather than folded into an immediate is a global in another
+  translation unit.** 0x455790 ends `movl 0x4c5874,%eax / movl %eax,(%edi)`; the file bytes at
+  0x4c5874 are `5c 00 00 00`, i.e. the wide string `"\\"`. Declaring that object in the same file
+  as `static const wchar_t g_szSep[2] = L"\\";` makes VC 9 fold it and emit `movl $0x5c,(%eax)` -
+  one instruction, four bytes shorter, and a *wrong* statement about the program. Declared
+  `extern const wchar_t g_szSep[2];` the candidate emits the same load-and-store pair, and the
+  reading is the correct one: the program keeps its path separator in one shared object (which is
+  also consistent with the same image accepting `/` - see `IsPathSepW` at 0x455760, which tests
+  both).
+
+One correction to §33's numbers, so both are not quoted back as if they measured the same thing:
+its "1,662 of 2,724 bodies are reachable from the entry point" counts every body, including the
+CRT's. `Tests/Proprietary/winrar-reverse/tools/march.py` counts reachability among the same call
+edges but reports the **program-owned** subset (731 of 1,817, 214,532 of 638,280 bytes), because
+that is the subset a source file could change. Both are correct for their question; a project's
+report should say which one it printed.
+
+## 37. A candidate's vptr store is a link-filled address, and the differ saw it as an operand difference — found, diagnosed, fixed (2026-11-08) #tool #relocation #vptr #fixed
+
+Unit 0x4313d0 of `WinRAR.exe` (35 bytes) reproduced nine instructions to nine, and still stopped at 82.86 % and tier `structural`. One line of the report explains it:
+
+```
+-0x4313d4  movl $DAT0, (%ecx)
++     0x4  movl $0, DAT0(%ecx)
+ ! operand: operands differ
+```
+
+The target stores the address of a one-slot vtable (`movl $0x4c7020,(%ecx)`). A candidate cannot spell that address: `cl` emits `movl $0x0,(%ecx)` with an `IMAGE_REL_I386_DIR32` against `??_7Sink…@@6B@`, because the value is the link's to choose. So the two bodies differ in one field **the link writes** — exactly the class of difference the byte comparison already masks — and it was counted as an `operand` difference.
+
+The first diagnosis of this (written before the reading was finished, and wrong in its mechanism) said the candidate had no reference for such an operand at all. It has one. The fault is **which operand owns the field**:
+
+* `normalize._slots` says plainly that `enc_offset` is "a convention, not a decoding": for a `[reg]` operand it may invent a displacement slot from the instruction's length (`movl $0x0,(%ecx)` is six bytes, and a `[reg + disp32]` encoding is never shorter than six), and for `cmpl $0, x(%ecx)` it reads two *real* fields from overlapping ranges. So an immediate slot and a displacement slot claimed the same four bytes.
+* `extract.CandidateObject.bindings` then preferred the memory operand — "pair the address operands first" — and bound the relocation to the `(%ecx)` displacement. `reference()` resolved it happily to the vtable object, so the reference existed; it was attached to an operand that is not the field, and the immediate kept its literal `0`. That is why the two sides printed different lines and the category was `operand`.
+
+The rule that settles it, and it is a property of the instruction set rather than of any target: **an absolute-address relocation (`IMAGE_REL_I386_DIR32`, `R_386_32`, `IMAGE_REL_AMD64_ADDR32`) rewrites a field that holds an address, and a register-relative displacement never holds one.** So when an instruction carries an immediate and another slot claiming the same bytes, the immediate is the field. The binder already knew the weak form of this ("a non-PIE 32-bit object writes `pushl $_ZTI14CVehicleEntity`: an `R_386_32` on an immediate of 0") as a *leftover* fallback, which fires only when nothing else competes — and here something always competes, because it is the same instruction.
+
+Fix (`decomp/extract.py`, in `bindings`): pair a non-PC-relative 4-byte relocation with the immediate whose claimed field the relocation's offset falls inside, but only when another slot claims those same bytes; otherwise the existing ordering is untouched, so x86-64 rip-relative bindings are unaffected.
+
+Test (`Tests/probe/x86_addr_store.cpp`, group 6 of `Tests/tools/check_msvc_x86_candidate.py`): the smallest source that stores the address of a global through a register-relative operand three ways (`(%ecx)`, `8(%esi)`, a stack slot), asked of **both** 32-bit toolchains the repository has. Each must bind exactly one reference, to the `imm` operand, naming `g_slot`, of class `data`; `store_constant` — same instruction shape, no relocation — must bind nothing, because the fix is about who owns a relocated field and not about inventing references. Measured with the fix stashed out: `bound to disp`, three FAILs per toolchain; with it: all six pass, `bound to imm`, names `?g_slot@@3HA` / `g_slot`.
+
+Regressions (sequential): `check_msvc_x86_candidate` 0 with the new group, `check_coff_candidate` {exact 70, structural 19} and mean 100.00 % = its §22 baseline unchanged, `check_masked_bytes` gcc-o0-x86 {67, 21, 1} unchanged, `check_diff_accounting`, `check_gate_tiers`, `check_phase2_try`, `check_msvc_x86_reference`, `check_phase4_evidence`, `check_phase6_link` all 0.
+
+End to end, on the unit that started this: 0x4313d0 went from "bytes reproduced 29/35 = 82.86 %, operand 1" to **35/35 = 100 %, categories all zero**, still capped at `structural` only because three *other* references (two placeholder callees and the vtable object) are unnamed. Scale of what this unlocks on an i386 MSVC target: **2,067 instructions in 726 of the image's 1,784 program-owned bodies** store an address immediate — every constructor and destructor, and every function that installs a callback or takes a global's address.
+
+## 38. `cl` under wibo dies in the loader instead of compiling: `wibo: call reached missing import lstrcatW from kernel32` (2026-11-08) #tool #wibo #fixed
+
+While compiling project files that include `<windows.h>`, the v90 driver died like this:
+
+```
+pathutil.cpp
+wibo: call reached missing import lstrcatW from kernel32
+Aborted (core dumped)
+```
+
+No object, exit 134, and not one word about the source. `toolchains/vc90/bin/x86/cl` is a wrapper that ends in `exec "$WIBO" "$BINDIR/cl.exe" "$@"` — this box has no i386 Wine guest (§4), so wibo loads `cl.exe` itself, and the message is wibo's: a call landed on an import thunk it never bound. It is *not* the §22 "wibo cannot pass `<vector>`" case, which is C++ EH inside STL headers and deterministic.
+
+**What sets it off, measured.** The first read of this session called it intermittent ("seen three times in roughly forty invocations… a controlled repeat came back 8/8"), and that was wrong: the eight that came back were eight that wrote into a directory that already existed. The variable was the **output path**. `cl` does not create an output directory, and under this loader the failure to open it never becomes a compiler diagnostic — `cl` calls into path-building code, hits `lstrcatW`, and dies:
+
+| invocation | result |
+|---|---|
+| `/Fotmp/nx.obj`, `tmp/` absent in the working directory | `lstrcatW`, exit 134, no object |
+| same command, `tmp/` created first | exit 0, object written |
+| `/Fotmp2/deep/z.obj` (two levels missing) | `lstrcatW`, exit 134 |
+| `/Fo/tmp/missing-dir/z.obj` (absolute, directory absent) | `lstrcatW`, exit 134 |
+| `/Fo/tmp/y.obj` (absolute, directory present) | exit 0 |
+
+So: **any `/Fo` whose containing directory does not exist**, relative or absolute, and the source's relativity is irrelevant. That is a property of the loader running the compiler, not of the target, the flags, or the source — which is why the fix belongs in the tool and not in a project.
+
+**Fixed** (`decomp/compile.py`): `compile.loader_aborted(returncode, stderr, stdout)` separates "the *loader* gave up on the compiler" (a status ≥ 128, a negative status, or no status at all, and either a known loader line or nothing printed) from "the compiler judged the source", and `build()` re-runs the identical command once in that case. The result and `describe()` both say it happened (`retried`, printed as `note: the driver was aborted before it reported anything (its loader, not the source); ran it once more`), because a build that succeeded on the second attempt should not be quoted as if it succeeded once. A compile error is **not** retried: it exits 1 or 2 with the compiler's words, and retrying those would hide the error, double the time of every failed candidate, and re-run a compiler writing into the same object file.
+
+The loop itself should not hit this any more: `build()` has always created `object_path.parent` before invoking a driver, which is the whole reason forty-odd `decomp try` runs today did not trip it while my hand-typed shell commands did. The retry is for the rest — a loader hole, a killed driver, a directory that could not be created — and the honest part of the fix is that the loader's own line is what the failure now reports, instead of the loop saying "the candidate does not compile".
+
+`Tests/tools/check_loader_abort.py` drives `build()` with a stub driver of its own, so it does not wait for the bug to recur, and counts invocations: abort-then-succeed → run twice, `ok`, note present; always-aborts → run twice, and the failure the reader sees is the loader's line; a compile error → run **once**, the compiler's words unchanged, no invented note; killed silently → retried. 21 checks, exit 0. The false-positive half is the part worth testing: a driver that exits 0 is never an abort whatever it printed, and a driver's own `fatal error` is never one.
+
+
+## 39. A call to a function of the same object turned into a jump to a label inside the caller (fixed, 2026-11-08) #tool #coff #relocation #fixed
+
+`GetUserSettingD` (0x45fe70, 28 bytes) had been 28/28 for two days. It fell to 23/28 the moment its callee was reproduced *in the same source file*:
+
+```
+-0x45fe84  calll SYM15
++     0x14  calll L0
+ ! operand: operands differ
+```
+
+`L0`. The candidate's call had stopped naming anything. Two separate faults were behind that one line, and the second only shows up when a tool asks about two functions in one object.
+
+**1. Where an address is an edge, and where it is the link's turn.** An MSVC front end gives every function its own section, and every one of those sections carries the same name — plain `.text` from the MSVC 9 driver, `.text$mn` from a newer one. This is not a flag to hunt for: `cl /O2` (the variant the WinRAR reading is scored at) splits them with nothing on the command line, three `.text` sections for a three-function probe; the newer driver at `/Od` keeps one section and needs `/Gy` to split. So a call from one function of a translation unit to another is a call *across sections whose names are identical*, and its relocation record names the callee's own symbol (measured in both objects: `?ReadSettingD@@YGKPAUHKEY__@@PB_W1K@Z` → section `.text#1`, `_inner_of_this_unit` → `.text$mn#2`) with the field in the code left at **0**.
+
+Capstone therefore resolves the call to address 0, and `normalize_function`'s rule for an operand inside the unit applies: a branch or call that lands inside the body being compared becomes `L<offset>`, a rule that exists for real edges (a jump to a cold block of the same function, a self-recursive call). Both sections start at offset 0, so the callee's address is "inside" the caller, and the reference the binder had just resolved was thrown away at tokenising time. Nothing about the *relocation* was wrong — the tokeniser's "inside this unit" test was being asked about an address from another section.
+
+Fix (`decomp/normalize.py`, `normalize_function`): the tokeniser is told which section those addresses live in, and an address carried by a reference from a **different** section is not an edge in this unit. A call inside one shared section is untouched: it needs no relocation at all and is resolved by the existing in-section symbol lookup, which is also how a self-recursive call keeps reading as `L0` on both sides. `decomp/cli.py` passes `original.section` / `candidate.section`.
+
+**2. A function's relocations were read from whatever function was asked about last.** `extract.CandidateObject.function()` stored the extents it had just assembled in instance state (`self._extent_sections`), and `bindings()` and `masked_fields()` filtered the relocation table through that state. Ask for one function and it is correct. Ask for a second — a caller and its callee, which is what a translation unit *is* — and the second one's sections decide which relocations belong to the first: measured on the split-object probe, `calls_its_own_unit` then reports **nothing bound** for its call, and a unit that is a faithful reproduction prints `calll` with no target. Nothing errors; the reference is just gone.
+
+Fix: extents travel on the `Function` (`extent_sections`, and a `blocks()` that yields `(section, address, length)` per block), instead of being remembered by the object. That is also the shape a two-block body needs independently of this bug — a `-O2` cold partition is a *different section* with its own address domain — and the instance state is now gone, so there is no order in which asking twice can differ from asking once.
+
+Both were considered and rejected as fixes elsewhere: the relocation reader already resolves these calls correctly (it names the callee's symbol by table index, which is why the section's name never has to be trusted — while it is at it, `_read_relocations_coff` no longer labels an unknown symbol index as living in the section the record sits in, which is the *source*, not the target). Reading a record that names a *section* symbol as an offset into that section was measured too: it happens for `.debug$F`, and not for any code these compilers produce.
+
+Test (`Tests/probe/x86_call_pair.cpp`, group 7 of `Tests/tools/check_msvc_x86_candidate.py`): a caller and a callee in one TU plus a self-recursive function, built by the same driver twice — as it comes, and with `/Gy`. Three claims, one per rule:
+
+* the split object really does put caller and callee in two sections sharing one name (otherwise the group measures nothing), the call reaches a **function** named `?inner_of_this_unit@@YAHH@Z`, and the token is `calll SYM0`;
+* a self-recursive call is still `calll L0` — the edge rule the fix must not break;
+* the one-section object has no relocation on that call at all, and still reaches the callee.
+
+Measured with the tokeniser guard disabled: `the call is tokenised as a reference to a symbol (calll L0)` FAILs. Measured with the extent state still on the object: `the call … reaches a function (nothing is bound)` FAILs. With both: the group is 9 checks and exits 0.
+
+Regressions (sequential, on the final code): `check_msvc_x86_candidate` 0 with group 7 added, `check_coff_candidate` tiers {exact 70, structural 19} with all 89 extents at 100.00 % and byte-identical output to the §22 baseline (21 report lines both times), `check_phase5_o2` (cold partitions — the `extent_sections` path) OK, `check_phase5_ledger` 55, `check_phase4_evidence` 47, `check_phase6_link` 43, `check_phase7_fidelity` 56, `check_diff_accounting` / `check_masked_bytes` / `check_gate_tiers` all groups, `check_phase2_try`, `check_pe_target`, `check_loader_abort` (made independent of a leftover counter file: it now clears its own, and passes twice in a row).
+
+End to end on the units that started it: 0x45fe70 back to **28/28 = 100 %**, and the string getter 0x45fe40 built the same way is **38/38 = 100 %**; both stay `structural` because the callee they reach is itself unreproduced, which is the honest reason rather than a byte loss. Scale: any candidate that defines a caller and a callee in one translation unit — every subsystem of every target — had its internal calls reported as operand differences.

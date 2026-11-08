@@ -757,7 +757,7 @@ def _operand_spans(operands: str) -> list[tuple[int, int]]:
 
 def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruction],
 	bind, base: int, size: int, register_abstract: bool = False,
-	extents: list[tuple[int, int]] | None = None) -> list[Token]:
+	extents: list[tuple[int, int]] | None = None, section: str = "") -> list[Token]:
 	"""Tokenise one function.
 
 	`bind(instruction) -> {operand index: Ref}` says what each address operand refers to:
@@ -768,6 +768,12 @@ def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruct
 	bytes being compared (`extents`) rather than a raw address: a unit whose cold half was
 	linked into another part of `.text`, and a candidate whose cold half sits in
 	`.text.unlikely`, then agree on the same label for the same edge.
+
+	`section` is the section those addresses live in. A COFF object built by an MSVC front end gives
+	every function its own section, so a call to one of its own functions is relocated against the
+	callee and its *encoded* value is 0 - an address that belongs to the callee's section, not to
+	this one, and one that lands inside this body by accident when both sections start at offset 0.
+	An address from another section is therefore not an edge in this unit.
 	"""
 	blocks = list(extents) if extents else [(base, size)]
 
@@ -797,6 +803,9 @@ def normalize_function(vocab: Vocabulary, side: str, instructions: list[Instruct
 			# relocation behind the reference says where it goes.
 			target = ref.address if (ref is not None and ref.address is not None) else slot.value
 			here = position_of(target) if target is not None else None
+			if here is not None and ref is not None and section and ref.section and (
+					ref.section != section):
+				here = None
 			replacement = None
 			if here is not None and slot.kind in ("branch", "call") and (
 					ref is None or ref.kind != "external"):

@@ -22,6 +22,13 @@ a field it cannot mask, cannot read the offset out of, and cannot compare.
 4. **The negative controls.** The deliberately wrong candidates of
    `Tests/examples/candidate_math_bad.cpp`, built by the x86 driver, still reported as the kind of
    wrong they are.
+5. **One table, reached two ways**, and **an address stored through a register operand** (X86-6,
+   \u00a737): the same object read from the instruction's immediate and from the analysis' resolved
+   reference must be one object.
+6. **A call to a function of the same object** (\u00a739): with function-level linking the call's
+   relocation names the callee's *section symbol*, and the unfilled field disassembles to an address
+   inside the caller's own body. It has to reach the callee, while a self-recursive call stays an
+   edge inside the unit and a call inside one shared section keeps needing no relocation at all.
 
 The candidate objects are built through `compile.build(variant=...)`, i.e. the same driver
 resolver `decomp try` uses (`arch = "x86"` -> `<prefix>/bin/x86/cl`), and every object is
@@ -92,11 +99,12 @@ def _objects_for(store: cache.Cache, suffix: str = "") -> Path:
 	return store.root / ("candidates-x86-%s%s" % (VARIANT_NAME, suffix))
 
 
-def object_for(source: Path, work: Path, variant_body: dict | None = None) -> tuple[Path, str]:
+def object_for(source: Path, work: Path, variant_body: dict | None = None,
+	extra_flags: list[str] | None = None) -> tuple[Path, str]:
 	"""Build one translation unit with this variant's own driver and flags (the resolver's choice)."""
 	body = variant_body if variant_body is not None else VARIANT
 	object_path = work / ("%s.obj" % source.stem)
-	built = build_.build([source], object_path, flags=toolchain.build_flags(body),
+	built = build_.build([source], object_path, flags=toolchain.build_flags(body) + list(extra_flags or []),
 		includes=config.include_dirs(CONFIG, body), variant=body, cfg=CONFIG)
 	if not built.ok:
 		print("  %s" % "\n  ".join(build_.describe(built)))
@@ -499,6 +507,230 @@ ALL_FAILURES = False
 cache_store = None
 
 
+def stored_addresses(variant_name: str, failures: list[str]) -> None:
+	"""An address stored through a register-relative operand reaches its object (§37).
+
+	One question about the candidate side, with no target involved. In a 32-bit object the value is
+	still zero and a relocation sits on the four bytes of the *immediate* of `movl $0, 8(%esi)`;
+	those same four bytes are also what a slot list built from instruction length would call the
+	memory operand's displacement, and only one of the two claims can be a field of the
+	instruction. Bind the relocation to the displacement and the object the code reaches is gone
+	from the candidate side: what the link fills in then reads as an operand difference, and a unit
+	that stores a vptr, a global's address or a function pointer can never be matched on it. That
+	covers every constructor and destructor of a C++ target of this era, and any function that
+	takes the address of a global.
+
+	`Tests/probe/x86_addr_store.cpp` is the smallest source that makes all three shapes, asked of
+	both 32-bit toolchains this repository has. Each unit must bind exactly one reference, to the
+	*immediate* operand, naming the global; and `store_constant`, which has the same instruction
+	shape and no relocation, must still bind nothing - the fix is about who owns a relocated field,
+	not about inventing references.
+	"""
+	probe = TESTS / "probe" / "x86_addr_store.cpp"
+	units = ["store_global", "store_field", "store_local"]
+	try:
+		judge_name, judge = config.variant(CONFIG, variant_name)
+	except config.ConfigError as exc:
+		print("   no variant %s in Tests/project.toml: %s" % (variant_name, exc))
+		return
+	# a directory per variant: the two 32-bit toolchains build the same probe, and the second
+	# build must not overwrite the first one's object
+	work = _objects_for(cache_store, "addr-store-%s" % variant_name)
+	work.mkdir(parents=True, exist_ok=True)
+	object_path, problem = object_for(probe, work, variant_body=judge)
+	if problem:
+		failures.append("%s: the address-store probe did not build: %s" % (variant_name, problem))
+		return
+	candidate = extract.CandidateObject(object_path)
+	if candidate.error:
+		failures.append("%s: %s" % (variant_name, candidate.error))
+		return
+	expect(candidate.bits == 32, "%s: the probe object measures %d-bit, this group is the 32-bit "
+		"one" % (variant_name, candidate.bits), failures)
+	handle = normalize.capstone_for("x86:LE:32:default", detail=True)
+	if handle is None:
+		failures.append("%s: no capstone decoder for x86:LE:32" % variant_name)
+		return
+
+	def reached(function):
+		"""Every (instruction, slot, reference) this function's bindings state."""
+		bind, _refs = candidate.bindings(function)
+		out = []
+		for instruction in normalize.decode_function(handle, function.address, function.bytes,
+				None, None):
+			bound = bind(instruction) or {}
+			for slot in instruction.slots:
+				ref = bound.get(slot.operand)
+				if ref is not None:
+					out.append((instruction, slot, ref))
+		return out
+
+	for name in units:
+		try:
+			function = candidate.function(name)
+		except extract.SymbolNotFound as exc:
+			failures.append("%s: %s" % (variant_name, exc))
+			continue
+		found = reached(function)
+		expect(len(found) == 1, "%s %s: the address it stores is bound to exactly one operand "
+			"(%d: %s)" % (variant_name, name, len(found),
+				", ".join("%s@%s" % (s.kind, hex(i.address)) for i, s, _ in found)), failures)
+		if len(found) != 1:
+			continue
+		_instruction, slot, ref = found[0]
+		expect(slot.kind == "imm", "%s %s: the relocated field belongs to the immediate, not to a "
+			"displacement (bound to %s)" % (variant_name, name, slot.kind), failures)
+		expect("g_slot" in (ref.raw or "") + (ref.name or ""), "%s %s: the reference names the "
+			"global the source stores the address of (%s)" % (variant_name, name, ref.raw), failures)
+		expect(ref.cls == "data", "%s %s: storing the address of data is a data reference (%s)"
+			% (variant_name, name, ref.cls), failures)
+	# the control: the same instruction shape, no relocation, no reference
+	try:
+		held = reached(candidate.function("store_constant"))
+	except extract.SymbolNotFound as exc:
+		failures.append("%s: %s" % (variant_name, exc))
+		return
+	expect(not held, "%s store_constant: a store of a constant binds no reference (%d)"
+		% (variant_name, len(held)), failures)
+
+
+def same_object_call(variant_name: str, failures: list[str]) -> None:
+	"""A call to another function of the same object reaches that function (\u00a739).
+
+	One question about the candidate side, with no target involved. A caller and a callee in one
+	translation unit are the ordinary shape of a decompilation project, and what the object makes of
+	the call depends on one flag. Left as it comes, the front end puts every function of the unit in
+	one section, the call carries **no relocation**, and the callee is read by looking the final
+	address up in that section. With function-level linking (`/Gy`, what an optimizing build of this
+	era ships) every function gets its own section and every one of those sections shares a name, so
+	the call's relocation names the callee's *section symbol* - this object has no symbol for the
+	callee at all - and the field in the code holds 0, which disassembles as a call to the next
+	instruction. An address of 0 is inside the caller's own body, because both sections start at 0.
+	A tool that believes it turns a call into a jump to a label inside the unit and reports an
+	operand difference on a field the link writes: the callee vanishes, and the unit cannot be shown
+	right however faithful the source is.
+
+	`Tests/probe/x86_call_pair.cpp` makes both shapes, asked of the same driver. The `/Gy` object is
+	the one under test; the plain object is the control that the same-section lookup still works, and
+	`calls_itself` is the control in the other direction - a self-recursive call *is* an edge inside
+	the unit, and must still read as one.
+	"""
+	probe = TESTS / "probe" / "x86_call_pair.cpp"
+	try:
+		judge_name, judge = config.variant(CONFIG, variant_name)
+	except config.ConfigError as exc:
+		print("   no variant %s in Tests/project.toml: %s" % (variant_name, exc))
+		return
+	handle = normalize.capstone_for("x86:LE:32:default", detail=True)
+	if handle is None:
+		failures.append("%s: no capstone decoder for x86:LE:32" % variant_name)
+		return
+
+	def sites(candidate: extract.CandidateObject, function) -> list:
+		"""Every call this function makes, with the reference behind it and its token text."""
+		bind, _refs = candidate.bindings(function)
+		instructions = normalize.decode_function(handle, function.address, function.bytes,
+			None, None)
+		tokens = normalize.normalize_function(normalize.Vocabulary(), "candidate", instructions,
+			bind, function.address, function.size, False, function.extents, function.section)
+		found = []
+		for instruction, token in zip(instructions, tokens):
+			if not token.text.startswith("call"):
+				continue
+			bound = bind(instruction) or {}
+			ref = next((bound[slot.operand] for slot in instruction.slots
+				if bound.get(slot.operand) is not None), None)
+			found.append((instruction, ref, token))
+		return found
+
+	def built_object(suffix: str, extra_flags: list[str]) -> tuple:
+		work = _objects_for(cache_store, "call-pair-%s%s" % (variant_name, suffix))
+		work.mkdir(parents=True, exist_ok=True)
+		object_path, problem = object_for(probe, work, variant_body=judge, extra_flags=extra_flags)
+		if problem:
+			failures.append("%s%s: the call-pair probe did not build: %s"
+				% (variant_name, suffix, problem))
+			return None
+		candidate = extract.CandidateObject(object_path)
+		if candidate.error:
+			failures.append("%s%s: %s" % (variant_name, suffix, candidate.error))
+			return None
+		if candidate.bits != 32:
+			failures.append("%s%s: the probe object measures %d-bit"
+				% (variant_name, suffix, candidate.bits))
+			return None
+		return candidate
+
+	# 1. the shape under test: function-level linking, and what it does to the call.
+	split = built_object("-gy", ["/Gy"])
+	if split is not None:
+		try:
+			caller = split.function("calls_its_own_unit")
+			callee = split.function("inner_of_this_unit")
+		except extract.SymbolNotFound as exc:
+			failures.append("%s: %s" % (variant_name, exc))
+			caller = None
+		if caller is not None and callee is not None:
+			expect(caller.section != callee.section and caller.section.split("#", 1)[0]
+				== callee.section.split("#", 1)[0],
+				"%s: the /Gy object puts the caller and the callee in two sections that share one "
+				"name (%s / %s) - this group measures that shape or nothing"
+				% (variant_name, caller.section, callee.section), failures)
+			found = sites(split, caller)
+			expect(len(found) == 1, "%s: calls_its_own_unit makes one call (%d)" % (variant_name,
+				len(found)), failures)
+			if len(found) == 1:
+				_instruction, ref, token = found[0]
+				expect(ref is not None and ref.kind == "function", "%s: the call to a function of the "
+					"same object reaches a function (%s)" % (variant_name,
+						ref.kind if ref else "nothing is bound"), failures)
+				expect(ref is not None and "inner_of_this_unit" in (ref.raw or "") + (ref.name or ""),
+					"%s: the reference names the callee of this unit (%s)" % (variant_name,
+						(ref.raw or ref.name) if ref else "-"), failures)
+				# what the differ sees: a reference, not an edge to a label inside the body
+				expect("SYM" in token.text, "%s: the call is tokenised as a reference to a symbol (%s)"
+					% (variant_name, token.text), failures)
+		# the self-call stays an edge inside the unit - the rule the fix must not break
+		try:
+			recursive = split.function("calls_itself")
+		except extract.SymbolNotFound as exc:
+			failures.append("%s: %s" % (variant_name, exc))
+			recursive = None
+		if recursive is not None:
+			found = sites(split, recursive)
+			expect(len(found) == 1, "%s: calls_itself makes one call, to itself (%d)"
+				% (variant_name, len(found)), failures)
+			if len(found) == 1:
+				_instruction, ref, token = found[0]
+				# the reference may be there (the self-call is a symbol of this object too); what must
+				# not change is how it reads: an edge to a label inside this body, on both sides
+				opcode, _, target = token.text.partition(" ")
+				expect(target.startswith("L"),
+					"%s: a self-recursive call is still an edge inside the unit (%s: %s)"
+					% (variant_name, token.text, (ref.raw if ref else "unbound")), failures)
+
+	# 2. the control: without function-level linking there is no relocation on the call at all, and
+	# the callee is read from the address the assembly already settled. That path must keep working.
+	shared = built_object("", [])
+	if shared is not None:
+		try:
+			caller = shared.function("calls_its_own_unit")
+			callee = shared.function("inner_of_this_unit")
+		except extract.SymbolNotFound as exc:
+			failures.append("%s: %s" % (variant_name, exc))
+			caller = None
+		if caller is not None and callee is not None:
+			expect(caller.section == callee.section, "%s: the plain object keeps the unit in one "
+				"section (%s / %s) - this control measures that shape or nothing"
+				% (variant_name, caller.section, callee.section), failures)
+			found = sites(shared, caller)
+			expect(len(found) == 1 and found[0][1] is not None
+				and "inner_of_this_unit" in (found[0][1].raw or "") + (found[0][1].name or ""),
+				"%s: a call inside one section still reaches its callee (%s)" % (variant_name,
+					"; ".join((ref.raw if ref else "unbound") for _i, ref, _t in found)
+					or "no call found"), failures)
+
+
 def main() -> int:
 	global VARIANT, VARIANT_NAME, CONFIG, KEY, OFFSET, cache_store
 	parser = argparse.ArgumentParser(prog="check_msvc_x86_candidate.py",
@@ -579,9 +811,14 @@ def main() -> int:
 		controls(answer, failures)
 	print("\n=== 5. one table, reached two ways (X86-6's acceptance) ===")
 	reached_twice(VARIANT_NAME, failures)
+	print("\n=== 6. an address stored through a register operand reaches its object (\u00a737) ===")
+	stored_addresses(VARIANT_NAME, failures)
+	print("\n=== 7. a call to a function of the same object reaches that function (\u00a739) ===")
+	same_object_call(VARIANT_NAME, failures)
 	if VARIANT_NAME == "msvc-o0-x86":
 		# the same rule on the other 32-bit toolchain - X86-6 is one phase, not two
 		reached_twice(OTHER_32, failures)
+		stored_addresses(OTHER_32, failures)
 
 	if failures:
 		print("\nFAILURES (%d):" % len(failures))

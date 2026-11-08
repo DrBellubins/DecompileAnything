@@ -519,6 +519,75 @@ run a 32-bit image), and `crosscheck` treats that as "no goldens". (Superseded t
 X86-4 below: with wibo installed the 32-bit program runs, its goldens are captured, and its
 self-test passes.)
 
+## Which operand owns a relocated field (§37, 2026-11-08) #x86-32 #relocation
+
+A 32-bit object stores an address as `movl $0x0, 8(%esi)` plus an `IMAGE_REL_I386_DIR32` sitting on
+the immediate. Those four bytes are also what a slot list built from instruction *length* would call
+the memory operand's displacement — and only one of the two is a field of the instruction. The
+binder preferred the memory operand ("pair the address operands first"), so the reference resolved to
+the right object and was attached to the wrong operand, the immediate kept its literal `0`, and the
+differ reported an `operand` difference on a field the link fills in. Every unit that stores a vptr,
+a global's address or a function pointer was capped by it — on the WinRAR 4.11 image, 2,067
+instructions in 726 bodies.
+
+Group 6 of `check_msvc_x86_candidate.py` is the acceptance, asked of **both** 32-bit toolchains:
+`Tests/probe/x86_addr_store.cpp` stores `&g_slot` through `(%ecx)`, through `8(%esi)` and into a
+stack slot, and each must bind exactly one reference, to the `imm` operand, naming `g_slot`, of class
+`data`. `store_constant` — same shape, no relocation — must bind nothing, because the rule is about
+who owns a relocated field, not about inventing references. With the fix stashed out the group fails
+six times (`bound to disp`); with it, six pass (`bound to imm`). Nothing else moved: `check_coff_candidate`
+stays at `{exact 70, structural 19}` (its §22 baseline), `check_masked_bytes`/`check_gate_tiers` at
+gcc-o0-x86 `{67, 21, 1}`, and `check_diff_accounting`, `check_phase2_try`, `check_msvc_x86_reference`,
+`check_phase4_evidence`, `check_phase6_link` all exit 0. End to end, the unit that started it went
+from 29/35 bytes with an operand difference to **35/35 with every category at zero**.
+
+## A driver aborted by its loader is retried once, a compile error is not (§38, 2026-11-08)
+
+`toolchains/*/bin/x86/cl` runs a Windows PE through a loader; that loader sometimes dies instead of
+starting the compiler — `wibo: call reached missing import lstrcatW from kernel32`, exit 134, no
+object, and not one word about the source. Measured cause: **a `/Fo` whose containing directory does
+not exist** (relative or absolute — VC does not create output directories, and under this loader the
+failed open never becomes a diagnostic). `compile.build` already creates the directory, which is why
+the loop never tripped it and my hand-typed shell commands did.
+
+`compile.loader_aborted()` separates a killed driver from a compiler that judged the source, `build()`
+re-runs the command once in the first case and says so (`retried`, printed as a `note:` line by
+`describe`), and never retries the second. `Tests/tools/check_loader_abort.py` (21 checks, ~2 s)
+drives `build()` with a stub driver it writes itself and counts invocations — abort-then-succeed runs
+twice and reports the retry, always-aborts runs twice and reports the loader's line as the failure, a
+compile error runs **once** with the compiler's words unchanged, a silent SIGKILL is retried. It does
+not depend on the bug recurring on demand.
+
+Two probes from the same day, both read out of objects rather than argued about:
+`Tests/probe/x86_addr_store.cpp` (above) and `Tests/probe/wstr_scan_shapes.cpp`, which settles which
+C spelling makes VC 9 emit the terminator scan `movw (%eax),%cx / addl $2,%eax / testw %cx,%cx /
+jne <loop>` — `while (*p++) ;` does, `while (*p) ++p;` and `for (; *p; ++p)` do not (they emit a
+`cmpw $0,(%eax)` test at the top), which is what several bodies of a 32-bit MSVC target show.
+
+## A call to a function of the same object reaches that function (§39, 2026-11-08) #tool #coff #relocation
+
+A decompilation project defines callers and callees in one translation unit, and the image then calls
+them directly. In the object the call looks like nothing: an MSVC front end gives every function its
+own section — VC 9's `/O2` does it with no flag asked for, a newer driver with `/Gy` — all of those
+sections carrying one name, the relocation record naming the callee's symbol, and the four bytes in
+the code left at **0**. Capstone reads that as a call to address 0, which is inside the caller's own
+body (both sections start at 0), and the rule that turns a branch inside the unit into `L<offset>`
+collected it: the differ printed `calll L0` against `calll SYM15` and called it an operand
+difference, so a unit that reproduced the call exactly lost its bytes for making it.
+
+Group 7 of `check_msvc_x86_candidate.py` is the acceptance: `Tests/probe/x86_call_pair.cpp` (a caller,
+a callee, and a self-recursive function) built by the same driver twice, as it comes and with `/Gy`.
+It requires the split object to really be split — two sections sharing a name, or the group would
+measure nothing — then holds three rules at once: the cross-section call reaches a **function** named
+`?inner_of_this_unit@@YAHH@Z` and tokenises as `calll SYM0`; a self-recursive call is still
+`calll L0`, because that one really is an edge inside the unit; and the one-section object, where the
+call carries no relocation at all, still reaches its callee by the in-section lookup. 9 checks, exit
+0. With the tokeniser's section rule disabled the third line becomes `calll L0` and the group fails;
+with the extents still remembered on the `CandidateObject` rather than carried on the `Function`, the
+caller's call reports *nothing bound* and it fails the same way — asking a second function about its
+extents silently changed which relocations the first one owned, which is the shape of every real
+candidate file.
+
 ## The 32-bit MSVC reference build and its answer key (MSVC-x86 X86-4, 2026-11-07)
 
 X86-3 made an i386 candidate readable; this is the asset it is read against, and the asset had three

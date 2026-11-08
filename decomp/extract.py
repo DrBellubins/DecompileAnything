@@ -314,12 +314,26 @@ class Function:
 	# whose bytes are contiguous has one; a `-O2` function with a cold partition has two, in the
 	# order its blocks are compared (Phase 5). Empty means `address`/`size`, i.e. one block.
 	extents: list[tuple[int, int]] = field(default_factory=list)
+	# Which section each extent was read from, parallel to `extents`. A candidate's blocks are not in
+	# one section: `-O2` puts a cold partition in `.text.unlikely`, and an MSVC object gives every
+	# function its own. Asked what a function's relocations are, the answer has to come from the
+	# sections of *that* function.
+	extent_sections: list[str] = field(default_factory=list)
 	language_note: str = ""           # arch/format, for error messages
 	warnings: list[str] = field(default_factory=list)
 
 	def __post_init__(self) -> None:
 		if not self.extents:
 			self.extents = [(self.address, self.size)]
+		if not self.extent_sections:
+			self.extent_sections = [self.section] * len(self.extents)
+
+	def blocks(self) -> list[tuple[str, int, int]]:
+		"""(section, address, length) per block of this body, in the order its bytes concatenate."""
+		sections = list(self.extent_sections) or [self.section] * len(self.extents)
+		sections += [self.section] * (len(self.extents) - len(sections))
+		return [(section, int(where), int(length))
+			for section, (where, length) in zip(sections, self.extents)]
 
 
 # --------------------------------------------------------------------------------------
@@ -1173,7 +1187,6 @@ class CandidateObject:
 		self._relocs: dict[str, list[tuple[int, str, str, int, str]]] = {}
 		# the (section, address, length) of the last function handed back by `function()`, which
 		# is what its relocations have to be looked up in (a -O2 candidate spans two sections)
-		self._extent_sections: list[tuple[str, int, int]] = []
 		# COFF: sections keyed in file order (a COFF object may name two sections the same -
 		# `link` puts one COMDAT per `.text$mn` and they all carry that name), and a
 		# relocation names a symbol *table index*, so the section it lives in is known exactly.
@@ -1473,6 +1486,8 @@ class CandidateObject:
 				entry = symbols.get(index)
 				if entry is not None:
 					name, symbol_section, _value = entry
+				# Not falling back to the section the record sits in: that is the *source*, and saying
+				# the target lives there would be a claim the object does not make.
 				width = int(getattr(item, "size", 0) or 0)
 				if width not in (1, 2, 4, 8):
 					# LIEF does not always fill it; the type says how wide the field is.
@@ -1481,7 +1496,7 @@ class CandidateObject:
 				if width and offset + width <= len(data):
 					addend = int.from_bytes(data[offset:offset + width], "little", signed=True)
 				self._relocs.setdefault(key, []).append(
-					(offset, str(item.type), name, addend, symbol_section or key))
+					(offset, str(item.type), name, addend, symbol_section))
 
 	def is_partition(self, symbol: CandidateSymbol) -> bool:
 		"""Is this symbol a -O2 partition of another one (`<name>.cold`)?
@@ -1558,11 +1573,9 @@ class CandidateObject:
 			warnings.append("this candidate's cold blocks are in %s (%d bytes at %s): they are "
 				"compared after its entry block, as the linked original's are"
 				% (section, len(chunk), _hex(value)))
-		self._extent_sections = [(section, where, length) for section, (where, length)
-			in zip(sections, extents)]
 		return Function(display=symbol.simple or symbol.mangled, raw_name=symbol.mangled,
 			address=symbol.value, size=len(data), bytes=data, section=symbol.section,
-			extents=extents, warnings=warnings)
+			extents=extents, extent_sections=sections, warnings=warnings)
 
 	def _in_section(self, function: Function, address: int) -> str:
 		"""A symbol defined in this same section at `address`.
@@ -1581,8 +1594,7 @@ class CandidateObject:
 		so it binds to the address operand of the instruction containing it.
 		"""
 		relocs: list[tuple[int, str, str, int, str]] = []
-		for section, where, length in self._extent_sections or [
-				(function.section, function.address, function.size)]:
+		for section, where, length in function.blocks():
 			relocs += [item for item in self._relocs.get(section, [])
 				if where <= item[0] < where + length]
 		used: list[Ref] = []
@@ -1648,6 +1660,32 @@ class CandidateObject:
 			address_slots = [slot for slot in slots if slot.kind != "imm"]
 			immediates = [slot for slot in slots if slot.kind == "imm"]
 			taken: list = []
+			# One exception, and it is about which field an instruction can even have. An
+			# absolute-address relocation (IMAGE_REL_I386_DIR32, R_386_32, IMAGE_REL_AMD64_ADDR32)
+			# rewrites a field that holds an address, and a register-relative displacement never holds
+			# one - so when an instruction carries an immediate *and* a slot claiming those same bytes,
+			# the immediate is the field. That is `s->p = &g` and every vptr store a C++ front end
+			# emits: `movl $0x0,(%ecx)` with a DIR32 against the vtable. `_slots` says its enc_offset
+			# is a convention and not a decoding (a `[reg]` operand may be given a displacement slot on
+			# instruction length alone, and `cmpl $0, x(%ecx)` reads two real fields from overlapping
+			# ranges), so the two claims collide without either side being a fact about the encoding -
+			# and getting it wrong hides a reference the original side has and turns a link-filled
+			# field into an operand difference (Docs/x86-32bit-issues.md §37).
+			for slot in immediates:
+				field = instruction.address + slot.enc_offset
+				if not any(instruction.address + other.enc_offset == field for other in address_slots):
+					continue        # nothing is competing for these bytes, so the order below decides
+				for item in here:
+					if item in taken or pc_relative(item[1]) or relocation_width(item[1]) != 4:
+						continue
+					if item[0] != field:
+						continue
+					chosen[slot.operand] = reference(*item, width=slot.width)
+					taken.append(item)
+					here = [item2 for item2 in here if item2 not in taken]
+					if not here:
+						return chosen
+					break
 			if len(address_slots) == len(here):
 				# one relocation per remaining address operand, in the same order (usual case)
 				for slot, item in zip(address_slots, here):
@@ -1682,8 +1720,7 @@ class CandidateObject:
 		fields: list[tuple[int, int]] = []
 		unknown = 0
 		cursor = 0
-		for section, where, length in (self._extent_sections
-				or [(function.section, function.address, function.size)]):
+		for section, where, length in function.blocks():
 			for item in self._relocs.get(section, []):
 				offset = int(item[0])
 				if not where <= offset < where + length:
@@ -1728,7 +1765,7 @@ class CandidateObject:
 			# a name that is not a symbol of this object still says where to look.) A COFF
 			# relocation always names a symbol by table index - `strncpy` in `strings.obj` is the
 			# CRT's, not an offset in `.text$mn` - so when it names one, the object at that offset
-			# is not what the instruction reaches.
+			# is not what the instruction reaches. A section symbol is the other half of that rule.
 			display = self._nearest_in(section_named, addend)
 			# A section-relative reference can name a *function* too: a non-PIE 32-bit object pushes
 			# the address of its `qsort` comparator as an `R_386_32` against the `.text` section symbol

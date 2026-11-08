@@ -1242,9 +1242,11 @@ def score_candidate(cfg: dict, conn, meta: dict, row, sources: list[Path], *,
 	vocabulary.seed_ledger(ledger_rows)
 	bind_candidate = object_file.bindings(candidate)[0]
 	tokens_original = normalize.normalize_function(vocabulary, "original", instructions_original,
-		bind_original, original.address, original.size, False, original.extents)
+		bind_original, original.address, original.size, False, original.extents,
+		original.section)
 	tokens_candidate = normalize.normalize_function(vocabulary, "candidate", instructions_candidate,
-		bind_candidate, candidate.address, candidate.size, False, candidate.extents)
+		bind_candidate, candidate.address, candidate.size, False, candidate.extents,
+		candidate.section)
 	# The byte comparison of Phase 3 needs the fields of each body that the link writes. The
 	# candidate's come from its own relocation table - authoritative, and the widths come from the
 	# relocation type. The original's come from the address-carrying operands of its instructions,
