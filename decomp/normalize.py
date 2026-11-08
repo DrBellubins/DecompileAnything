@@ -241,6 +241,15 @@ def clean_symbol(text: str) -> str:
 		# be idempotent, and eating it made the second pass in `canonical_name` return "")
 		_clean_cache[text] = marked.group(1)
 		return marked.group(1)
+	if text.startswith("__imp_"):
+		# An MSVC import thunk: `__imp_` followed by the decorated name of the imported symbol. A
+		# 32-bit candidate object relocates a `call *[reg]` against this name, while the linked file
+		# names the same object through its import directory (`WideCharToMultiByte`). Without the
+		# prefix coming off, the two spellings are one prefix apart and no call through the IAT of a
+		# PE can ever be proven - which caps every unit of a 32-bit PE that calls an API below
+		# `exact` (Docs/x86-32bit-issues.md §20). What is left is the decorated name itself, so the
+		# trimming below still applies to it.
+		text = text[len("__imp_"):]
 	name = _AT.sub("", _ADDEND.sub("", text))
 	name = name.replace("@plt", "").replace("@PLT", "")
 	if name.startswith("_Z"):

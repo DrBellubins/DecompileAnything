@@ -109,7 +109,7 @@ The startup check must verify, before any analysis: Ghidra dir contains `Ghidra/
 
 ### Per-target config: `project.toml`
 
-Same shape as `Tests/project.toml` (which `Tests/eval.py` already reads) — `std`, `threshold = 97.0`, `cppflags`, `linkflags`, and `[variants.<name>]` with `compiler` / `optimize` / `arch`. Add the analysis side:
+Same shape as `Tests/project.toml` (which `Tests/eval.py` already reads) — `std`, `threshold = 97.0`, `cppflags`, `linkflags`, and `[variants.<name>]` with `compiler` / `optimize` / `arch`. An MSVC variant can also name `crt` (`/MT`, `/MD`, …) and `eh`, the exception model (`/EHsc`, `/EHa`, `/EHs`, `/EHc`); `eh` is a code-generation fact, not a preference — on x86 it decides whether a function with a destructor or a `try` gets an EH4 frame at all, which is visible in the first instructions of the body (Docs/x86-32bit-issues.md §26). Add the analysis side:
 
 ```toml
 [ghidra]

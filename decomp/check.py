@@ -219,7 +219,8 @@ def check_all(cfg: dict, want_compilers: bool = True) -> Report:
 					"variant %s: %s" % (name, gap),
 					"see the `msvc target <arch>` lines below, or Docs/Setup.md §6.7 / "
 					"Docs/MSVC-x86-Plan.md X86-1 for what would add it", fatal=want_compilers)
-		msvc_report(report, [body.get("compiler", "g++") for body in names.values()], want_compilers)
+		msvc_report(report, [body.get("compiler", "g++") for body in names.values()], want_compilers,
+			prefix=prefix, prefix_from=prefix_from)
 		build_agreement(report, cfg, names)
 	return report
 
@@ -314,11 +315,24 @@ class Tool:
 	def found(self) -> bool:
 		return bool(self.path)
 
+	@property
+	def tool_key(self) -> str:
+		"""What kind of tool this is - `cl`, `link`, ... - whatever spelling named it.
+
+		A variant may name a driver by path (`toolchains/vc90/bin/x86/cl`), and then `self.name`
+		is that path. Both decisions below are about the *tool*, not the spelling: which banner
+		arguments to try (`cl` answers `/Bv /c`, and prints nothing for `--version`, which is how a
+		VS2008 driver named by path ended up reported as having no banner), and whether the version
+		it prints is a compiler version or a linker version.
+		"""
+		base = os.path.basename(self.name.replace("\\", "/")).lower()
+		return base[:-4] if base.endswith(".exe") else base
+
 	def _identify(self) -> None:
 		# Two spellings, because the drivers disagree: /? and /Bv are MSVC's, --version answers
 		# for binutils/coreutils and for clang-cl.
 		texts = []
-		for arguments in _banner_arguments(self.name):
+		for arguments in _banner_arguments(self.tool_key):
 			texts.append(_run(self.path, arguments))
 			if any(_MSVC_BANNER.search(t or "") for t in texts):
 				break
@@ -349,6 +363,13 @@ class Tool:
 		`cl` reports its own version (19.12), which is the same minor as the toolset the
 		linker reports (14.12) for every toolset from VS2015 on; `link`/`lib`/`dumpbin`
 		report the linker version directly, which is what `msvc_toolset` reads.
+
+		Before VS2015 the two numberings differ by a constant: a `cl` 15.00 (VC 2008) links with a
+		linker that writes 9.00 into the optional header, and a `cl` 14.00 (VC 2005) with 8.00 -
+		measured on the VS2008 toolchain of Docs/Setup.md §6.13 (its banner says 15.00.30729.01 and
+		every PE it links carries linker version 9.00). The older guard here returned None below 16,
+		which made a correctly-installed v90 driver read as "toolset MSVC link.exe 15.0 (no toolset
+		table entry)" - a toolchain the tool could not name, next to a target it named exactly.
 		"""
 		if not self.version:
 			return None
@@ -357,9 +378,7 @@ class Tool:
 			major, minor = int(parts[0]), int(parts[1])
 		except (IndexError, ValueError):
 			return None
-		if self.name == "cl" or major >= 19:
-			if major < 16:
-				return None
+		if self.tool_key == "cl" or major >= 19:
 			# cl and link share the minor; the major only differs from VS2017 on, where the
 			# compiler stayed at 19.x while the toolset numbering went 14.10, 14.20, 14.30...
 			return toolchain.msvc_toolset("%d.%d" % (14 if major >= 19 else major - 6, minor))
@@ -505,18 +524,26 @@ def _installed_prefixes() -> list[Path]:
 	return out
 
 
-def msvc_prefix(cl_path: str | None = None) -> tuple[Path | None, str]:
+def msvc_prefix(cl_path: str | None = None, preferred: Path | None = None,
+		prefix_from: str = "") -> tuple[Path | None, str]:
 	"""The root of an installed MSVC toolchain (`<prefix>/bin/<arch>/cl`, `<prefix>/VC`,
 	`<prefix>/Windows Kits`), or None with the reason there is none.
 
-	Two ways to find one, because they mean different things. An msvc-wine wrapper is
-	`<prefix>/bin/<arch>/cl`, so a `cl` on PATH has the prefix as an ancestor. When nothing is
-	on PATH, the directory `toolchains/install_msvc.py` installs into is still a fact about this
-	machine, and the two gaps it can show are different gaps: an installed toolchain that is not
-	on PATH needs one shell line, while a toolset with no 32-bit target needs a download
-	(Docs/MSVC-x86-Plan.md X86-0). Reporting only the first case is what made `decomp check`
-	say "no `cl` on PATH" about a toolchain that is in fact installed at `toolchains/msvc`.
+	Three ways to find one, because they mean different things. A **config pin first**: a project
+	that says `[msvc] prefix` has answered this question already, and reporting a different
+	toolchain here contradicts the `compiler <variant>` rows a few lines above, which resolve the
+	driver from that pin. (Seen with a VS2008-era target: the variants named
+	`toolchains/vc90/bin/x86/cl` while these rows described `toolchains/msvc`.) Then an
+	msvc-wine wrapper is `<prefix>/bin/<arch>/cl`, so a `cl` on PATH has the prefix as an
+	ancestor. When nothing is on PATH, the directory `toolchains/install_msvc.py` installs into is
+	still a fact about this machine, and the two gaps it can show are different gaps: an installed
+	toolchain that is not on PATH needs one shell line, while a toolset with no 32-bit target
+	needs a download (Docs/MSVC-x86-Plan.md X86-0). Reporting only the first case is what made
+	`decomp check` say "no `cl` on PATH" about a toolchain that is in fact installed at
+	`toolchains/msvc`.
 	"""
+	if preferred is not None and _looks_like_prefix(preferred):
+		return preferred, "%s (%s)" % (preferred, prefix_from or "pinned by [msvc] prefix")
 	cl = cl_path or shutil.which("cl")
 	if cl:
 		resolved = Path(cl).resolve()
@@ -872,7 +899,8 @@ def msvc_arch_report(report: "Report", prefix: Path | None) -> None:
 	report.add("run 32-bit PE", guest["ok"], guest["detail"], guest["fix"], fatal=False)
 
 
-def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> None:
+def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool,
+		prefix: Path | None = None, prefix_from: str = "") -> None:
 	"""Add the MSVC toolchain items.
 
 	Runs when a variant asks for the MSVC family (`cli.py` maps it to `cl`), and also when
@@ -881,7 +909,7 @@ def msvc_report(report: "Report", variant_compilers: list[str], fatal: bool) -> 
 	"""
 	tools = msvc_tools()
 	asked = any(toolchain.msvc(name) for name in variant_compilers)
-	prefix, why = msvc_prefix(tools["cl"].path)
+	prefix, why = msvc_prefix(tools["cl"].path, preferred=prefix, prefix_from=prefix_from)
 	if not asked and not tools["cl"].found and prefix is None:
 		return
 	fix = ("install a toolset of the target's era with msvc-wine into toolchains/msvc and put "

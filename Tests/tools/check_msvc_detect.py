@@ -524,10 +524,17 @@ def check_i386(work: Path) -> None:
 			% ("optimize=%s" % guess["optimize"] if guess else outcome["problems"][:2]))
 		if guess:
 			stated = guess.get("toolset_gap") or ""
-			expect(bool(stated) and "outside the toolset table" in stated,
-				"the era question is answered in the open: this file is link.exe %s, so the reading "
-				"from the toolchain here is labelled as this toolchain's - %s"
-					% (note.get("linker_version"), stated or "nothing said"))
+			family = str((note.get("toolset") or {}).get("family") or "")
+			# Two halves to the era question, and they are no longer the same answer. The file's own
+			# era is a fact now: link.exe 8.00 names v80, which is in the table since the 32-bit
+			# eras became a real request (Docs/x86-32bit-issues.md §14). What still has to be stated
+			# in the open is the gap to the compiler installed here.
+			expect("v80 (Visual Studio 2005)" in family,
+				"a link.exe 8.00 file is named by era from its own linker version: %s"
+					% (family or "nothing"))
+			expect(bool(stated) and "compiler of the same era" in stated,
+				"and the reading is still labelled as this toolchain's, not that file's: this file is "
+				"link.exe %s - %s" % (note.get("linker_version"), stated or "nothing said"))
 			expect("ret" in str(profile.get("sample_source") or "")
 				and "ret" in str(guess.get("confidence", "")),
 				"a ret-cut sample says so in the same sentence as the answer: %r"

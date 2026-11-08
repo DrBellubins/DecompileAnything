@@ -206,10 +206,10 @@ def the_loop(cfg: dict, store: cache.Cache, answer: dict, limit: int, failures: 
 			sum(1 for item in scores if item.passed)))
 	for item in broken[:8]:
 		print("   BROKEN %s" % item)
-	for item in below[:12]:
+	# Every one of these has to be named in KNOWN_GAPS with a reason, so all of them are printed:
+	# a truncated list hides the ids the next reader is being asked to write down.
+	for item in below:
 		print("   FAIL %s" % item)
-	if len(below) > 12:
-		print("   ... %d more" % (len(below) - 12))
 	if broken:
 		failures.append("%d units could not be scored" % len(broken))
 	gaps = KNOWN_GAPS.get(VARIANT_NAME, {})

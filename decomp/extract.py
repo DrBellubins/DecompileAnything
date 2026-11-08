@@ -386,6 +386,9 @@ class TargetImage:
 		# ... and the slots whose value is an imported symbol (a pure-virtual slot, a method
 		# of another translation unit): no address to read, only a name.
 		self.named_pointers: dict[int, str] = {}
+		# ... and, for a PE, every slot of the import-address table: the import directory names them
+		# whether or not a relocation points at them (`self.offset`-biased, like `self.pointers`).
+		self.import_slots: dict[int, str] = {}
 		try:
 			import lief
 		except ImportError as exc:  # pragma: no cover - `decomp check` reports this
@@ -412,10 +415,45 @@ class TargetImage:
 		except Exception:  # noqa: BLE001 - pointer tables are a discovery nicety, not a requirement
 			self.pointers = {}
 		try:
+			self._read_imports(binary)
+		except Exception:  # noqa: BLE001 - an unreadable import directory must not break `try`
+			self.import_slots = {}
+		try:
 			self._read_function_table(binary)
 		except Exception as exc:  # noqa: BLE001 - a unit table is an extra source of truth, not a
 			self.units = []  # requirement, and a LIEF that cannot read .pdata must not break `try`
 			self.unit_note = "reading the function table failed: %s" % exc
+
+	def _read_imports(self, binary) -> None:
+		"""What the file's own import directory says each IAT slot holds (a PE only).
+
+		A 32-bit PE reaches an API through a pointer slot - `call *[0x4c515c]` - and the analysis
+		shows a label in `.rdata` named after the *value* Ghidra resolved there
+		(`PTR_WideCharToMultiByte_004c515c`). That name is the disassembler's, so it is synthetic to
+		the comparison, and a candidate object relocates the same operand against `__imp__...` - so
+		no call through a PE's IAT could ever be proven and no unit of such a file could reach
+		`exact`. The import directory is the file's own statement about those slots, and it names
+		them the way the candidate does once the `__imp_` prefix is off. Ordinals carry no name and
+		are left out: a number matches nothing on the other side. (Docs/x86-32bit-issues.md §20.)
+		"""
+		import lief
+
+		if not isinstance(binary, lief.PE.Binary):
+			return
+		base = file_address_base(binary)
+		for imported in binary.imports:
+			try:
+				entries = list(imported.entries)
+			except Exception:  # noqa: BLE001 - one unreadable descriptor must not lose the rest
+				continue
+			for entry in entries:
+				try:
+					name = str(entry.name or "")
+					slot = int(entry.iat_address) + base + self.offset
+				except Exception:  # noqa: BLE001
+					continue
+				if name:
+					self.import_slots[slot] = name
 
 	def _read_function_table(self, binary) -> None:
 		"""The function table the file carries itself, in the file's own addresses.
@@ -900,6 +938,15 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 
 	def describe_object(ref: Ref) -> None:
 		"""Name a reference by the object the file's own data says is there (Phase 4)."""
+		# The import directory comes first, and answers even without a structure recovery: an IAT
+		# slot is named by the file itself, which is the one kind of `.rdata` label a candidate can
+		# also name. Its bytes are the loader's to write, so they are not comparable.
+		imported = (getattr(image, "import_slots", None) or {}).get(ref.address or -1)
+		if imported:
+			ref.name = imported
+			ref.identity = "iat@%s" % _hexkey(ref.address)
+			ref.content = None
+			return
 		if structures is None or ref.address is None or ref.kind == "function":
 			return
 		object_ = structures.object_at(ref.address)

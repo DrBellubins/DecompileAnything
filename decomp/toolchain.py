@@ -57,6 +57,20 @@ def _std_year(std) -> str:
 	return text if text.isdigit() else "17"
 
 
+def _std_omitted(std) -> bool:
+	"""Does this variant ask for *no* dialect flag at all?
+
+	A dialect switch is a fact about the target's build like any other flag, and not every driver has
+	one: `/std:` exists only from 14.16 for C++17 (which is said in the detection output, and asserted
+	by `Tests/tools/check_msvc_detect.py` group 3), so on a VC 6/2003/2005-era toolchain the flag is
+	not merely useless, it is refused or ignored - v90 answers `/std:c++17` with
+	`cl : Command line warning D9002 : ignoring unknown option`. A report that prints a flag the driver
+	ignored is not a report of what the build was, so a variant can say `std = "none"` and mean "the
+	compiler's own default" (Docs/x86-32bit-issues.md §27)."""
+	return str(std if std is not None else "c++17").strip().lower() in (
+		"", "none", "off", "default", "compiler-default", "driver-default")
+
+
 # MSVC's own spelling of each level. `cl` has no -O1/-O2 distinction of the GCC kind: /O1
 # optimises for size and /O2 for speed, and both imply /Gy and (at /O2) inlining everything.
 _MSVC_OPTIMIZE = {0: "/Od", 1: "/O1", 2: "/O2"}
@@ -309,6 +323,24 @@ def compiler_for(variant: dict, *, prefix=None, prefix_from: str = "") -> Driver
 	return Driver(arch=wanted or "", gap=_msvc_gap(wanted, found), tried=tried)
 
 
+def _msvc_eh(value) -> str:
+	"""The model letters after `/EH`. Default `sc`, which is what `cl` means by no exception option
+	on its own command line, so a variant that does not name `eh` gets the flags it always got.
+
+	This is a code-generation flag on x86, not only a semantic one: `/EHsc` and `/EHa` put a
+	different handler in the frame-setup slot of every body that has a `try` block or a local object
+	with a destructor, so the difference is visible in the first six instructions of those bodies.
+	`/EHsc` used to be hardcoded in `build_flags`, which silently asserted a model the target may not
+	use - a target that registers `_except_handler4`/`_CxxFrameHandler3` frames and contains no
+	`_GSHandlerCheck` anywhere was not built that way (Docs/x86-32bit-issues.md §26).
+
+	An unrecognised value falls back to `sc` instead of being passed through: `/EH` with a letter `cl`
+	does not know is a driver error, and a typo in a config should not surface as a decompilation
+	mismatch. The flags in use are printed by `decomp check`, so the fallback stays visible."""
+	v = str(value or "sc").lower().replace("/eh", "")
+	return v if v in ("a", "s", "c", "sc", "aa", "s-") else "sc"
+
+
 def build_flags(variant: dict) -> list[str]:
 	"""Compile flags a variant implies, in the same shape Tests/eval.py uses.
 
@@ -321,7 +353,11 @@ def build_flags(variant: dict) -> list[str]:
 	/GL, `comdat` is /Gy, `inline` is /Ob0|/Ob1|/Ob2, `fp` is /fp:*. A key that is absent
 	adds nothing, which is what leaves `cl`'s defaults alone for a variant that does not
 	name them (Docs/MSVC-Plan.md MS-4: the flag set has to be able to say what the target's
-	was, not collapse it to /Od or /O2).
+	was, not collapse it to /Od or /O2). `eh` is the exception model (/EHsc, /EHa, /EHs, /EHc): it
+	changes the frame setup of every body with a `try` or a destructible local, so on an x86 target it
+	is a byte-level fact about the target, not a preference (X86-32 issues §26). `std = "none"` asks
+	for no dialect flag at all, which is what a driver older than the switch needs (§27); any other
+	value is the level as before.
 
 	`arch` is not in that list on purpose. For `cl` it selects the *driver* (`compiler_for`),
 	not a flag; for GCC it is `-m32`, which is the same question asked the only way that
@@ -329,8 +365,10 @@ def build_flags(variant: dict) -> list[str]:
 	"""
 	if msvc(variant.get("compiler", "g++")):
 		level = int(variant.get("optimize", 0))
-		flags = ["/std:c++%s" % _std_year(variant.get("std", "c++17")),
-			_MSVC_OPTIMIZE.get(level, "/O2"), "/W3", "/EHsc", "/nologo"]
+		std = variant.get("std", "c++17")
+		flags = ([] if _std_omitted(std) else ["/std:c++%s" % _std_year(std)])
+		flags += [_MSVC_OPTIMIZE.get(level, "/O2"), "/W3",
+			"/EH%s" % _msvc_eh(variant.get("eh")), "/nologo"]
 		if level >= 3:
 			flags.append(_MSVC_ABOVE_O2)
 		inline = str(variant.get("inline", "")).lower()
@@ -368,8 +406,9 @@ def build_flags(variant: dict) -> list[str]:
 		if str(variant.get("arch", "")).upper() in ("AVX", "AVX2", "AVX512"):
 			flags.append("/arch:%s" % str(variant["arch"]).upper())
 		return flags + list(variant.get("cppflags", []))
-	flags = ["-std=%s" % variant.get("std", "c++17"), "-O%d" % int(variant.get("optimize", 0)),
-		"-Wall", "-Wextra"]
+	std = variant.get("std", "c++17")
+	flags = ([] if _std_omitted(std) else ["-std=%s" % std])
+	flags += ["-O%d" % int(variant.get("optimize", 0)), "-Wall", "-Wextra"]
 	# For GCC and clang the target bitness *is* a flag, and the driver does not change.
 	if arch_bitness(variant.get("arch")) == "x86":
 		flags.append("-m32")
@@ -800,6 +839,15 @@ _MSVC_TOOLSETS = (
 	((12, 0), "v120 (Visual Studio 2013)"),
 	((11, 0), "v110 (Visual Studio 2012)"),
 	((10, 0), "v100 (Visual Studio 2010)"),
+	# The pre-VS2010 families. The mapping is the same rule as the newer rows and the numbers are
+	# the optional header's linker version, not a guess: the VC 9.0 linker writes 9.00 and its
+	# compiler prints "Version 15.00.30729.01 for 80x86" (measured with the toolchain of
+	# Docs/Setup.md §6.13 / toolchains/vc90), and `check.py` already maps a compiler's major to a
+	# linker major as `major - 6` below VS2015, which gives 9.00 for cl 15.00 and 8.00 for 14.00.
+	# They matter because a 32-bit target of this era is a real request: WinRAR 4.11
+	# (Tests/Proprietary/wrar411/WinRAR.exe) is link.exe 9.00 and was outside the table.
+	((9, 0), "v90 (Visual Studio 2008)"),
+	((8, 0), "v80 (Visual Studio 2005)"),
 )
 
 
@@ -874,6 +922,14 @@ _MSVC_BUILDS = (
 	(28018, "14.23"), (27905, "14.22"), (27702, "14.21"), (27508, "14.20"), (27011, "14.16"),
 	(26723, "14.15"), (26428, "14.14"), (26128, "14.13"), (25711, "14.12"), (25325, "14.11"),
 	(25017, "14.10"), (24210, "14.0"),
+	# 15.00.30729 = Visual C++ 2008 SP1, corroborated on this machine in two ways: the toolchain
+	# at toolchains/vc90 prints "Version 15.00.30729.01" and the Rich records of a file it links
+	# carry build 30729, and Tests/Proprietary/wrar411/WinRAR.exe (linker version 9.00) carries
+	# build 30729 too. Nothing older is listed, and that is deliberate: build numbers are not
+	# monotonic across families (the VC 10.0 RTM build is 30319, *below* VC 9.0 SP1's 30729), so
+	# this table can only corroborate a family the linker version already named - it cannot decide
+	# an era on its own. `msvc_toolset` is the authority; `msvc_build_version` says which update.
+	(30729, "15.00"),
 )
 
 

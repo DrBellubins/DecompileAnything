@@ -291,6 +291,16 @@ def target_run() -> int:
 	unit_dir.parent.mkdir(parents=True, exist_ok=True)
 	shutil.copytree(measured.root / key, unit_dir)
 	db = unit_dir / "analysis.db"
+	# The copy starts with the shared cache's ledger, and that is not empty: any suite that ran
+	# `try` against the real analysis banked rows there (the same rows are in `decomp ledger` for the
+	# project). This suite measures what *it* banks, so the inherited rows are cleared here - not
+	# asserted away. (Docs/x86-32bit-issues.md §21.)
+	fresh = sqlite3.connect(db)
+	try:
+		fresh.execute("DELETE FROM matches")
+		fresh.commit()
+	finally:
+		fresh.close()
 	# The config has to sit next to the project's own: its include and build paths are relative to
 	# it. Only `cache_dir` moves, to the copy above.
 	scratch_cfg = TESTS / "phase5-scratch.toml"
