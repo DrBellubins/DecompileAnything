@@ -120,7 +120,7 @@ The cache lives in `cache/ghproj/<key>/`, where `<key>` is a hash of the binary,
 | Target | Analyse / find / show | `try` (scoring) | `types` |
 |---|---|---|---|
 | ELF, x86 32/64-bit (GCC/Clang) | yes | yes | yes |
-| PE, x86-64 (MSVC via `cl` under Wine) | yes | yes | yes |
+| PE, x86 32/64 bit (MSVC via `cl` under Wine) | yes | yes | yes |
 | Other architectures (ARM, etc.) | partly | no | no |
 
 Known limits: `-O1`/`-O2`/`-O3` can't be reliably told apart from the code alone, and a PE built with `/GL`+`/LTCG` can't be byte-reproduced from a single-file compile. See [Docs/MSVC-Plan.md](Docs/MSVC-Plan.md) and [Docs/byte-cleanup-plan.md](Docs/byte-cleanup-plan.md).
