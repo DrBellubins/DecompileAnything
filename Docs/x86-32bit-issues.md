@@ -1109,3 +1109,81 @@ Measured with the tokeniser guard disabled: `the call is tokenised as a referenc
 Regressions (sequential, on the final code): `check_msvc_x86_candidate` 0 with group 7 added, `check_coff_candidate` tiers {exact 70, structural 19} with all 89 extents at 100.00 % and byte-identical output to the §22 baseline (21 report lines both times), `check_phase5_o2` (cold partitions — the `extent_sections` path) OK, `check_phase5_ledger` 55, `check_phase4_evidence` 47, `check_phase6_link` 43, `check_phase7_fidelity` 56, `check_diff_accounting` / `check_masked_bytes` / `check_gate_tiers` all groups, `check_phase2_try`, `check_pe_target`, `check_loader_abort` (made independent of a leftover counter file: it now clears its own, and passes twice in a row).
 
 End to end on the units that started it: 0x45fe70 back to **28/28 = 100 %**, and the string getter 0x45fe40 built the same way is **38/38 = 100 %**; both stay `structural` because the callee they reach is itself unreproduced, which is the honest reason rather than a byte loss. Scale: any candidate that defines a caller and a callee in one translation unit — every subsystem of every target — had its internal calls reported as operand differences.
+
+## 40. "Did it succeed" has five machine spellings, and the source expression picks one (2026-11-09) #x86-32 #codegen
+
+Nine bodies of one subsystem - `Tests/Proprietary/winrar-reverse/src/fileattr.cpp`, the file
+attribute / delete / remove-directory layer of WinRAR.exe, 0x432430-0x4327f0 - ask an API whether it
+worked and report the answer. The image spells that answer **five** different ways within 400 bytes
+of each other, and the choice is made by the shape of the source expression, not by its type.
+`Tests/Proprietary/winrar-reverse/probe/attr_spellings.cpp` measures ~30 spellings against five of
+those bodies; each row below is what a candidate emitted and what it scored.
+
+| what the source says | what VC 9.0 /O2 emits | bytes | score against the body that has it |
+|---|---|---|---|
+| `return API(p);` — a BOOL returned where a bool is wanted | `testl %eax,%eax / setne %al` | 4 | 57/57 `structural` (0x432790), 76/76 (0x432540) |
+| `if (API(p) == 0) return false; return true;` | same | 4 | 44/44 (0x432480) |
+| `return A && B;` — a short-circuit whose value **is** the result | `<test> / je <false block>` … `movl $1,%eax / retl` … `<false block>: xorl %eax,%eax` | 5+2 | 32/32 **exact** (0x432770, 0x4327d0), 26/26 **exact** (0x4324b0) |
+| `if (A && B) return true; return false;` | `movb $1,%al` / `xorb %al,%al` | 5+2, one byte narrower each | 21/32, 15/26 - `none` |
+| `return x != SENTINEL;` in a `bool` function | `xorl %ecx,%ecx / cmpl $-1,%eax / setne %cl / movb %cl,%al` | 11 | the wide branch of 0x432430 |
+| `return API(p) != 0;` — the one that reads best | `negl %eax / sbbl %eax,%eax / negl %eax` | 7 | 41/57, 58/78; and it **is** right for 0x48b1e0 (`SetCurrentDirW`, 20/20 `exact`) |
+
+Three rules came out of that table, and the first one corrects a note this project had written into
+`include/winrar.h`: **it is not the return type that chooses the materialisation, it is the
+expression.** `bool` functions appear with `setne %al`, with `movb $1,%al`/`xorb %al,%al` and with
+`movl $1,%eax`/`xorl %eax,%eax`; an `int` function appears with the last of those. So:
+
+* Do not read a predicate's type from `movl $1,%eax` - read the **false tail**. `xorb %al,%al` is a
+  byte-typed answer, `xorl %eax,%eax` is not, and both are reachable from a `bool` function. The
+  caller's `testb %al,%al` proves only that the low byte is what is tested, which is true of both.
+* A `&&` whose value is returned and an `if` that returns constants are **different lengths**, so the
+  choice is visible in the file size and is decided by the diff, not by taste.
+* One body can hold two of the five spellings: 0x432430's wide branch builds the answer in a scratch
+  byte (`movb %cl,%al`) and its ANSI branch short-circuits to 32-bit 1/0. Writing the same
+  expression for both paths scores 67/76 (`none`); writing the fallback as `return A && B;` is
+  76/76 with no differing instruction. A body whose two halves behave the same way as each other is
+  therefore evidence that the source had two different statements - which is also the honest answer
+  to "why is this program written like that".
+
+Nothing here is a matcher defect and there is nothing to mask: two sources really do assemble to
+different lengths, and the tier difference is the point.
+
+Two more things measured on the way.
+
+* **A cached read belongs at the join of the paths that fill it, and only an explicit `else` puts it
+  there.** 0x443050 (`GetWindowsVersion`, 146 bytes, the widest-used body in the image that is not a
+  string helper) tests a cached global, queries `GetVersionExW` if it is unset, and then uses the
+  major version: `0x44309e jmp L55` / `0x4430a0 movl DAT3,%eax` / `0x4430a5 cmpl $2,%ecx` /
+  `0x4430aa shll $8,%eax`. The load of the cached value sits at the *entry of the merge block*, not
+  inside either branch. `return (g_osMajor << 8) + g_osMinor;` written inside the NT case puts the
+  load inside that case (90/146, `none`); `DWORD dwMajor = g_osMajor;` at the top of the function
+  puts it five instructions early (110/146, `none`). The spelling that matches is an `else` that
+  reads the cache, and a chained store (`dwMajor = g_osMajor = osvi.dwMajorVersion;`) on the query
+  path so the value stays in a register instead of being re-read: **146/146, no differing
+  instruction**. This is the general shape of "read a global, unless I just wrote it" - every
+  lazily-initialised cache in a target will look like this.
+* **A unit that fails the gate cannot become an anchor, so on a symbol-less target a whole subsystem
+  can be blocked by one body.** `decomp try` writes the name pair into the analysis ledger only when
+  a unit *reaches* the gate; and it caps the tier at `structural` for any unit that calls a body the
+  ledger does not name. 0x443050 is byte-complete but capped (four references to unnamed `.data`
+  globals, and no symbol file exists for this image), so it was not banked, so the six bodies in
+  `fileattr.cpp` that call it are capped too - correctly, on the tool's own rule, and permanently so
+  long as the rule stands. Three ways out, none of them target-specific: name the callee from the
+  ledger of an earlier variant (not consulted), give the byte comparison a data side so a candidate's
+  `.data` initialiser can be compared with the image's (`Docs/byte-cleanup-plan.md` Phase 4), or bank
+  a byte-complete unit's name pair with its evidence marked as "bytes, references unverified" so it
+  can anchor other units. Open question, recorded here rather than fixed: the third is a real
+  weakening of the ledger's evidence rule, and the second is the honest one.
+
+**Closed the same day, by the second of those three.** The byte comparison now compares the
+*object* a data reference reaches, not only the bytes one instruction reads: an extent a file
+allocates without storing states the value zero, values are compared for the width the read states,
+and two globals the unit cannot tell apart are settled by whether their spacing matches between the
+two files. This is **not** Phase 4, which was about constants in a read-only pool and shipped; it is
+the writable half Phase 4 never listed, written up as `Docs/byte-cleanup-plan.md` **Phase 4b** with
+its acceptance test (`Tests/tools/check_data_evidence.py`). 0x443050 now reaches `semantic` and banks
+five name pairs - its `___security_cookie` matched by the `__security_check_cookie` call it is used
+in, `g_osPlatform` by the `ff ff ff ff` both files store, `g_osMinor`/`g_osMajor` by their shared
+zero initial values plus an offset agreement. Its six callers are no longer capped by it, and the
+WinRAR subsystem went from 18 units past the gate to 25. What still caps units in that image is
+unnamed callees (`FUN_…` / `PTR_LAB_…` in the target's own `.text`) - the ledger queue, not data.

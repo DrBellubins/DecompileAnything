@@ -64,9 +64,44 @@ NEGATIVE_CONTROLS = [
 # `msvc-o0` used to carry one entry here, STRUCT-24: the `.obj` named each MSVC type descriptor
 # by symbol while the target could only repeat the data type Ghidra had applied to all three.
 # MS-5 reads the MSVC RTTI graph out of the target instead (Docs/MSVC-Plan.md MS-5), so both
-# sides now say `typeinfo for CVehicleEntity`, and the entry is gone: 89 of 89 units pass.
+# sides now say `typeinfo for CVehicleEntity`, and that entry is gone.
+#
+# What replaced it is not one gap but the loop's own queue. Phase 5 made "both bodies are the same
+# size" stop counting as evidence about a call, so a byte-identical unit that calls a helper the
+# match ledger has no name for stops at `structural` - on a static-link `/Od` build that is every
+# unit whose helper is not itself one of the 89 units, and every unit that reaches the CRT through
+# a link-time thunk a stripped image does not name. Phase 4b (Docs/byte-cleanup-plan.md) then
+# answered the **data** references these units also had: 4 more of them score through, and what is
+# left is callees and one pointer table, which is `decomp ledger`'s queue rather than a matcher
+# defect. The numbers moved with that: 70 of 89 past the gate before, 74 of 89 now.
 KNOWN_GAPS: dict[str, dict[str, str]] = {
-	"msvc-o0": {},
+	"msvc-o0": {
+		# A static helper of the same translation unit, reproduced nowhere in this run, so the
+		# ledger has no name for it. `decomp ledger` ranks these by how many units call them.
+		"MATH-13": "calls BuildCrcTable, which no unit reproduces (the ledger's queue)",
+		"MATH-24": "calls SquareRootNewton, which no unit reproduces (the ledger's queue)",
+		"MATH-27": "calls Vec3LengthSq and SquareRootNewton (the ledger's queue)",
+		"MATH-29": "calls Vec3Cross, Vec3LengthSq and SquareRootNewton (the ledger's queue)",
+		"STR-04": "calls ToLowerChar, which no unit reproduces (the ledger's queue)",
+		"STR-07": "calls LengthOf, which no unit reproduces (the ledger's queue)",
+		"STR-08": "calls FindSubstring, which no unit reproduces (the ledger's queue)",
+		"STRUCT-22": "calls CEntityBase::TakeDamage, which no unit reproduces (the ledger's queue)",
+		"STRUCT-25": "calls CompareDescriptorCost, which no unit reproduces (the ledger's queue)",
+		# The CRT's own function, reached through a thunk the static link put in the image: the
+		# candidate relocates against the import's name, and the stripped image only has FUN_. Same
+		# shape as an unnamed `.text` thunk at -m32 (check_phase2_try's list).
+		"STR-10": "reaches memcpy through a CRT thunk the image does not name",
+		"STR-17": "reaches memcpy through a CRT thunk the image does not name",
+		"STR-15": "reaches snprintf through a CRT thunk the image does not name",
+		"STRUCT-20": "reaches snprintf through a CRT thunk the image does not name",
+		"STRUCT-24": "reaches __RTDynamicCast through a CRT thunk the image does not name",
+		# The object is named on the candidate side (`g_stateTable`) and is a `PTR_LAB_…` label on
+		# the image's. Its value is three function pointers, so the candidate has no bytes for it -
+		# every slot is a relocation - and no name to compare. What pairs them is a pointer table
+		# read through the relocations (`TargetImage.pointers`), which is the structures work, not
+		# the data side: a global with no initial value has one, and this object has none to state.
+		"STRUCT-21": "a table whose slots are pointers the link fills in (the pointer-table path)",
+	},
 }
 
 

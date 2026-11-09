@@ -192,9 +192,69 @@ def section_capabilities(fmt, section) -> tuple[bool, bool, bool]:
 	return True, False, False
 
 
+def section_extents(fmt, section) -> tuple[int, int]:
+	"""(how much memory a section occupies, how much of it the file has bytes for).
+
+	`section_capabilities` answers what a section is *for*; this answers where its bytes *are*, which
+	is a different question and one the tool only noticed when it started comparing data references.
+	Three formats hide it three ways, and all three of them hand back bytes that are not there:
+
+	* an ELF `.bss` is `SHT_NOBITS`. Measured on `Tests/build/gcc-o0/da_tests.stripped`, LIEF's
+	  "content" for it begins `GCC: (GN` - the bytes of the section after it.
+	* a COFF `.bss` carries IMAGE_SCN_CNT_UNINITIALIZED with a raw-data pointer of 0, and LIEF reads
+	  from offset 0 of the file: the header. (`candidate_sysinfo.o` for WinRAR reads `4c010600…`.)
+	* a PE maps `VirtualSize` and stores `SizeOfRawData`. WinRAR 4.11 maps 647 KB of `.data` and
+	  stores 14 KB of it, and its global version cache lives in the gap.
+
+	An object in the part the file has no bytes for has no initial value: it is zero when the process
+	starts. That is a statement about the object, and for a global no symbol names it is the only
+	statement the file makes - which is why the comparison needs it (the data side,
+	Docs/byte-cleanup-plan.md Phase 4b).
+	"""
+	raw, spelling = _section_flags(section)
+	kind = str(fmt or "").upper()
+	mem = int(section.size or 0)
+	# A PE section's memory size is its VirtualSize, which may be larger than the raw data; `size`
+	# is the raw size there and the memory size everywhere else. (A COFF section reports the larger
+	# of the two, so its case is carried by the flag below.)
+	virtual = int(getattr(section, "virtual_size", 0) or 0)
+	if spelling == "pe" or "PE" in kind or "COFF" in kind:
+		mem = max(mem, virtual)
+	have = mem
+	# A section named for zero-initialised data is one, whatever the format. An ELF section also says
+	# so in its type (SHT_NOBITS), which is the authoritative word; a PE's `.bss` says it in the
+	# flag below; a Mach-O's says it in its name (`__bss`, `__common`) or its type (S_ZEROFILL).
+	# Asking a *PE* section for its type is what makes LIEF warn about the characteristic word it
+	# found instead, so the type is only read where one exists.
+	spelling_name = str(getattr(section, "name", "") or "").upper()
+	if "NOBITS" in spelling_name or "ZEROFILL" in spelling_name or spelling_name in (
+			".BSS", "__BSS", "__COMMON", ".BSS."):
+		have = 0
+	if spelling == "elf" and have:
+		try:
+			type_name = str(getattr(section, "type", "") or "").upper()
+		except Exception:  # noqa: BLE001 - a type word LIEF cannot name is not NOBITS either
+			type_name = ""
+		if "NOBITS" in type_name or "ZEROFILL" in type_name:
+			have = 0
+	if spelling == "pe" or "PE" in kind or "COFF" in kind:
+		if isinstance(raw, int) and raw & _SCN_CNT_UNINITIALIZED:
+			have = 0
+		elif virtual:
+			have = min(have, int(section.size or 0))
+	return max(mem, 0), max(have, 0)
+
+
 # Where an object's data lives: pointer tables (vtables, GOT-like tables) and ordinary data.
 _POINTER_SECTIONS = (".data.rel.ro", ".rodata", ".rdata", ".data", ".got", ".got.plt",
 	".init_array", "__DATA")
+
+# The sections of an *object file* a data reference may be compared on. Everything `_COMPARABLE`
+# covers, plus the writable ones: a candidate's `.data` holds the initial value it gives a global,
+# and what it gives no bytes for is zero at load time (Phase 4b, and `_read`'s two refusals are
+# what keep that claim honest). Junk sections - `.debug$S`, `.drectve`, `.xdata`, `.pdata` - stay
+# out of it: nothing a data reference reaches is there, and reading them would invent evidence.
+_READABLE_DATA = _COMPARABLE + (".data", ".bss", ".bss.", ".data.", "__common", "__bss")
 
 # The function table a file carries itself. An x64 PE's `.pdata` is the unwind table the loader
 # reads: (begin, end, unwind) for every function, with no symbols, after stripping - the
@@ -387,6 +447,10 @@ class TargetImage:
 		self.path = path
 		self.offset = int(address_offset)
 		self.sections: list[tuple[str, int, int, int, bool, bool]] = []
+		# ... and the parts of the image the file *allocates* but carries no bytes for: an ELF `.bss`,
+		# a PE's data past its raw size, a zero-fill Mach-O section. `self.sections` stays the
+		# file-backed view every other reader wants; `initialised_at()` is the question both answer.
+		self.uninitialised: list[tuple[str, int, int, bool]] = []
 		self.error = ""
 		# The file's own function table, in the *file's* addresses (the same domain
 		# `self.sections` is in): `analysis_units()` biases it into the analysis' ones.
@@ -421,9 +485,23 @@ class TargetImage:
 				continue
 			allocated, writable, _executable = section_capabilities(
 				getattr(binary, "format", None), section)
+			memory, stored = section_extents(getattr(binary, "format", None), section)
+			if not stored:
+				# No bytes to read: recording it as a readable range is what made a `.bss` address
+				# answer with the bytes of whatever section followed it.
+				if allocated and memory:
+					self.uninitialised.append((str(section.name),
+						int(section.virtual_address) + file_address_base(binary), memory, writable))
+				continue
 			self.sections.append((str(section.name),
-				int(section.virtual_address) + file_address_base(binary), int(section.size),
+				int(section.virtual_address) + file_address_base(binary), stored,
 				int(section.offset), allocated, writable))
+			if memory > stored and allocated:
+				# mapped past what the file stores: the loader zeroes the rest (a PE's `.data`, most
+				# often, which is where MSVC keeps every global with no initialiser)
+				self.uninitialised.append(("%s!uninitialised" % str(section.name),
+					int(section.virtual_address) + file_address_base(binary) + stored,
+					memory - stored, writable))
 		try:
 			self._read_pointers(binary)
 		except Exception:  # noqa: BLE001 - pointer tables are a discovery nicety, not a requirement
@@ -743,6 +821,27 @@ class TargetImage:
 		there are still zeros - see `pointers`)."""
 		return self._read(address, length, any_section=True)
 
+	def initialised_at(self, address: int) -> bool | None:
+		"""Does this file give the object at an analysed address an initial value?
+
+		True   - the file has bytes there, so `read`/`read_data` return its initial value.
+		False  - the file allocates the space and stores no bytes for it: the object is zero at load
+		         time. That is a statement about the object, and the only one a stripped binary makes
+		         about a global no symbol names (Phase 4b).
+		None   - this file says nothing about that address.
+
+		The question is asked about the object's first byte, which is the byte the comparison can use:
+		everything past the part the file stores is not read, and so is not claimed.
+		"""
+		if self.error:
+			return None
+		file_address = address - self.offset
+		if any(start <= file_address < start + size for _n, start, size, _o, _a, _w in self.sections):
+			return True
+		if any(start <= file_address < start + size for _n, start, size, _w in self.uninitialised):
+			return False
+		return None
+
 	def _read(self, address: int, length: int, any_section: bool) -> bytes | None:
 		where = self._locate(address, any_section)
 		if where is None or self.error:
@@ -1007,6 +1106,18 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		ref.size = ref.size or object_["size"]
 		ref.content = None   # a vtable is pointers; its bytes are never comparable
 
+	def describe_initial_value(ref: Ref) -> None:
+		"""What this file says about the object's initial value (the data side, Phase 4b).
+
+		Nothing here invents a claim: `False` only ever comes from a section the file *allocates* and
+		stores no bytes for, and `True` only from one it does store bytes for. An object no name
+		reaches - a stripped binary's `DAT_0053d510` - is otherwise something the comparison has to
+		assume, and an assumption is not a tier (that is what `unverified` counts).
+		"""
+		if ref.cls != "data" or ref.address is None or ref.identity:
+			return
+		ref.initialised = image.initialised_at(ref.address)
+
 	def build(item: sqlite3.Row) -> Ref:
 		key = "%s:%s" % (item["ref_type"], item["to_address"])
 		if key in seen:
@@ -1029,6 +1140,7 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		ref = Ref(kind=kind, raw=item["to_name"] or "", name=name, address=to_address,
 			section=item["section"] or "")
 		describe_object(ref)
+		describe_initial_value(ref)
 		if function is not None:
 			if forwarded is not None:
 				name = clean_symbol(function["name"] or "")
@@ -1048,9 +1160,13 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 				# read as well, so a candidate whose literal is one character longer or shorter does
 				# not compare equal over the shared prefix (Phase 4).
 				ref.string = int(declared)
-				ref.content = image.read(to_address, int(declared) + 1)
+				ref.content = image.read_data(to_address, int(declared) + 1)
 			else:
-				ref.content = image.read(to_address, _PROBE)
+				# `read_data`, not `read`: the writable sections are in scope here deliberately. What
+				# the file stores for `static DWORD g_wait = 1;` is its initial value, and an object no
+				# name reaches is otherwise unverifiable (the data side, Phase 4b). A value the loader
+				# rewrites is a pointer slot, and `pointers`/`named_pointers` are what speak for those.
+				ref.content = image.read_data(to_address, _PROBE)
 		seen[key] = ref
 		used.append(ref)
 		return ref
@@ -1084,6 +1200,7 @@ def original_bindings(conn: sqlite3.Connection, meta: dict, row: sqlite3.Row,
 		ref = Ref(kind="data", raw=name or _hex(address),
 			name=clean_symbol(name) if name else "", address=address, section=section)
 		describe_object(ref)
+		describe_initial_value(ref)
 		if ref.content is None:
 			# read no further than the section does; the width of the access is what
 			# `diff.content_window` compares when neither side can name the object (Phase 4)
@@ -1179,6 +1296,10 @@ class CandidateObject:
 		self.functions: list[CandidateSymbol] = []
 		self._sections: dict[str, bytes] = {}
 		self._writable: set[str] = set()
+		# sections the object file allocates but stores no bytes for (`.bss` in either spelling, a
+		# zero-fill section): an object that lives in one has no initial value. Their `content` is not
+		# empty in LIEF - it is whatever follows them in the file - so they must not be read at all.
+		self._no_bytes: set[str] = set()
 		self._by_section_address: dict[tuple[str, int], CandidateSymbol] = {}
 		# which of those addresses are *function* entries: what a section-relative reference naming
 		# one reaches, rather than an object it is an offset inside
@@ -1233,7 +1354,11 @@ class CandidateObject:
 					self._writable.add(key)
 				if self._coff and int(_section_flags(section)[0] or 0) & _SCN_LNK_COMDAT:
 					self._comdat.add(key)
-				self._sections[key] = bytes(section.content)
+				if section_extents(getattr(binary, "format", None), section)[1]:
+					self._sections[key] = bytes(section.content)
+				else:
+					self._no_bytes.add(key)
+					self._sections[key] = b""
 			if self._coff:
 				self._handle = normalize.capstone_for("x86:LE:%d:default" % (self.bits or 64))
 			self._read_symbols(binary)
@@ -1620,6 +1745,7 @@ class CandidateObject:
 					"%s+0x%x" % (target["section"], where) if where is not None else ""),
 				address=where, section=target["section"], size=target["size"],
 				content=target["content"], width=int(width) or None,
+				initialised=target.get("initialised"),
 				string=target.get("string") or None)
 			seen[key] = ref
 			used.append(ref)
@@ -1780,6 +1906,7 @@ class CandidateObject:
 			# to compare - `.data.rel.ro+0x18` is a section, and the other side has no such thing
 			return {"kind": "data", "address": addend, "section": section_named, "size": None,
 				"content": self._read_data(section_named, addend, 0, display), "display": display,
+				"initialised": section_named not in self._no_bytes,
 				"name": display,
 				# in an object file every section is addressed from 0, so an offset alone names
 				# nothing: `.rodata+0x18` and `.rodata.cst4+0x18` are different objects
@@ -1793,7 +1920,7 @@ class CandidateObject:
 			# compared as one: the linked image has the object itself, not an import.
 			kind = "external" if self._undefined.get(symbol_name, True) else "data"
 			return {"kind": kind, "address": None, "section": "", "size": None,
-				"content": None, "display": symbol_name}
+				"content": None, "display": symbol_name, "initialised": None}
 		section, value, size, is_function = found
 		if is_function:
 			# the body's bytes are not safe evidence: outside PIC they encode absolute
@@ -1807,6 +1934,7 @@ class CandidateObject:
 		return {"kind": "data", "address": (None if own else where), "section": section,
 			"size": size or None,
 			"content": self._read_data(section, where, size or 0, symbol_name),
+			"initialised": section not in self._no_bytes,
 			"display": symbol_name,
 			"identity": ("symbol:%s" % symbol_name) if own else "%s+0x%x" % (section, where)}
 
@@ -1867,7 +1995,14 @@ class CandidateObject:
 		# whole section that was refused on the strength of one record anywhere in it, which threw
 		# away every constant in a `.rodata.cst*` pool that shares its section with a pointer: what
 		# sits away from the relocations is final at assembly time (Phase 4).
-		if section in self._writable or not section.startswith(_COMPARABLE):
+		#
+		# Writable data is read too, since Phase 4b: what an object file stores for `int g_x = 5;`
+		# *is* its initial value, and comparing it is the only way a global no symbol names in the
+		# image can be verified at all. Two things keep that honest. A section the file stores no
+		# bytes for is never read - LIEF hands back whatever follows it, which is not the object's
+		# value (`.bss` in both spellings). And a value the link has to fill in carries a
+		# relocation record, which is refused by the window test below as it always was.
+		if section in self._no_bytes or not section.startswith(_READABLE_DATA):
 			return None
 		if self._relocated(section, offset, length):
 			return None

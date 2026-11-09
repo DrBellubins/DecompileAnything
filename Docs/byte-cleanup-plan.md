@@ -199,6 +199,91 @@ relocation addresses (MATH-21, MATH-27).
 Acceptance: `Tests/tools/check_phase4_evidence.py` — MATH-20's `360.0f`→`359.0f` and STR-15's
 `x%.1f`→`x%.2f` both fail the gate, naming the bytes and the instruction they are read at.
 
+## Phase 4b: The data side — what Phase 4 left out
+*Fixes the "it reads an unnamed global" cap. Done 2026-11-09.*
+
+Phase 4 verified a **constant**: the bytes an instruction reads out of a pool, at the width the
+instruction states, compared against what the candidate object stores there. It said nothing about
+the other half of a data reference — a **global**, the writable object a body reads *and* writes.
+A global has no bytes to read at the read site, and on a stripped image no name either, so every
+reference to one stayed `unverified`. Phase 4's own residual table recorded that as its last row
+("MATH-13, STRUCT-21: references to `.bss` data neither side can describe"), and on a real target
+the cap was not cosmetic: `decomp try` writes a ledger pair only when a unit **passes the gate**, so
+a byte-perfect helper whose globals and callees are unnamed anchors nothing, and every unit that
+calls it is capped in turn. On WinRAR 4.11 that one rule held 13 units at `structural` with 2,933 of
+2,970 bytes already reproduced.
+
+**What the files actually say.** A global's *value* is stated far more often than it looks:
+
+| spelling | an uninitialised object | a `0xFFFFFFFF` initialiser |
+| --- | --- | --- |
+| ELF | `.bss` is `SHT_NOBITS`: 1088 bytes of memory, 0 bytes of file | `.data` carries the bytes |
+| PE built by GCC | `.bss` is `NOBITS` | `.data` carries them |
+| COFF (a `.obj`) | `.bss` is `IMAGE_SCN_CNT_UNINITIALIZED` — **and `cl` puts zero-initialised globals in `.data` as literal zeros** | `.data` carries them |
+| an MSVC-linked PE | `.data` maps 647,052 bytes and stores 14,336: the rest is zero at load | file-backed and stored |
+| Mach-O | a zero-fill section | the section's bytes |
+
+Four formats, two of them telling the truth about the same object in opposite ways. So:
+
+- **A file that stores nothing for an object states its value.** `section_extents()` returns the
+  memory extent and how much of it the file has bytes for; `initialised_at()` answers *has this
+  address got a value in the file*; `Ref.initialised` travels with a read. `extract` reads only the
+  extent the file stored — LIEF hands back bytes for a `NOBITS`/`CNT_UNINITIALIZED` section (the
+  start of the next one, or the file header), and reading those is reading nothing.
+- **The comparison is about values, not about which file kept the bytes.** `value_window()` /
+  `object_value()` compare the first `min(width)` bytes of each object, with an unstored extent
+  worth zeros, and answer `zeroed` when both are zero for as long as the instruction reaches.
+  `bytes` stays what Phase 4 made it — pool bytes at the read's width, for a read-only object. The
+  two never claim the same reference, and a global whose value one file omits and the other writes
+  as zeros is **not** refuted, which matters because that is how MSVC differs from GCC on the same C.
+- **Nothing distinguishing them is nothing proving them** — the rule about a callee, applied to data.
+  A unit that reads two globals of one shape (same access width, same initial value) has not said
+  which is which: swap them and no byte changes. It is refuted only if the two files describe
+  different values. It is *verified* only when the layout tells them apart: the distance between the
+  two objects in the image equals the distance between the two symbols in the candidate, which makes
+  the pairing the only one the layout allows. Layout never refutes — the link reorders, and a
+  candidate holds one translation unit of a bigger program — so such a pair is counted with the
+  unverified references and says what is missing.
+- **The runtime's own objects are named by what the unit does with them.** `__security_cookie` is not
+  the program's and no symbol table in a shipped `.exe` names it; it is identified by the check the
+  program calls with its value, a name both sides already agree on. A short table (`diff.
+  RUNTIME_OBJECT_PAIRS`: the MSVC and GCC stack guard and cookie pair) and the evidence is `runtime`.
+  Only for an object the candidate does not *define*: if it defines one under that name, it is asked
+  about the definition like any other global.
+- **A symbol with no value on either side is not verified, it is unresolvable.** "no claim about it in
+  either file" is a third answer alongside "no evidence" and "the values differ", so `decomp try`
+  stops saying `neither side can name, bound or read it` about a global it cannot say anything about.
+
+**Not included, on purpose.** A writable object under a *relocation* is still not compared: its value
+is whatever the loader writes there, which is the pointers path (`TargetImage.pointers`), not this
+one. And an instruction whose width the reader could not resolve claims no value either — `movzbl
+DAT_53d50c` says the object is zero, `movl DAT_53d50c` says nothing, so `width` is the bound.
+
+**Measured.** Same ledger state, before and after:
+
+| variant | past the gate | after | newly past |
+| --- | --- | --- | --- |
+| `-O0` | 79 | 79 | none: MATH-13's two globals are now verified, and it stays capped by its helper alone |
+| `-O2` | 78 | 79 | MATH-13 |
+| `-m32` | 67 | 67 | none; 4 more data references verified |
+| `msvc-o0` | 70 | 74 | STR-05, STR-18, STRUCT-05, STRUCT-16 |
+| `msvc-o2` | 69 | 70 | STR-13 |
+| WinRAR 4.11 | 18 of 35 | 25 of 35 | 7 units, and the first units of that target now bank name pairs |
+
+Nothing moved the other way in any variant. `check_coff_candidate`'s `KNOWN_GAPS["msvc-o0"]` had
+never been filled in since Phase 5 landed, so the check has been failing on its own baseline; the 15
+remaining are now named there with their reason (a helper no unit reproduces, a CRT function behind a
+thunk the stripped image does not name, and STRUCT-21's function-pointer table).
+
+Acceptance: `Tests/tools/check_data_evidence.py` — what each file format states about an object it
+stores nothing for; stored-zeros against omitted-zeros agreeing, and a candidate that initialises the
+object refuted by name; no claim from a file that says nothing, or from a read with no width; the
+interchangeable pair held back and settled by layout, and *not* held back when the shapes differ;
+the CRT cookie named only when the check is in the unit; and on the real target, MATH-13 verified
+both of its globals and then **failing** with `initial values differ (00 00 vs 01)` when the source
+is edited to initialise the flag the image leaves zero — the negative control that proves the rule
+compares the value.
+
 ## Phase 5: Callee and global identity through a match ledger
 *Fixes the "equal size, different helper" and first-use-order problems.*
 

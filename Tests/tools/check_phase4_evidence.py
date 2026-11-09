@@ -143,7 +143,8 @@ def candidate_object() -> None:
 	# assembly time, and reading them is what makes a float pool comparable at all.
 	obj = extract.CandidateObject.__new__(extract.CandidateObject)
 	obj._sections = {".rodata.cst8": b"\x00" * 8 + b"\xff" * 8}
-	obj._writable, obj._relocs, obj._coff = set(), {".rodata.cst8": [(0, "R_X86_64_64", "g", 0)]}, False
+	obj._writable, obj._no_bytes = set(), set()
+	obj._relocs, obj._coff = {".rodata.cst8": [(0, "R_X86_64_64", "g", 0)]}, False
 	ok("the word under a relocation is refused", obj._read(".rodata.cst8", 0, 8), None)
 	ok("the word beside it is read", obj._read(".rodata.cst8", 8, 8), b"\xff" * 8)
 	ok("a window that runs into a relocation is refused", obj._read(".rodata.cst8", 4, 8), None)

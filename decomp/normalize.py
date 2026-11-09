@@ -369,6 +369,13 @@ class Ref:
 	# side, the cached string record. It is what makes a string literal comparable at all - the
 	# length says how many bytes to read, and the candidate side reads to its NUL (Phase 4).
 	string: int | None = None
+	# Does *this file* give the object an initial value? False is a positive statement, not an
+	# absence: the file allocates the space and stores no bytes there, so the object is zero at load
+	# time (an ELF `.bss`, a COFF `.bss`, the part of a PE's `.data` past its raw size, a Mach-O
+	# zero-fill section). None means the file says nothing about that address. Paired with `content`,
+	# which is the initial value when the file does store one, this is the data side of the
+	# comparison: what a file says about a global it never names (Phase 4b).
+	initialised: bool | None = None
 
 	@property
 	def named(self) -> bool:

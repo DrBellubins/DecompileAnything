@@ -61,6 +61,7 @@ To check that the scorer's own counts add up (Docs/byte-cleanup-plan.md, Phase 1
 .venv/bin/python Tests/tools/check_gate_tiers.py
 .venv/bin/python Tests/tools/check_masked_bytes.py
 .venv/bin/python Tests/tools/check_phase4_evidence.py
+.venv/bin/python Tests/tools/check_data_evidence.py
 .venv/bin/python Tests/tools/check_phase5_ledger.py
 ```
 
@@ -81,8 +82,12 @@ tier counts. Measured with it, on the untouched source: **-O0 89/89, -O2 86/89, 
 unchanged (100.00 / 99.91 / 99.38) - six units out, all six an operand difference on a reference
 the two sides cannot pair (`leaq SYM1(%rip)` against `leaq SYM0(%rip)` at -O2, an object named
 `DAT1` against `DAT0` at -m32), all six named in `KNOWN_GAPS` with the reason. Phases 4 and 5
-moved those counts again (79 / 78 / 59 today, see "known gaps" below for what each cap is and what
-would lift it); the means did not move. The tiers, lowest
+moved those counts again (79 / 78 / 59 when Phase 5 landed, see "known gaps" below for what each
+cap is and what would lift it); the means did not move. Phase 4b (`Docs/byte-cleanup-plan.md`,
+`Tests/tools/check_data_evidence.py`) compares the **object** a global reference reaches rather than
+only the bytes one instruction reads, and moved the gate counts without moving any mean: today
+**-O0 79, -O2 79, -m32 67, `msvc-o0` 74, `msvc-o2` 70** of 89, plus WinRAR 4.11 18 → 25 of 35. No
+variant lost a unit to it. The tiers, lowest
 first: `structural` (same length, operations and targets), `semantic` (+ every operand right, +
 streams identical once registers are folded), `exact` (+ the bytes are equal once the fields the
 link writes are zeroed on both sides); `percent` and `none` are the escape hatches, and `--gate`
@@ -751,6 +756,39 @@ By hand:
 .venv/bin/python -m decomp detect Tests/build/msvc-o0-x86/da_tests.stripped \
   -C Tests/project.toml --sample FUN_        # the analysis sample, real boundaries
 ```
+
+## What a global reference is evidence of (Phase 4b)
+
+Phase 4 (`check_phase4_evidence.py`) made a *constant* verifiable: the bytes an instruction reads out
+of a read-only pool, at the width the instruction states. A **global** — the writable object a body
+reads and writes — had no such rule, so on a stripped image every reference to one was counted
+`unverified`, capped the tier at `structural`, and (because `decomp try` banks a name pair only when
+a unit reaches the gate) blocked whole subsystems of a symbol-less target. `check_data_evidence.py`
+is that rule. Four file formats and two toolchains, measured:
+
+```sh
+.venv/bin/python Tests/tools/check_data_evidence.py            # unit fixtures + gcc-o0 + MATH-13
+.venv/bin/python Tests/tools/check_data_evidence.py msvc-o0    # the real-target half on another format
+.venv/bin/python Tests/tools/check_data_evidence.py --no-target  # fixtures only, no build needed
+```
+
+42 checks. What it holds: `section_extents` for ELF `SHT_NOBITS`, COFF `CNT_UNINITIALIZED`, a PE
+`.data` mapped past what the file stores, and a Mach-O zero-fill section — and that a section with no
+bytes is *not read* (LIEF returns the following section's bytes for one, and the bytes of what comes
+next are not the value of the thing that ends there). That a candidate storing zeros and an image
+allocating the space without storing anything are the same value, and that `g_x = true` where the
+image leaves it zero is a **refutation** naming both values (`initial values differ (00 vs 01)`).
+That no claim is made from a file which states nothing about the address, or from a read whose width
+could not be resolved. That two globals of one shape, reached by one unit, are held back unless the
+layout separates them — and that layout never *refutes*, and never holds apart objects of different
+shapes. And that the CRT's own `__security_cookie` is named by the `__security_check_cookie` the unit
+calls, but only when that call is in the unit, and never when the candidate defines the symbol itself.
+
+The real-target half is a positive and its negative control: MATH-13's 1024-byte `.bss` table and
+its `.bss` flag are both verified as `zeroed`, its only remaining unverified reference is the helper
+it calls, and editing the source to `g_crcTableReady = true` makes the unit **fail** the gate. The
+same rule runs on the COFF side (`msvc-o0`), where the same globals live in file-backed `.data` as
+literal zeros.
 
 ## The binary
 

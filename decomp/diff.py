@@ -64,15 +64,48 @@ GATE_DEFAULT = "semantic"
 # the object (Phase 4), or the only thing said about a callee is that both bodies are the same size
 # and the match ledger has no name for it (Phase 5).
 WAIVABLE = ("unverified",)
-# Why a reference counts as unverified, in the two ways that happen. Constants because the report and
+# Why a reference counts as unverified, in the three ways that happen. Constants because the report and
 # the gate note both have to name which one it is: "neither side can name it" and "all either side
 # said was that both bodies are the same size" are different things to go and fix.
 _UNNAMED = "nothing on either side names it"
 _SIZE_ONLY = "only that both bodies are the same size"
+# The data-side twin of `_SIZE_ONLY`: two zero-initialised globals read at the same width are the
+# same shape in both files, so matching one of them to a symbol has not shown the operand right.
+_SAME_SHAPE = ("more than one global of this shape in this unit, and nothing in either file says "
+	"which one this is")
 # The kinds of evidence strong enough to bank as a claim about a name (Phase 5). `size` is not one:
 # recording a symbol on the strength of two bodies being the same length would make the next unit's
-# score rest on a name nothing proved. `ledger` is, because it was proven once already.
-PROVEN_EVIDENCE = ("name", "string", "bytes", "ledger")
+# score rest on a name nothing proved. `ledger` is, because it was proven once already. `zeroed` is,
+# but only when `_interchangeable` could tell this object from the unit's other data references -
+# that is what makes it a claim rather than a guess.
+PROVEN_EVIDENCE = ("name", "string", "bytes", "ledger", "zeroed", "runtime")
+
+
+# Objects the program's own runtime defines, and the function that says what one is for, as
+# `canonical_name` spells them (so a cdecl-decorated `___security_cookie` and the header's
+# `__security_cookie` are the same entry). Neither name is a candidate's to choose freely: the
+# runtime declares the pair, and a body that reaches the object by that name is also handing that
+# very value to the check function - which is a name both sides already agree on. That is what makes
+# the identification evidence rather than a guess, and it is what lets a `/GS` or
+# `-fstack-protector` body reach the gate on an image with no symbols (Phase 4b).
+RUNTIME_OBJECT_PAIRS = {
+	canonical_name("__security_cookie"): canonical_name("__security_check_cookie"),
+	canonical_name("__stack_chk_guard"): canonical_name("__stack_chk_fail"),
+}
+
+
+def _runtime_object(right: Ref, named: frozenset) -> bool:
+	"""Does the candidate reach an object of the runtime's own, named by the check it calls?
+
+	The candidate's side of the pair has to be exactly that: a name, and nothing else. A symbol the
+	candidate *defines* is described by its own section and initial value, and is asked about that
+	instead - this rule is only for the object the program borrowed from its runtime and the image
+	carries without a name.
+	"""
+	if right.address is not None or right.content or right.initialised is not None:
+		return False
+	want = RUNTIME_OBJECT_PAIRS.get(canonical_name(right.name or ""))
+	return bool(want) and want in named
 
 
 def _why_unverified(refs) -> str:
@@ -92,6 +125,10 @@ def _why_unverified(refs) -> str:
 		parts.append("%d: the only thing either side says about the callee is that both bodies are "
 			"the same size, and the match ledger has no name for it - decompile the callee first"
 			% kinds[_SIZE_ONLY])
+	if kinds.get(_SAME_SHAPE):
+		parts.append("%d: both files describe an object with no initial value, but the unit reaches "
+			"more than one of them and the layout does not say which is which - the whole-program "
+			"relink (`decomp link`) is what compares the addresses themselves" % kinds[_SAME_SHAPE])
 	return "; ".join(parts) or "nothing either side can say"
 
 TIER_MEANING = {
@@ -320,19 +357,57 @@ def content_window(a: Ref, b: Ref) -> tuple[int, str]:
 	return 0, ""
 
 
-def ref_evidence(a: Ref, b: Ref, ledger: list[dict] | None = None) -> tuple[bool, str, str]:
+def value_window(a: Ref, b: Ref) -> tuple[int, str]:
+	"""How many bytes of *initial value* both files state, when one of them states it by storing
+	no bytes at all (Phase 4b).
+
+	A PE's `.bss` and a COFF's are opposite ways of saying the same thing: MSVC keeps zero-filled
+	globals inside `.data` and writes their zeros into the file, while an ELF or a COFF object puts
+	them in a section it stores nothing for. The value is zero either way, so the comparison has to
+	be about the value and not about which file happened to keep the bytes. The window is the width
+	the instruction reads, which is the only extent either file states for an unnamed global.
+	"""
+	if a.content and b.content:
+		return 0, ""           # `content_window` answers that pair, with a better `why`
+	if not (bool(a.content) or a.initialised is False):
+		return 0, ""
+	if not (bool(b.content) or b.initialised is False):
+		return 0, ""
+	width = min(int(a.width or 0), int(b.width or 0))
+	if not width:
+		return 0, ""
+	return width, "the %d bytes this instruction reads, one side of them stored as nothing" % width
+
+
+def object_value(ref: Ref, width: int) -> bytes | None:
+	"""The value this file says the object has when the program starts, over `width` bytes."""
+	if ref.content:
+		return ref.content[:width]
+	if ref.initialised is False:
+		return b"\x00" * width
+	return None
+
+
+def ref_evidence(a: Ref, b: Ref, ledger: list[dict] | None = None,
+		named: frozenset = frozenset()) -> tuple[bool, str, str]:
 	"""Do these two references mean the same thing, why if not, and *what let us tell*.
 
 	`refs_compatible` is the answer; the third value names the evidence the answer rests on - "name",
-	"bytes", "string", "size", "ledger", or "" when nothing on either side said anything about the
-	object. The last one is what `unverified` counts: a reference neither side can pin down is not
-	proof that a unit is right, and a tier that rests on one is not honest (Phase 4).
+	"bytes", "string", "size", "ledger", "zeroed", "runtime", or "" when nothing on either side said
+	anything about the object. The last one is what `unverified` counts: a reference neither side can
+	pin down is not proof that a unit is right, and a tier that rests on one is not honest (Phase 4,
+	and the data side, Phase 4b).
 
 	`ledger` is what an earlier unit already proved about this entity (Phase 5): the rows the match
 	ledger holds for the address this reference reaches, each naming the `candidate` symbol that was
 	shown to reproduce it. Once something has been *shown* it is a claim about the candidate: an
 	anonymous callee in a stripped binary is the same callee in every unit that reaches it, so a unit
 	may not name it freely any more - not when a unit that passed the gate already named it.
+
+	`named` is what this same unit states on both sides at once - the set of canonical names the two
+	sides agree on. It is only used for one thing: an object that belongs to the runtime rather than
+	to the program (`__security_cookie`, `__stack_chk_guard`), whose *check function* the unit also
+	reaches by name. See `RUNTIME_OBJECT_PAIRS`.
 	"""
 	if a.cls != b.cls:
 		return False, "%s on the original, %s in the candidate" % (a.kind, b.kind), ""
@@ -344,13 +419,20 @@ def ref_evidence(a: Ref, b: Ref, ledger: list[dict] | None = None) -> tuple[bool
 	# Bytes only count when both sides are reading *the same kind of thing*, which is what
 	# `content_window` decides. A `.rodata` pool that neither side can bound is laid out per build
 	# - the same constants at different offsets - so two 16-byte windows out of it are not the same
-	# object twice, unless both sides say how wide the read is.
+	# object twice, unless both sides say how wide the read is. Where one file stores nothing for
+	# the object, `value_window` asks the same question about its initial value instead.
 	shared, why = content_window(a, b)
-	if shared and a.content[:shared] != b.content[:shared]:
-		return False, "the bytes there differ (%s vs %s), %s" % (
-			a.content[:shared].hex(), b.content[:shared].hex(), why), ""
+	what = "bytes there"
+	if not shared:
+		shared, why = value_window(a, b)
+		what = "initial values"
 	if shared:
-		evidence = evidence or ("string" if (a.string or b.string) else "bytes")
+		left_value, right_value = object_value(a, shared), object_value(b, shared)
+		if left_value != right_value:
+			return False, "the %s differ (%s vs %s), %s" % (
+				what, left_value.hex(), right_value.hex(), why), ""
+		evidence = evidence or (
+			"string" if (a.string or b.string) else ("bytes" if what == "bytes there" else "zeroed"))
 	# a size is only the same kind of quantity when both sides know the object by name, or
 	# when it is a function body: a `.rodata` object that holds several merged string
 	# literals is bigger than the one string Ghidra measured inside it
@@ -378,6 +460,11 @@ def ref_evidence(a: Ref, b: Ref, ledger: list[dict] | None = None) -> tuple[bool
 		# since Phase 5 the caller counts it with the references that are not verified. It stays named
 		# rather than blank so the report can say what the match there rests on.
 		evidence = "size"
+	if not evidence and _runtime_object(b, named):
+		# The object belongs to the runtime, and this very unit hands the value it reads there to the
+		# runtime's own check function - a name both sides already agree on. Neither half of that was
+		# the candidate's to invent.
+		evidence = "runtime"
 	return True, "", evidence
 
 
@@ -385,6 +472,62 @@ def refs_compatible(a: Ref, b: Ref, ledger: list[dict] | None = None) -> tuple[b
 	"""The two-value form of `ref_evidence`, for callers that only need the verdict."""
 	ok, why, _evidence = ref_evidence(a, b, ledger)
 	return ok, why
+
+
+def _shape(ref: Ref) -> tuple:
+	"""How far this file describes an object: enough to tell two globals apart, nothing more."""
+	return (ref.cls, ref.initialised, int(ref.width or 0), int(ref.size or 0))
+
+
+def _interchangeable(pairs: list[tuple[str, Ref, Ref]]) -> set[str]:
+	"""Which of this unit's data references are not told apart by anything either file says.
+
+	An uninitialised global carries no name, no content and no type in the object file: all either
+	file states is that the space is allocated and stores nothing. Two of them read at the same width
+	are therefore interchangeable - putting the candidate's symbol at either of the two image
+	addresses changes no byte of the body, of the object file, or of the link - so a match there has
+	not shown the operand is right. That is the data-side twin of Phase 5's refusal to accept "both
+	bodies are the same size" about a call, and the same kind of thing settles it: layout. If the
+	distance between two objects in the image equals the distance between the two symbols in the
+	candidate, then this pairing is the only one the layout allows and the objects are told apart.
+	If it does not, or an address is not known, nothing here distinguishes them and the reference is
+	counted with the ones that are not verified rather than assumed.
+
+	Layout is never used to *refute* anything: a link may reorder objects, and this project's
+	candidate holds one translation unit of a program built from many, so a difference in order says
+	nothing about the source. It is only used to decide whether a match is distinguishable.
+	"""
+	groups: dict[tuple, list] = {}
+	for token, left, right in pairs:
+		if left.cls != "data" or right.cls != "data":
+			continue
+		if left.initialised is not False and right.initialised is not False:
+			continue
+		groups.setdefault(_shape(left) + _shape(right), []).append((token, left, right))
+	flagged: set[str] = set()
+	for members in groups.values():
+		if len(members) < 2:
+			continue
+		for position, first in enumerate(members):
+			for second in members[position + 1:]:
+				if not _layout_separates(first, second):
+					flagged.add(first[0])
+					flagged.add(second[0])
+	return flagged
+
+
+def _layout_separates(first: tuple, second: tuple) -> bool:
+	"""Do the two sides' layouts tell these two objects apart?"""
+	_name, left_a, right_a = first
+	_name, left_b, right_b = second
+	if None in (left_a.address, left_b.address, right_a.address, right_b.address):
+		return False
+	# each side has to be measuring inside one section of its own; a distance across two sections
+	# is a linker's arrangement, not a fact about the objects
+	if left_a.section != left_b.section or right_a.section != right_b.section:
+		return False
+	delta = int(left_b.address) - int(left_a.address)
+	return delta != 0 and delta == int(right_b.address) - int(right_a.address)
 
 
 def _pair(vocab_side_original, vocab_side_candidate):
@@ -714,15 +857,26 @@ def compare(original: list, candidate: list, vocabulary, *, threshold: float,
 
 	symbols = []
 	unverified: list[dict] = []
-	for token, left_ref, right_ref in _pair(vocabulary.entries["original"], vocabulary.entries["candidate"]):
+	pairs = [(token, left_ref, right_ref) for token, left_ref, right_ref
+		in _pair(vocabulary.entries["original"], vocabulary.entries["candidate"])]
+	# A zero-initialised global is only told from the unit's other zero-initialised globals by where
+	# it sits; without that, matching it to a symbol has not shown the operand right.
+	interchangeable = _interchangeable(pairs)
+	# ... and the names this unit states on both sides at once, which is the only way to identify an
+	# object the program borrowed from its runtime (`RUNTIME_OBJECT_PAIRS`).
+	named = frozenset(canonical_name(left.name) for _token, left, right in pairs
+		if left.named and right.named and canonical_name(left.name) == canonical_name(right.name))
+	for token, left_ref, right_ref in pairs:
 		rows = _ledger_for(ledger, left_ref)
-		ok, why, evidence = ref_evidence(left_ref, right_ref, rows)
+		ok, why, evidence = ref_evidence(left_ref, right_ref, rows, named)
+		if ok and evidence == "zeroed" and token in interchangeable:
+			evidence, why = "", _SAME_SHAPE
 		symbols.append({"token": token, "ok": ok, "why": why, "evidence": evidence,
 			"original": _describe(left_ref), "candidate": _describe(right_ref)})
 		if ok and not evidence:
 			# both sides reach something, and nothing either side knows says what it is
 			unverified.append({"token": token, "original": _describe(left_ref),
-				"candidate": _describe(right_ref), "why": _UNNAMED})
+				"candidate": _describe(right_ref), "why": why or _UNNAMED})
 		elif ok and evidence == "size":
 			# Phase 5: two bodies of the same size is not a name for what is called. It counts with
 			# the unverified references; the ledger is what settles it in either direction.
@@ -786,6 +940,9 @@ def _describe(ref: Ref) -> dict:
 		# what the access itself proves: how wide the read is, and a string length when this side
 		# knows the object is a string of one (Phase 4)
 		"width": ref.width or None, "string": ref.string,
+		# what this file says about the object's initial value: True with `content`, False for a
+		# section it allocates and stores nothing for, None when it says nothing (Phase 4b)
+		"initialised": ref.initialised,
 		"content": ref.content[:16].hex() if ref.content else None}
 
 
@@ -864,6 +1021,7 @@ def report_lines(verdict: Verdict, original_name: str, candidate_name: str, *,
 				right = (item["candidate"] or {}).get("name", "-")
 				if item["ok"]:
 					status = "ok (%s)" % item.get("evidence") if item.get("evidence") else (
+						"UNVERIFIED - %s" % item["why"] if item.get("why") else
 						"UNVERIFIED - nothing either side knows says what this object is")
 				else:
 					status = "DIFFERS - " + item["why"]
