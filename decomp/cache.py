@@ -106,6 +106,41 @@ CREATE TABLE IF NOT EXISTS matches (
 """
 MATCHES_INDEX = "CREATE INDEX IF NOT EXISTS i_matches_entry ON matches(entry);"
 
+# The score record: what `decomp try` last concluded about each unit, per variant.
+#
+# The ledger answers "which symbol reproduces which entity". It cannot answer "how much of this
+# range is done", because it only ever gains a row when a unit *reaches* the gate: everything it
+# does not mention is indistinguishable from a unit nobody has tried. That question is the one a
+# range-level percentage asks - a percentage is not a per-unit claim (a wrong function at 97 % is
+# still a wrong function), so the honest denominator is a range and the honest numerator is the
+# bytes of it that are at the gate. Answering it needs the attempts, not only the successes.
+#
+# So a scored unit records its own row here, pass or fail: the tier it reached, both percentages,
+# the diff categories that cap it, and the source that was scored. One row per (variant, entry):
+# the newest attempt is the current state of that unit, and re-scoring after a readability pass
+# overwrites it. Separate from `matches` on purpose - a failed attempt is evidence about progress,
+# never a claim about identity, and it must not leak into how the next unit is scored.
+SCORES_DDL = """
+CREATE TABLE IF NOT EXISTS scores (
+	variant TEXT,
+	entry INTEGER,                   -- the unit's entry in the original's addresses
+	name TEXT,                       -- what the analysis calls it (for the report)
+	original_size INTEGER,           -- bytes of the original that were compared
+	candidate_size INTEGER,
+	gate TEXT,                       -- the tier that was asked for at the time
+	tier TEXT,                       -- the tier reached
+	tier_rank INTEGER,               -- diff.tier_rank(tier), so "at gate X?" is one integer compare
+	passed INTEGER,                  -- reached the gate that was asked for then
+	match_percent REAL,              -- instruction-text match: progress only, never the claim
+	byte_percent REAL,               -- bytes reproduced inside this unit
+	bytes_matched INTEGER, bytes_over INTEGER,
+	cats TEXT,                       -- the diff categories as JSON: what caps the unit
+	unverified INTEGER,              -- references neither side can name (the tier cap)
+	source TEXT,                     -- the candidate source that was scored
+	at TEXT,
+	PRIMARY KEY (variant, entry));
+"""
+
 SCHEMA_INDEXES = """
 CREATE INDEX i_functions_entry ON functions(entry);
 CREATE INDEX i_functions_name ON functions(name);
@@ -119,7 +154,7 @@ CREATE INDEX i_units_entry ON units(entry);
 CREATE INDEX i_strings_address ON strings(address);
 """
 
-SCHEMA = SCHEMA_TABLES + MATCHES_DDL + MATCHES_INDEX + SCHEMA_INDEXES
+SCHEMA = SCHEMA_TABLES + MATCHES_DDL + MATCHES_INDEX + SCORES_DDL + SCHEMA_INDEXES
 
 
 def target_key(path: Path) -> dict:
@@ -491,6 +526,98 @@ def unit_neighbours(conn: sqlite3.Connection, address: int) -> tuple[sqlite3.Row
 	return before, after
 
 
+def _span_sql(spans: list[tuple[int, int]], column: str = "entry") -> tuple[str, list[int]]:
+	"""SQL for "this column is inside any of these address spans", and the values for it. Pass a
+	qualified column (`u.entry`) whenever the query joins, or the column name is ambiguous.
+
+	A scope is a list of spans rather than one low/high pair, because that is what a program's own
+	code looks like in a linked image: interleaved with the runtime it borrowed (an MSVC `/MT`
+	image, a statically linked Go binary), split by the linker into hot and cold blocks, or asked
+	for as several regions of interest in one request. Excluded spans are subtracted by the
+	callers, since "everything in this span except the CRT" is how those scopes are written.
+	"""
+	where = " OR ".join("(? <= %s AND %s <= ?)" % (column, column) for _ in spans)
+	values = [int(value) for span in spans for value in span]
+	return (where or "0"), values
+
+
+def in_excluded(entry: int, excludes: list[tuple[int, int]]) -> bool:
+	"""Is this entry inside one of the excluded spans?"""
+	return any(lo <= entry <= hi for lo, hi in (excludes or []))
+
+
+def range_units(conn: sqlite3.Connection, spans: list[tuple[int, int]],
+	excludes: list[tuple[int, int]] = ()) -> list[dict]:
+	"""The analysis' units inside a set of address spans, entry order - a scope's denominator.
+
+	The analysis' own `size` is used rather than the file's unit table even where they disagree:
+	the total has to be a number that does not move when the disagreement is looked at, and a
+	report has `unit_conflicts` to state the disagreement instead of hiding it.
+	"""
+	where, values = _span_sql(spans)
+	return [{"entry": int(row["entry"]), "name": row["name"], "size": int(row["size"] or 0),
+		"kind": row["kind"] or "function"}
+		for row in conn.execute("SELECT entry, name, size, kind FROM functions WHERE %s"
+			" ORDER BY entry" % where, values).fetchall()
+		if not in_excluded(int(row["entry"]), excludes)]
+
+
+def unit_table_in(conn: sqlite3.Connection, spans: list[tuple[int, int]],
+	excludes: list[tuple[int, int]] = ()) -> dict:
+	"""{units, bytes, source} as the file's own function table bounds a scope - the one number a
+	scope generated from the analysis cannot state: how far the two views of the same territory
+	differ. Empty when the format gives the tool no function table to read (an ELF keeps this in its
+	symbol table, which is a `decomp` gap, not a fact about the target).
+	"""
+	if not has_table(conn, "units"):
+		return {"units": 0, "bytes": 0, "source": ""}
+	where, values = _span_sql(spans)
+	out = {"units": 0, "bytes": 0, "source": ""}
+	for row in conn.execute("SELECT u.entry, u.size, u.source FROM units u WHERE %s" % where,
+		values).fetchall():
+		if in_excluded(int(row["entry"]), excludes):
+			continue
+		out["units"] += 1
+		out["bytes"] += int(row["size"] or 0)
+		out["source"] = out["source"] or (row["source"] or "")
+	return out
+
+
+def unit_conflicts(conn: sqlite3.Connection, entries: list[int]) -> dict[int, dict]:
+	"""{entry: {analysis, unit, source}} for the units in `entries` whose extent the file's own
+	function table bounds differently (or does not bound at all). A range report needs this to
+	say which of its units cannot reach the tool's top tier for a reason that is not the source."""
+	if not entries or not has_table(conn, "units"):
+		return {}
+	out: dict[int, dict] = {}
+	marks = ",".join("?" * len(entries))
+	for row in conn.execute("SELECT f.entry AS entry, f.size AS analysis_size,"
+		" u.size AS unit_size, u.source AS source, u.end AS end FROM functions f"
+		" LEFT JOIN units u ON u.entry = f.entry WHERE f.entry IN (%s)" % marks,
+			[int(item) for item in entries]):
+		analysis, table = int(row["analysis_size"] or 0), row["unit_size"]
+		if table is None or int(table) != analysis:
+			out[int(row["entry"])] = {"analysis": analysis, "unit": None if table is None
+				else int(table), "source": row["source"],
+				"end": None if row["end"] is None else int(row["end"])}
+	return out
+
+
+def units_without_bodies(conn: sqlite3.Connection, spans: list[tuple[int, int]],
+	excludes: list[tuple[int, int]] = ()) -> list[dict]:
+	"""The units the file's own function table bounds inside a scope that the analysis has no body
+	for. They cannot be scored at all, so a range report has to name them and their bytes rather
+	than let its total imply the scope is only what the analysis can see."""
+	if not has_table(conn, "units"):
+		return []
+	where, values = _span_sql(spans, "u.entry")
+	return [{"entry": int(row["entry"]), "size": int(row["size"] or 0), "section": row["section"]}
+		for row in conn.execute("SELECT u.entry, u.size, u.section FROM units u LEFT JOIN"
+			" functions f ON f.entry = u.entry WHERE %s AND f.entry IS NULL ORDER BY u.entry"
+			% where, values).fetchall()
+		if not in_excluded(int(row["entry"]), excludes)]
+
+
 def unit_sizes(conn: sqlite3.Connection, entries: list[int]) -> dict[int, dict]:
 	"""{entry: {source, size}} for the units starting at these addresses - what `find` annotates
 	an entry that is not in the table, or is a different size in it, with."""
@@ -753,6 +880,79 @@ def matched_entries(conn: sqlite3.Connection, variant: str = "") -> set[int]:
 		sql += " WHERE variant = ?"
 		values.append(variant)
 	return {int(row[0]) for row in conn.execute(sql, values)}
+
+
+# --------------------------------------------------------------------------------------
+# the score record: what the loop concluded about each unit
+
+
+SCORE_COLUMNS = ("variant", "entry", "name", "original_size", "candidate_size", "gate", "tier",
+	"tier_rank", "passed", "match_percent", "byte_percent", "bytes_matched", "bytes_over",
+	"cats", "unverified", "source", "at")
+
+
+def ensure_scores(conn: sqlite3.Connection) -> None:
+	"""Add the score record to a cache written before it existed (only on a writable
+	connection: a read-only one cannot migrate, so the readers answer 'nothing scored'.)"""
+	conn.executescript(SCORES_DDL)
+
+
+def score_rows(conn: sqlite3.Connection, variant: str = "", entries: list[int] | None = None,
+	) -> list[dict]:
+	"""Every attempt the record holds, oldest first. `variant` narrows it to one candidate build:
+	a unit scored at `/O0` says nothing about what the same source reaches at `/O1`."""
+	if not has_table(conn, "scores"):
+		return []
+	sql = "SELECT %s FROM scores" % ", ".join(SCORE_COLUMNS)
+	values: list = []
+	where = []
+	if variant:
+		where.append("variant = ?")
+		values.append(variant)
+	if entries:
+		where.append("entry IN (%s)" % ",".join("?" * len(entries)))
+		values.extend(int(item) for item in entries)
+	if where:
+		sql += " WHERE %s" % " AND ".join(where)
+	sql += " ORDER BY rowid"
+	return [dict(row) for row in conn.execute(sql, values).fetchall()]
+
+
+def score_index(conn: sqlite3.Connection, variant: str = "") -> dict[int, dict]:
+	"""{unit entry: the attempt that says the most about it}.
+
+	Per unit, the row that reached the highest tier; on a tie, the most recent one. An empty
+	`variant` means "any build", which is what a report that compares variants reads; a named one
+	is what a range's own progress asks, because a byte reached at another `/O` is not a byte this
+	variant reached."""
+	out: dict[int, dict] = {}
+	for row in score_rows(conn, variant=variant):
+		entry = int(row["entry"])
+		held = out.get(entry)
+		if held is None or (int(row["tier_rank"] or 0), str(row["at"] or "")) > (
+				int(held["tier_rank"] or 0), str(held["at"] or "")):
+			out[entry] = row
+	return out
+
+
+def record_score(conn: sqlite3.Connection, item: dict) -> int:
+	"""Write what one scored unit concluded (0 when the record cannot hold it, e.g. no entry)."""
+	if item.get("entry") is None:
+		return 0
+	ensure_scores(conn)
+	with conn:
+		conn.execute(
+			"INSERT OR REPLACE INTO scores (%s) VALUES (%s)" % (", ".join(SCORE_COLUMNS),
+				",".join("?" * len(SCORE_COLUMNS))), tuple([
+					item.get("variant", ""), int(item["entry"]), item.get("name", ""),
+					item.get("original_size", 0), item.get("candidate_size", 0),
+					item.get("gate", ""), item.get("tier", "none"),
+					int(item.get("tier_rank") or 0), int(bool(item.get("passed"))),
+					float(item.get("match_percent") or 0.0), float(item.get("byte_percent") or 0.0),
+					int(item.get("bytes_matched") or 0), int(item.get("bytes_over") or 0),
+					json.dumps(item.get("cats") or {}), int(item.get("unverified") or 0),
+					item.get("source", ""), item.get("at", "")]))
+	return 1
 
 
 def callees_of(conn: sqlite3.Connection, among: set[int] | None, exclude: set[int],

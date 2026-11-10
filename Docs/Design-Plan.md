@@ -44,6 +44,10 @@ decomp/
 - `decomp find <query>`: search by name, string, xref, or vtable; list related functions.
 - `decomp show <func>`: asm, Ghidra pseudo-code, referenced types and symbols.
 - `decomp try <func> <file.cpp>`: compile, diff, print match % and compact categorized diff.
+- `decomp progress [--range …]`: bytes at the gate over the scope's own bytes — the range-level
+  percentage, read from the score record `try` writes (every attempt, pass or fail) plus the match
+  ledger. `--range`/`--exclude` take one or more spans, or `[scope]` in the target config states
+  them; the exit code is that project's bar.
 - `decomp types`: shared struct and class definitions recovered so far (a header the LLM can reuse).
 
 ## Phases

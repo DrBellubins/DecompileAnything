@@ -978,6 +978,383 @@ def ledger(
 	raise typer.Exit(EXIT_OK)
 
 
+# --------------------------------------------------------------------------------------
+# range progress: a percentage, stated where a percentage is true
+
+
+def _reaches_gate(score: dict, require: str, threshold: float) -> bool:
+	"""Does a recorded attempt reach the gate being asked for *now*?
+
+	The record keeps the tier that was reached; the gate is read again on every report, so a project
+	that tightens `[gate] require` sees its range percentage fall without re-scoring anything. That is
+	the point: the tier is the claim, and the claim is what the number counts. `percent` reproduces
+	the pre-Phase-2 rule from the stored categories; `none` counts any attempt.
+	"""
+	if require == "none":
+		return True
+	if require == "percent":
+		cats = score.get("cats") or {}
+		if isinstance(cats, str):
+			try:
+				cats = json.loads(cats)
+			except ValueError:
+				cats = {}
+		return (float(score.get("match_percent") or 0.0) >= float(threshold)
+			and int(cats.get("opcode") or 0) == 0 and int(cats.get("relocation") or 0) == 0)
+	return int(score.get("tier_rank") or 0) >= diff.tier_rank(require)
+
+
+def _plural(n: int, word: str) -> str:
+	""""1 unit", "2 units" - the headline line of a progress report should read like English."""
+	return "%d %s%s" % (n, word, "" if n == 1 else "s")
+
+
+def _say_categories(cats) -> str:
+	"""The diff categories of a recorded attempt, in the compact form the loop reads (an empty
+	list of differences is what a gate looks for, so say so rather than printing nothing)."""
+	if isinstance(cats, str):
+		try:
+			cats = json.loads(cats)
+		except ValueError:
+			return str(cats)
+	if not cats:
+		return "no categories recorded"
+	hit = ["%s %d" % (name, int(cats.get(name) or 0)) for name in diff.CATEGORIES
+		if int(cats.get(name) or 0)]
+	return ", ".join(hit) if hit else "no differences"
+
+
+def _scope_table_rows(path: Path) -> dict[int, str]:
+	"""{entry: status text} from a project's own unit-and-status table (a generated SCOPE.md).
+
+	Read only to cross-check the human-facing sheet against the score record: the numbers in a range
+	report come from the cache, never from a hand-edited status column. A row is any pipe row that
+	carries an address cell and ends with a status cell, which is the shape these tables have.
+	"""
+	out: dict[int, str] = {}
+	try:
+		text = path.read_text(errors="replace")
+	except OSError:
+		return out
+	for line in text.splitlines():
+		line = line.strip()
+		if not line.startswith("|") or line.count("|") < 4:
+			continue
+		cells = [cell.strip() for cell in line.strip("|").split("|")]
+		entry = next((cell.strip("`*") for cell in cells
+			if re.fullmatch(r"0x[0-9a-f]{5,16}|[0-9a-f]{5,16}", cell.strip("`*"))), "")
+		status = cells[-1]
+		if entry and status and not set(status) <= {"-", ":", " "}:
+			out[int(entry, 16)] = status
+	return out
+
+
+def range_progress(cfg: dict, conn, meta: dict, spans: list[tuple[int, int]],
+	excludes: list[tuple[int, int]] = (), *, variant: str | None = None,
+	require: str | None = None, scope_table: Path | None = None) -> dict:
+	"""How much of a scope is at the gate - everything `decomp progress` reports, in one call (the
+	check in `Tests/tools/check_range_progress.py` uses it).
+
+	The denominator is the scope's own units as the analysis bounds them, never the file: "x % of
+	this scope is reproduced" is a statement a reader can check, while "x % of the binary" is not -
+	library code is most of most images, and a scope is what was asked for. The numerator counts a
+	unit's bytes only when that unit reaches `[gate] require`: a percentage is not a per-unit claim
+	(a wrong function at 97 % is still a wrong function, and in float-heavy code a wrong field offset
+	is the interesting part), so the only honest percentage is this one.
+
+	A unit counts as at the gate when the score record says so, or - for work done before the record
+	existed - when the match ledger holds a claim that this unit proved at that tier. The second is a
+	floor, not a substitute: a unit that reached the gate and proved nothing anonymous left no row.
+	"""
+	name = variant or str(meta.get("variant") or "")
+	body = None
+	try:
+		_, body = config.variant(cfg, name) if name else (None, None)
+	except config.ConfigError:
+		body = None
+	if require:
+		if require not in diff.GATE_MODES:
+			raise config.ConfigError("--gate %s: not a gate - use one of %s"
+				% (require, ", ".join(diff.GATE_MODES)))
+		require, gate_from = require, "--gate"
+	else:
+		require, gate_from = config.gate(cfg, body)
+	bar = config.threshold(cfg)
+
+	units = cache.range_units(conn, spans, excludes)
+	entries = [int(row["entry"]) for row in units]
+	scores = cache.score_index(conn, variant=name)
+	# what the ledger says about units that were gated before the score record existed
+	proven: dict[int, dict] = {}
+	for row in cache.match_rows(conn, variant=name):
+		owner = row.get("unit_entry")
+		if owner is None:
+			continue
+		held = proven.get(int(owner))
+		if held is None or diff.tier_rank(str(row.get("tier") or "")) > diff.tier_rank(
+				str(held.get("tier") or "")):
+			proven[int(owner)] = row
+
+	out_units, reached, short, untried = [], [], [], []
+	for row in units:
+		entry = int(row["entry"])
+		score, claim = scores.get(entry), proven.get(entry)
+		score_ok = _reaches_gate(score, require, bar) if score else False
+		ledger_ok = bool(claim) and require in diff.TIERS and diff.tier_rank(
+			str(claim.get("tier") or "")) >= diff.tier_rank(require)
+		# work that reached the gate before the score record existed: the ledger proves it, but only
+		# where that unit proved something about an entity it was shown, so this is a floor
+		gate_ok = score_ok or ledger_ok
+		where = ("score" if score_ok else "ledger" if ledger_ok else "score" if score
+			else "ledger" if claim else "")
+		scored = bool(score)
+		state = "at_gate" if gate_ok else ("attempted" if scored else "unattempted")
+		item = {"entry": entry, "name": row["name"], "size": int(row["size"]),
+			"kind": row["kind"], "state": state, "at_gate_from": where,
+			"tier": (score or {}).get("tier") or (claim or {}).get("tier") or "",
+			"known_from": where,
+			"match_percent": (score or {}).get("match_percent"),
+			"byte_percent": (score or {}).get("byte_percent"),
+			"categories": (score or {}).get("cats") if score else None,
+			"unverified": (score or {}).get("unverified") if score else None,
+			"source": (score or {}).get("source") or ((claim or {}).get("source") or ""),
+			"at": (score or {}).get("at") or (claim or {}).get("at") or ""}
+		out_units.append(item)
+		(reached if gate_ok else short if scored else untried).append(item)
+
+	total = sum(item["size"] for item in out_units)
+	num = sum(item["size"] for item in reached)
+	tiers: dict[str, int] = {}
+	for item in reached:
+		if item["tier"]:
+			tiers[item["tier"]] = tiers.get(item["tier"], 0) + 1
+	tiers_below: dict[str, int] = {}
+	for item in short:
+		if item["tier"]:
+			tiers_below[item["tier"]] = tiers_below.get(item["tier"], 0) + 1
+	capped = [item for item in short if float(item["byte_percent"] or 0.0) >= bar]
+	notes: list[str] = []
+	if not scores:
+		others: dict[str, int] = {}
+		for row in cache.score_rows(conn):
+			others[str(row.get("variant") or "")] = others.get(str(row.get("variant") or ""), 0) + 1
+		note = ("the score record holds no attempt at this variant, so nothing below the gate is "
+			"distinguishable from a unit nobody has tried. `decomp try` records an attempt (pass "
+			"or fail) with this version of the tool; work scored earlier shows up only through the "
+			"ledger, and only where a unit that passed proved something about an anonymous entity")
+		if others:
+			enum = ", ".join("%d at %s" % (count, name or "(no variant)")
+				for name, count in sorted(others.items()))
+			note += (" - the record does hold %s at other variants, and a byte reached there is not a "
+				"byte reached at this one, which is why the count stays 0" % enum)
+		notes.append(note)
+	conflicts = cache.unit_conflicts(conn, entries) if entries else {}
+	if conflicts:
+		lo_conflict = sorted(conflicts.items())[:8]
+		notes.append("%d of these units have an extent that the file's own function table bounds "
+			"differently from the analysis (%s). The denominator keeps the analysis' size so the total "
+			"does not move when the disagreement is looked at; `decomp show` prints both, and "
+			"--size is how a scored unit picks one"
+			% (len(conflicts), ", ".join("%s %s vs %s" % (_hex(entry), bit["analysis"],
+				"no unit" if bit["unit"] is None else bit["unit"]) for entry, bit in lo_conflict)))
+	unbounded = cache.units_without_bodies(conn, spans, excludes)
+	if unbounded:
+		span = cache.unit_table_in(conn, spans, excludes)
+		notes.append("%d units the file's own function table bounds in this scope have no body in the "
+			"analysis (%d bytes), so they cannot be scored at all and are not in the %d-byte "
+			"denominator above. In this scope %s names %d units / %d bytes in total: the scope is "
+			"bigger than the analysis can see, so a percentage says which of the two views it was "
+			"counted from (per function, both extents are in `decomp show`)"
+			% (len(unbounded), sum(int(row["size"]) for row in unbounded), total,
+				span["source"] or "no function table", span["units"], span["bytes"]))
+	table_check: dict = {}
+	if scope_table is not None:
+		rows = _scope_table_rows(scope_table)
+		stale, undocumented, unrecorded = [], [], []
+		for entry, status in rows.items():
+			unit = next((item for item in out_units if item["entry"] == entry), None)
+			if unit is None:
+				continue
+			if status.startswith("matched") and unit["state"] != "at_gate":
+				stale.append((entry, status, unit["tier"] or "nothing recorded"))
+			elif unit["state"] == "at_gate" and not status.startswith("matched"):
+				undocumented.append((entry, status, unit["tier"]))
+			elif unit["state"] == "unattempted" and not status.startswith("todo"):
+				# the table remembers an attempt the record does not have - which is what work scored
+				# before the record existed looks like, and re-scoring it is what makes it count
+				unrecorded.append(entry)
+		table_check = {"table": str(scope_table), "rows": len(rows), "stale": stale,
+			"undocumented": undocumented, "unrecorded_attempts": len(unrecorded)}
+		if stale or undocumented:
+			notes.append("the project's own scope table disagrees with the record for %d row%s: %s. "
+				"The table is the reading a person keeps; the record is what the tool concluded. One of "
+				"them is stale - regenerate or re-`try`, do not edit the number"
+				% (len(stale) + len(undocumented),
+					"" if len(stale) + len(undocumented) == 1 else "s", ", ".join(
+					["%s says %r, the record says %s" % (_hex(entry), status, why)
+						for entry, status, why in (stale + undocumented)[:6]])))
+		elif unrecorded:
+			notes.append("the project's own scope table (%s, %d rows) claims nothing the record "
+				"contradicts, but %d row%s describe an attempt the record has nothing for - scored "
+				"before the record existed. Re-`try` those to make them count"
+				% (scope_table, len(rows), len(unrecorded), "" if len(unrecorded) == 1 else "s"))
+		else:
+			notes.append("the project's own scope table (%s, %d rows) agrees with the record"
+				% (scope_table, len(rows)))
+	return {"variant": name, "gate": require, "gate_from": gate_from, "bar": bar,
+		"spans": [list(span) for span in spans], "excluded": [list(span) for span in excludes],
+		"units": out_units,
+		"totals": {"units": len(out_units), "bytes": total,
+			"at_gate": len(reached), "at_gate_bytes": num,
+			"attempted": len(short), "attempted_bytes": sum(item["size"] for item in short),
+			"unattempted": len(untried), "unattempted_bytes": sum(item["size"] for item in untried),
+			"percent": round(100.0 * num / total, 2) if total else 0.0,
+			"tiers": tiers, "tiers_below": tiers_below, "byte_complete_capped": len(capped)},
+		"notes": notes, "extent_conflicts": len(conflicts), "unbounded": len(unbounded),
+		"scope_table": table_check, "met": bool(total) and 100.0 * num / total >= bar}
+
+
+@app.command()
+def progress(
+	binary: Optional[Path] = typer.Option(None, "--bin"),
+	key: Optional[str] = typer.Option(None, "--key"),
+	config_file: Optional[str] = typer.Option(None, "--config", "-C"),
+	range_text: list[str] = typer.Option([], "--range",
+		help="0xLO-0xHI or 0xSTART+0xLEN in the original's addresses; repeatable (default: [scope] "
+		"range in the target config)"),
+	exclude: list[str] = typer.Option([], "--exclude",
+		help="a span to leave out of the scope, same spelling, repeatable - a program's own code is "
+		"usually interleaved with the runtime the image linked, which is why one span is not enough "
+		"for every target (default: [scope] exclude in the target config)"),
+	variant: Optional[str] = typer.Option(None, "--variant", "-v",
+		help="default: the variant the analysis was run with"),
+	gate: str = typer.Option("", "--gate",
+		help="the tier a unit has to reach to be counted: %s (default: [gate] require in the target "
+		"config)" % ", ".join(diff.GATE_MODES)),
+	check_table: str = typer.Option("", "--check-table",
+		help="cross-check against a project's own unit/status table (default: [scope] table in the "
+		"target config) - its numbers are never used, only compared"),
+	limit: int = typer.Option(25, "--limit", help="how many units to name per group"),
+	as_json: bool = typer.Option(False, "--json"),
+) -> None:
+	"""How much of a scope is at the gate: bytes at the gate over the scope's own bytes.
+
+	This is where a percentage belongs. Per unit the claim is the tier (`[gate] require`), never a
+	number: 97 % of a wrong function is still a wrong function, and in float-heavy code one wrong
+	field offset hides inside the percentage. Over a scope the number *is* true - "x % of these
+	bytes are reproduced by source that reaches this tier" - and it is what "get this range to
+	90 %" asks for. The exit code is the bar: 0 when the scope is at it, 1 when it is not.
+
+	It reads the record `decomp try` writes (every attempt, pass or fail) plus the match ledger, and
+	the denominator is the scope's own units, never the file: a share of a whole binary is not a
+	statement about the program. Name the scope with `--range` (repeatable, with `--exclude`) or in
+	`[scope]` in the target config, so the number can be re-checked by anyone who reads the report.
+	"""
+	cfg = load_config(config_file)
+	store = cache.Cache(config.cache_dir(cfg))
+	conn, values = open_analysis(store, binary, key)
+	try:
+		meta = cache.meta(conn)
+		scope = config.scope(cfg)
+		texts = list(range_text) or list(scope["ranges"])
+		if not texts:
+			raise Stop(EXIT_USAGE, "no scope to report: pass --range 0xLO-0xHI, or name one in "
+				"[scope] range in %s - a percentage is only true of a stated scope" % cfg["path"])
+		spans = [_parse_range(text) for text in texts]
+		excludes = [_parse_range(text) for text in (list(exclude) or list(scope["excludes"]))]
+		table = check_table or scope["table"]
+		table_path = None
+		if table:
+			path = Path(table).expanduser()
+			table_path = path if path.is_absolute() else (cfg["root"] / path)
+		try:
+			report = range_progress(cfg, conn, meta, spans, excludes, variant=variant,
+				require=(gate or None), scope_table=table_path)
+		except config.ConfigError as exc:
+			raise Stop(EXIT_USAGE, "%s" % exc)
+	finally:
+		conn.close()
+
+	def shown(items: list[tuple[int, int]]) -> str:
+		return ", ".join("%s-%s" % (_hex(lo), _hex(hi)) for lo, hi in items)
+
+	if as_json:
+		payload = dict(report)
+		payload["target"] = values.get("target_path")
+		payload["key"] = values.get("target_key")
+		payload["scope"] = {"ranges": texts, "exclude": list(exclude) or list(scope["excludes"])}
+		payload["spans"] = [{"lo": _hex(lo), "hi": _hex(hi)} for lo, hi in spans]
+		payload["excluded"] = [{"lo": _hex(lo), "hi": _hex(hi)} for lo, hi in excludes]
+		payload["units"] = [dict(item, entry=_hex(item["entry"])) for item in report["units"]]
+		echo(json.dumps(payload, indent=1, default=str))
+		raise typer.Exit(EXIT_OK if report["met"] else EXIT_FAIL)
+
+	t = report["totals"]
+	echo("; %s (key %s)  scope progress for variant %s" % (values.get("target_path"),
+		values.get("target_key"), report["variant"] or "(none recorded)"))
+	echo("scope: %s (%d units / %d bytes, as the analysis bounds them)  %s"
+		% (shown(spans), t["units"], t["bytes"], scope["where"] or "--range"))
+	if excludes:
+		echo("       excluding %s" % shown(excludes))
+	echo("gate:  %s (%s)" % (report["gate"], report["gate_from"]))
+	echo("")
+	echo("  AT THE GATE  %d of %s, %d of %d bytes = %.2f %%" % (t["at_gate"],
+		_plural(t["units"], "unit"), t["at_gate_bytes"], t["bytes"], t["percent"]))
+	claim = scope["percent"] or "bytes at the gate / the scope's bytes"
+	echo("  THE BAR      %.2f %% (%s; threshold in %s) - %s" % (report["bar"], claim, cfg["path"],
+		"MET" if report["met"] else "NOT MET"))
+	echo("  tiers at the gate: %s" % (", ".join(
+		"%s %d" % item for item in sorted(t["tiers"].items(),
+			key=lambda item: -diff.tier_rank(item[0]))) or "none"))
+	echo("  attempted and below the gate  %s / %d bytes%s%s"
+		% (_plural(t["attempted"], "unit"), t["attempted_bytes"],
+			"  (tiers: %s)" % ", ".join("%s %d" % item for item in sorted(
+				t["tiers_below"].items(), key=lambda item: -diff.tier_rank(item[0])))
+			if t["tiers_below"] else "",
+			"  (%d of them byte-complete at %.0f %% but capped below the gate)"
+			% (t["byte_complete_capped"], report["bar"]) if t["byte_complete_capped"] else ""))
+	echo("  not attempted at this variant  %s / %d bytes" % (_plural(t["unattempted"], "unit"),
+		t["unattempted_bytes"]))
+
+	def group(title: str, items: list[dict], order) -> None:
+		if not items:
+			return
+		echo("")
+		echo("%s (%d):" % (title, len(items)))
+		for item in sorted(items, key=order)[:max(limit, 0)]:
+			echo("  %s  %-22s %7d B  %s" % (_hex(item["entry"]), item["name"][:22], item["size"],
+				item["tier"] or "-"))
+			if item["state"] == "attempted":
+				echo("          ins %s %%  bytes %s %%  %s%s" % (item["match_percent"],
+					item["byte_percent"], _say_categories(item["categories"]),
+					"  %d reference(s) neither side can name" % item["unverified"]
+					if item.get("unverified") else ""))
+				if item["source"]:
+					echo("          %s  scored %s at %s" % (item["source"], item["at"],
+						report["variant"]))
+			elif item["state"] == "at_gate" and item["at_gate_from"] == "ledger":
+				echo("          its gate claim comes from the match ledger, not the score record - "
+					"re-`try` it to record it")
+			if item["kind"] != "function":
+				echo("          the analysis classifies this as %s" % item["kind"])
+		if len(items) > max(limit, 0):
+			echo("  ... %d more (--limit %d to see them)" % (len(items) - max(limit, 0), limit))
+
+	group("at the gate", [item for item in report["units"] if item["state"] == "at_gate"],
+		lambda item: item["entry"])
+	group("below the gate - largest first, which is where a fix moves the most bytes",
+		[item for item in report["units"] if item["state"] == "attempted"],
+		lambda item: (-item["size"], item["entry"]))
+	group("not attempted - smallest first, the order work can actually pass in",
+		[item for item in report["units"] if item["state"] == "unattempted"],
+		lambda item: (item["size"], item["entry"]))
+	if report["notes"]:
+		echo("")
+		for note in report["notes"]:
+			echo("note: %s" % note)
+	raise typer.Exit(EXIT_OK if report["met"] else EXIT_FAIL)
+
+
 @app.command()
 def find(
 	query: str = typer.Argument(..., help="name, substring, 0x address, or string content"),
@@ -1338,6 +1715,39 @@ def _learn(db: Path, row, variant: str, verdict, candidate, sources: list = ()) 
 	return {"written": written, "pairs": entries}
 
 
+def _record_score(db: Path, row, outcome: dict, sources: list = ()) -> dict:
+	"""Write what this attempt concluded into the cache's score record.
+
+	`decomp try` already tells the loop whether *this unit* reaches the gate. Nothing kept that
+	answer, so no command could answer the range-level question - "how many bytes of this scope are
+	at the gate" - which is the only honest way to report a percentage (a per-unit percent hides a
+	wrong field offset; a range's share of bytes at the gate does not). This is what makes the
+	denominator computable: every unit that gets a verdict leaves its tier, both percentages and the
+	categories that capped it here, pass or fail.
+
+	A verdict only, never a build failure: the record says what was concluded about a unit, and a
+	candidate that did not compile concluded nothing. Like `_learn`, the write takes its own
+	connection - scoring reads the analysis, recording is the one thing it does to it.
+	"""
+	verdict = outcome["verdict"]
+	original, candidate = outcome.get("original"), outcome.get("candidate")
+	item = {"variant": outcome["variant"], "entry": int(row["entry"]),
+		"name": str(row["name"] or ""),
+		# the extents actually compared, which are the file's own where it has a unit table - kept
+		# beside the analysis' size so a report can name the disagreement instead of hiding it
+		"original_size": int(getattr(original, "size", 0) or 0),
+		"candidate_size": int(getattr(candidate, "size", 0) or 0),
+		"gate": verdict.require, "tier": verdict.tier, "tier_rank": diff.tier_rank(verdict.tier),
+		"passed": bool(verdict.passed), "match_percent": verdict.match_percent,
+		"byte_percent": verdict.byte_percent, "bytes_matched": verdict.bytes_matched,
+		"bytes_over": verdict.bytes_matched_over, "cats": dict(verdict.categories),
+		"unverified": verdict.unverified,
+		"source": str(sources[0]) if sources else "", "at": time.strftime("%Y-%m-%d")}
+	with sqlite3.connect(db) as conn:
+		written = cache.record_score(conn, item)
+	return {"written": written, "tier": verdict.tier, "variant": item["variant"]}
+
+
 @app.command("try")
 def try_cmd(
 	function: str = typer.Argument(..., help="the function to score (name, substring, 0x address)"),
@@ -1360,6 +1770,10 @@ def try_cmd(
 		help="a unit that reaches the gate writes what it proved into the match ledger (Phase 5): "
 		"its own symbol at this address, and its names for anonymous entities it reaches. Later "
 		"units are scored against that - `decomp ledger` shows it, --no-learn leaves it alone"),
+	record: bool = typer.Option(True, "--record/--no-record",
+		help="what this attempt concluded (its tier, both percentages, the categories that capped it) "
+			"is written into the cache's score record, pass or fail - `decomp progress` reads those "
+			"rows to answer how much of a range is at the gate. --no-record leaves the record alone"),
 	gate: str = typer.Option("", "--gate",
 		help="override the tier this unit has to reach: %s (default: [gate] require in the "
 			"target config, else semantic)" % ", ".join(diff.GATE_MODES)),
@@ -1411,6 +1825,9 @@ def try_cmd(
 			if learn and verdict is not None and verdict.passed:
 				outcome["learned"] = _learn(Path(values["db"]), row, outcome["variant"], verdict,
 					outcome["candidate"], [Path(item) for item in source])
+			if record and verdict is not None:
+				outcome["recorded"] = _record_score(Path(values["db"]), row, outcome,
+					[Path(item) for item in source])
 		except config.ConfigError as exc:
 			raise Stop(EXIT_USAGE, "%s" % exc)
 		except NotImplementedError as exc:
@@ -1461,6 +1878,7 @@ def try_cmd(
 				"diff": verdict.diff, "symbols": verdict.symbols,
 				"unverified": verdict.unverified, "unverified_refs": verdict.unverified_refs,
 				"ledger_known": outcome.get("ledger", 0), "learned": outcome.get("learned", {}),
+				"recorded": outcome.get("recorded", {}),
 				"waived": verdict.waive},
 		}
 		echo(json.dumps(payload, indent=1))

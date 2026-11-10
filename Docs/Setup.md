@@ -118,6 +118,32 @@ cache_dir   = "cache/ghproj"       # one Ghidra project per target binary, keyed
 language    = ""                   # empty = let Ghidra auto-select (x86:LE:64:default here)
 ```
 
+### Per-target scope: `[scope]` — what a percentage is measured over
+
+`threshold` is a bar, and a bar needs a stated territory. Per function a percentage is never the
+claim (the gate tier is: `[gate] require`), because a wrong function at 97 % is still a wrong
+function and a wrong field offset hides inside the number. A range-level figure *is* a true
+statement — “x % of this scope's bytes are reproduced by source that reaches the gate tier” — and
+`decomp progress` computes it. `[scope]` says what the scope is, so the number can be re-checked
+by anyone who reads the report instead of being remembered:
+
+```toml
+[scope]
+range   = ["0x180046800-0x1800582f4"]   # repeatable: a program's code is often not one span
+exclude = ["0x1801f_76bc-0x18023_3000"] # spans to leave out (a statically linked runtime)
+table   = "SCOPE.md"                     # the project's own status sheet: compared, never used
+percent = "bytes at the gate / the scope's bytes"   # the wording the report prints
+```
+
+Every value accepts a single string or a list. `range`/`exclude` use the same spelling as
+`decomp detect --range` (`0xLO-0xHI` or `0xSTART+0xLEN`); passing `--range`/`--exclude` on the
+command line overrides them. `table` is only cross-checked — the tool reports rows that claim
+`matched` with nothing behind them, or a gate the sheet still calls `todo` — because a hand-kept
+sheet is the kind of thing that gets quoted after it has gone stale. The denominator is always the
+analysis' units inside the scope, never the file's size, and the report states where its numbers
+came from. It is optional: a project with no `[scope]` still scores units, it just cannot be asked
+for a range figure without naming the range.
+
 ### Analysis cache
 
 `decomp analyze` writes one Ghidra project per target binary into `cache/ghproj/<hash>/` so later commands never re-run auto-analysis. Measured on `Tests/build/gcc-o0/da_tests.stripped`: import 1.6 s + auto-analysis 4.6 s for 193 functions, versus **1.1 s** to reopen the cached project — which is what makes the stateless-CLI design usable.
@@ -788,3 +814,66 @@ driver    /home/…/toolchains/msvc/bin/x86/cl - targets x86, the toolchain inst
           /home/…/toolchains/msvc has this target … (Docs/Setup.md §6.2)
 build: ok (2.31s) -> cache/ghproj/candidates/candidate_probe.obj
 ```
+
+### 6.14 The v140 install as it actually ran here (2026-11-09)
+
+§6.4's first route (v140 through the VS2017 channel) works end to end now, and it is the shortest way
+to a real VS2015 toolset. What ran:
+
+```
+.venv/bin/python toolchains/vsdownload.py --major 15 --accept-license \
+    Microsoft.VisualStudio.Component.VC.140 --with-sdk=no \
+    --architecture x64 --host-arch x64 --dest toolchains/media/vc140
+```
+
+14 payloads / 159 MB, all **14.0.24247**; the ids and sha256s are recorded in
+`toolchains/media/vc140/README.md`. `--with-sdk=no` because the SDK 10.0.19041 tree already exists at
+`toolchains/msvc/Windows Kits/10` (§6.11) and §6.6 allows a 10.0.x SDK for v140 — the fetch shares it.
+Note what the manifest's VC component drags in: the VS2017 shell (msdia, VS Team Framework,
+MsGetDateTime), which is why the list is 14 packages and not 5.
+
+Extraction is `toolchains/extract_msicab.py` (`cabextract` for the `.cab`s; the MSIs are read with
+`struct`, as in §6.11 — `msiextract` still crashes on this box) into `toolchains/msvc-14.0`, which then
+holds the **VS2015 spelling**: `VC/{bin/amd64, include, lib/amd64, lib/onecore/amd64, redist}`.
+
+Then one step makes `decomp` able to see it:
+
+```
+.venv/bin/python toolchains/relayout_msvc.py --prefix toolchains/msvc-14.0 --dry-run   # what it would do
+.venv/bin/python toolchains/relayout_msvc.py --prefix toolchains/msvc-14.0 --force     # do it
+```
+
+`decomp` only ever probes the **manifest-era** paths (`VC/Tools/MSVC/<v>/bin/Host*/…`,
+`Windows Kits/10/Lib/...`, `bin/<arch>/cl`), so the script adds that spelling as symlinks over the
+old one, copies msvc-wine's wrappers into `bin/x64/`, and generates `bin/x64/msvcenv.sh`. It reads the
+version out of the binaries rather than being told it (`cl.exe` 19.00.24247.2 / `link.exe`
+14.00.24247.2 → toolset directory `14.00.24247`, cross-checked against the `Microsoft.VC140.CRT`
+redist names) and prints the derivation. **Any pre-2017 or imported toolchain (§6.4, §6.5) needs the
+same treatment** — that is what this script is for, not only v140.
+
+Two traps, both silent:
+
+* `msiextract` leaves every `.exe` mode 0644, and Wine answers only `err:execw … start process failed`.
+  The script chmods them.
+* `cl.exe` is a *host* binary that needs `vcruntime140.dll` / `msvcp140.dll` on the host's PATH.
+  Without them the host `cl` exits with Wine status 53 and the wrapper prints an empty error. The
+  script copies them out of the redist payload into `VC/bin/amd64`. (The CRTs the *target* links are
+  still the ones in `VC/lib` — this is only about running the compiler.)
+
+Verified after install:
+
+```
+.venv/bin/decomp check -C Tests/Proprietary/Synplant-reverse/project.toml
+    msvc target x64 ok — toolset 14.00.24247 (libraries from the toolset CRT, SDK present, wrapper present)
+    msvc target x86 -> can_build false   # only x64 payloads were fetched; README names the three packages
+.venv/bin/python Tests/tools/check_msvc_v140_prefix.py     # layout → resolution → pin → identity → build
+    check_msvc_v140_prefix: OK — the float body really is SSE arithmetic; /fp:precise /O2 emits no VEX and no FMA
+```
+
+Two era facts came out of that probe and are worth keeping: `/std:c++14` is accepted silently while
+`/std:c++17` answers `D9002 : ignoring unknown option` (so a project's `std` choice is bounded by the
+era, not by the target's own claim), and the toolset's CRT import libraries are complete only after
+`oldnames.lib` / `msvcrt.lib` / `legacy_stdio_definitions.lib` are taken from `VC/lib/onecore/amd64`
+(the OneCore package) — the same gap §6.11 found for v141. The pairing caveat of §6.6 still applies
+to any *byte-matching* work: this prefix links **UCRT 10.0.19041**, which is newer than the UCRT a
+2016-era link would have pulled in, so matching a target's CRT bodies needs an era-matching SDK too.

@@ -214,7 +214,47 @@ def variant(config: dict, name: str | None) -> tuple[str, dict]:
 
 
 def threshold(config: dict) -> float:
+	"""The project's bar. It gates only when `[gate] require` is `percent`; otherwise it is a
+	progress figure and the bar of a range-level percentage (`decomp progress`), which is where a
+	number is a true statement. Per unit the claim is the tier - see `gate`."""
 	return float(config["raw"].get("threshold", 97.0))
+
+
+def scope(config: dict) -> dict:
+	"""What a range-level percentage is answered over: `[scope]` in the target config.
+
+	A percentage is never a per-unit claim - a wrong function at 97 % is still a wrong function - so
+	a project asked for a number states the territory the number covers, and `decomp progress`
+	computes bytes-at-the-gate over exactly that. Returns:
+
+		{"ranges": ["0xLO-0xHI", ...], "excludes": [...], "table": path, "percent": wording,
+		 "where": provenance}
+
+	with empty lists when the project says nothing, in which case `--range` has to name it. Every
+	value accepts either a single string or a list: a program's own code is rarely one contiguous
+	span (it is interleaved with the runtime the image statically linked, or the request names two
+	regions), which is what `excludes` and the plural `ranges` are for.
+
+	Spans are written the way `decomp detect --range` and `show` take one (`0x180046800-
+	0x1800582f4`, or `0xSTART+0xLEN`). `table` is the project's own unit-and-status table (a
+	generated SCOPE.md or an equivalent), used only to cross-check what the human-facing sheet
+	claims against what the score record holds - never as a source of numbers.
+	"""
+	table = config["raw"].get("scope") or {}
+	if not isinstance(table, dict):
+		return {"ranges": [], "excludes": [], "table": "", "percent": "",
+			"where": "[scope] in %s is not a table" % config["path"]}
+
+	def values(key: str) -> list[str]:
+		value = table.get(key)
+		if isinstance(value, str):
+			value = [value]
+		return [str(item).strip() for item in (value or []) if str(item).strip()]
+
+	ranges = values("range") or values("ranges")
+	return {"ranges": ranges, "excludes": values("exclude") or values("excludes"),
+		"table": str(table.get("table") or ""), "percent": str(table.get("percent") or ""),
+		"where": ("[scope] range in %s" % config["path"]) if ranges else ""}
 
 
 def gate(config: dict, variant: dict | None = None) -> tuple[str, str]:

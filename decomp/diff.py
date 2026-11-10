@@ -57,7 +57,7 @@ SHAPE = ("opcode", "relocation", "missing", "extra")
 # no gate at all, kept as escape hatches for a target where no tier can honestly be claimed (an
 # LTCG MSVC image, a toolchain this machine cannot reproduce).
 TIERS = ("none", "structural", "semantic", "exact")
-GATE_MODES = ("none", "percent") + TIERS
+GATE_MODES = ("none", "percent") + TIERS[1:]  # "none" is a tier too; say it once in the help
 GATE_DEFAULT = "semantic"
 # What a project may choose to wave aside rather than have it cap every unit in the target. The
 # only one today is `unverified`: references nothing verifies - neither side can name, bound or read
